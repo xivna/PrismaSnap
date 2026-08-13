@@ -1,0 +1,55 @@
+[package]
+name = "prismsnap"
+version = "0.1.0"
+edition = "2021"
+description = "PrismaSnap - Windows 11 现代化截图工具（HDR 支持）"
+license = "MIT"
+
+# 目标平台：Windows 11 x86_64（MSVC），便携版分发。
+# 交叉编译命令：cargo build --target x86_64-pc-windows-msvc --release
+
+[dependencies]
+# 错误处理。AGENTS.md 约定：优先 anyhow::Result，避免 unwrap/expect。
+anyhow = "1"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 待分批引入的依赖清单（锁版本参考，查询于 2026-08-08，引入时需重新核实最新版本）
+#
+# 策略：按「核心链路 spike」分批引入，先捕获→输出（image/half/arboard 等轻依赖），
+#       再 GUI 栈（egui/wgpu/winit/tray-icon/global-hotkey 等重依赖）。
+#       一次性引入全量依赖会让首次交叉编译非常慢，且版本冲突排查困难。
+#
+#   核心链路（截图→输出）：
+#     windows-capture = "2.0"          # 屏幕捕获（WGC，Rgba16F 支持 HDR）
+#     half             = "2.7"          # f16 → f32 转换
+#     image            = "0.25"         # 图像处理 / PNG/JPEG 编解码
+#     imageproc        = "0.27"         # 标注绘制（马赛克需自行实现）
+#     arboard          = "3.6"          # 剪贴板
+#     windows          = "0.62"         # Win32/WinRT 绑定（色彩空间/HDR 检测、多显示器）
+#
+#   框架外壳：
+#     tray-icon        = "0.24"         # 系统托盘
+#     global-hotkey    = "0.8"          # 全局热键（RegisterHotKey）
+#
+#   GUI 栈（版本必须对齐，见 AGENTS.md 3.1）：
+#     egui             = "0.36"
+#     egui-wgpu        = "0.36"
+#     egui-winit       = "0.36"
+#     winit            = "0.30"
+#     wgpu             = "29"
+#     embed-resource   = "3.0"          # 可选：exe 图标/版本信息嵌入
+#
+#   异步与配置：
+#     tokio            = { version = "1", features = ["full"] }
+#     reqwest          = { version = "0.12", features = ["json"] }
+#     serde            = { version = "1", features = ["derive"] }
+#     toml             = "0.8"
+#     tracing          = "0.1"
+#     tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+#     ab_glyph         = "0.2"          # 文字标注渲染（配合内置 CJK 字体）
+# ─────────────────────────────────────────────────────────────────────────
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

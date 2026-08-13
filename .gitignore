@@ -1,0 +1,11 @@
+# 编译产物
+/target
+
+# 本地配置（便携版运行时生成，不入库）
+config.toml
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
