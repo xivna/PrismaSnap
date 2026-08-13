@@ -21,6 +21,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # 放在 target-specific 依赖里，保证 WSL2 下 cargo check/test 不编译它。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "2"
+# WinRT 绑定：获取 SDR 白点（SdrWhiteLevelInNits）与 RoInitialize。
+# 版本须与 windows-capture 依赖的 windows 0.62 对齐。
+windows = { version = "0.62", features = ["Graphics_Display", "Win32_System_WinRT"] }
 
 # ─────────────────────────────────────────────────────────────────────────
 # 待分批引入的依赖清单（锁版本参考，查询于 2026-08-08，引入时需重新核实最新版本）

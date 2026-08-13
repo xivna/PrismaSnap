@@ -222,6 +222,7 @@ dependencies = [
  "anyhow",
  "half",
  "image",
+ "windows",
  "windows-capture",
 ]
 
