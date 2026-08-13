@@ -37,8 +37,9 @@ mod imp {
     static SDR_WHITE_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
     /// SDR 白点在输出中的位置（<1.0 为 HDR 高光留 headroom）。
-    /// 值越小高光层次越多、但 SDR 白色越发灰；值越大 SDR 越正、但高光越容易纯白。
-    const SDR_OUT_WHITE: f32 = 0.9;
+    /// 8-bit SDR 输出的物理限制：SDR 白点映射到 1.0 时高光无空间（纯白）；
+    /// 值越小高光层次越多、但 SDR 白色越发灰。0.7 ≈ 留 30% headroom（约 68 级灰阶）。
+    const SDR_OUT_WHITE: f32 = 0.7;
 
     /// 捕获句柄：在 `on_frame_arrived` 中处理一帧后立即停止。
     struct CaptureHandler;
@@ -218,8 +219,8 @@ mod imp {
         if x <= 1.0 {
             x * sdr_out_white
         } else {
-            // 对数滚降：x = 1 + max_extra 时到满白
-            let max_extra = 8.0f32;
+            // 对数滚降：x = 1 + max_extra 时到满白；max_extra 覆盖常见高光范围
+            let max_extra = 6.0f32;
             let t = (x - 1.0).ln_1p() / max_extra.ln_1p();
             sdr_out_white + (1.0 - sdr_out_white) * t.min(1.0)
         }
