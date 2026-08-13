@@ -2,15 +2,14 @@
 //!
 //! 目的（对应 AGENTS.md 3.2 节）：
 //! 1. 验证 `windows-capture` 的 `ColorFormat::Rgba16F` 在 HDR 显示器下
-//!    返回的到底是不是真正的 scRGB 线性数据——判断标准是帧内是否存在
-//!    数值 >1.0 的高光像素（SDR 内容不会超过 1.0）。
-//! 2. 验证 f16 → f32 → 归一化 → linear→sRGB 的完整转换链路。
+//!    返回的到底是不是真正的 scRGB 线性数据。
+//! 2. 验证 f16 → f32 → SDR 白点归一化 → tone map → sRGB 的完整转换链路。
 //!
 //! 转换要点（3.2 节"SDR 白点问题"的实证修正）：
-//! scRGB 中 1.0 对应 80 nit（SDR 白点），但 Windows HDR 模式会把 SDR 桌面
-//! 内容提升到 >1.0（用户实测平均亮度 2.04）。若直接对原始值 clamp 到 1.0，
-//! 会导致大面积过曝。正确做法是先按 `SdrWhiteLevelInNits / 80` 归一化，
-//! 再做 linear→sRGB gamma，并对高光裁剪。
+//! - scRGB 中 1.0 对应 80 nit；Windows HDR 模式会把 SDR 桌面内容提升到
+//!   >1.0，必须先按 `SdrWhiteLevelInNits / 80` 归一化。
+//! - 归一化后 SDR 白点 = 1.0；>1.0 的是真 HDR 高光。直接裁剪会让高光
+//!   变成一坨纯白（无细节），需用 rolloff 软滚降保留层次。
 //!
 //! 运行：Windows 实机（建议开启 HDR，屏幕上有高亮内容），双击运行后捕获
 //! 主显示器一帧，打印统计并在 exe 同目录生成 `hdr_probe_out.png` 与
@@ -32,20 +31,24 @@ mod imp {
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
 
+    /// SDR 白点归一化因子（scRGB），由 run() 查询后写入。
+    static SDR_WHITE_SCRGB: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    /// SDR 白点来源说明（是否查询成功 / fallback）。
+    static SDR_WHITE_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    /// SDR 白点在输出中的位置（<1.0 为 HDR 高光留 headroom）。
+    /// 值越小高光层次越多、但 SDR 白色越发灰；值越大 SDR 越正、但高光越容易纯白。
+    const SDR_OUT_WHITE: f32 = 0.9;
+
     /// 捕获句柄：在 `on_frame_arrived` 中处理一帧后立即停止。
-    struct CaptureHandler {
-        sdr_white_scrgb: f32,
-    }
+    struct CaptureHandler;
 
     impl GraphicsCaptureApiHandler for CaptureHandler {
-        // 通过 flags 把归一化因子从 run() 传入 new()
-        type Flags = f32;
+        type Flags = ();
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
-        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            Ok(Self {
-                sdr_white_scrgb: ctx.flags,
-            })
+        fn new(_ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            Ok(Self)
         }
 
         fn on_frame_arrived(
@@ -55,6 +58,7 @@ mod imp {
         ) -> Result<(), Self::Error> {
             let width = frame.width();
             let height = frame.height();
+            let sdr_white_scrgb = SDR_WHITE_SCRGB.get().copied().unwrap_or(1.0);
             println!(
                 "Captured one frame: {}x{}, format {:?}",
                 width,
@@ -63,7 +67,7 @@ mod imp {
             );
 
             let mut buffer = frame.buffer()?;
-            analyze_and_save(&mut buffer, width, height, self.sdr_white_scrgb)?;
+            analyze_and_save(&mut buffer, width, height, sdr_white_scrgb)?;
 
             capture_control.stop();
             Ok(())
@@ -106,7 +110,7 @@ mod imp {
         // 归一化后 >1.0 的像素（真正的 HDR 高光）
         let mut norm_over_one: u64 = 0;
 
-        // 输出图（归一化 + sRGB 后）
+        // 输出图（归一化 + tone map + sRGB 后）
         let mut img = RgbaImage::new(width, height);
 
         for y in 0..h {
@@ -123,7 +127,6 @@ mod imp {
                 if r > 1.0 || g > 1.0 || b > 1.0 {
                     raw_over_one += 1;
                 }
-                // 归一化后仍 >1.0 的才是真正的高光
                 if r / sdr_white_scrgb > 1.0
                     || g / sdr_white_scrgb > 1.0
                     || b / sdr_white_scrgb > 1.0
@@ -156,12 +159,17 @@ mod imp {
         img.save(&out_path)?;
 
         // 汇总报告（英文避免 Windows 控制台代码页乱码，result.txt 为 UTF-8）
+        let note = SDR_WHITE_NOTE
+            .get()
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
         let mut report = String::new();
         report.push_str(&format!("Resolution: {}x{} ({} pixels)\n", w, h, total));
         report.push_str(&format!("Color format: {:?}\n", fmt));
+        report.push_str(&format!("SDR white: {} (scRGB factor {:.4})\n", note, sdr_white_scrgb));
         report.push_str(&format!(
-            "SDR white level (normalization factor, scRGB): {:.4}\n",
-            sdr_white_scrgb
+            "Tone map: SDR linear to {:.2}, highlights log rolloff to 1.0\n",
+            SDR_OUT_WHITE
         ));
         report.push_str(&format!("R channel: min={:.4} max={:.4}\n", min_r, max_r));
         report.push_str(&format!("G channel: min={:.4} max={:.4}\n", min_g, max_g));
@@ -201,13 +209,29 @@ mod imp {
         f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
     }
 
-    /// 归一化到 SDR 白点后做 linear → sRGB gamma 转换（高光裁剪、负值归零）。
-    fn linear_to_srgb(v: f32, sdr_white_scrgb: f32) -> u8 {
-        let v = (v / sdr_white_scrgb).clamp(0.0, 1.0);
-        let s = if v <= 0.0031308 {
-            v * 12.92
+    /// HDR → SDR 色调映射：SDR 白点线性 + 高光对数滚降。
+    ///
+    /// `x` 为 scRGB / sdr_white（SDR 白点 = 1.0）：
+    /// - x ≤ 1（SDR 内容）线性映射到 [0, sdr_out_white]，保证 SDR 所见即所得；
+    /// - x > 1（HDR 高光）对数滚降到 (sdr_out_white, 1.0]，保留高光层次而非硬裁剪。
+    fn tone_map(x: f32, sdr_out_white: f32) -> f32 {
+        if x <= 1.0 {
+            x * sdr_out_white
         } else {
-            1.055 * v.powf(1.0 / 2.4) - 0.055
+            // 对数滚降：x = 1 + max_extra 时到满白
+            let max_extra = 8.0f32;
+            let t = (x - 1.0).ln_1p() / max_extra.ln_1p();
+            sdr_out_white + (1.0 - sdr_out_white) * t.min(1.0)
+        }
+    }
+
+    /// 归一化 + tone map + linear→sRGB gamma。
+    fn linear_to_srgb(v: f32, sdr_white_scrgb: f32) -> u8 {
+        let x = tone_map(v / sdr_white_scrgb, SDR_OUT_WHITE).clamp(0.0, 1.0);
+        let s = if x <= 0.0031308 {
+            x * 12.92
+        } else {
+            1.055 * x.powf(1.0 / 2.4) - 0.055
         };
         (s * 255.0).round().clamp(0.0, 255.0) as u8
     }
@@ -222,7 +246,7 @@ mod imp {
     }
 
     /// 查询 Windows SDR 白点（nit），换算成 scRGB 归一化因子。
-    fn query_sdr_white_scrgb() -> (f32, String) {
+    fn query_sdr_white() -> (f32, String) {
         // 确保 WinRT 已初始化（windows-capture 内部也会 RoInitialize，重复调用安全）
         unsafe {
             let _ = windows::Win32::System::WinRT::RoInitialize(
@@ -236,11 +260,11 @@ mod imp {
         {
             Ok(nits) => {
                 // scRGB 中 1.0 = 80 nit
-                (nits / 80.0, format!("SDR white level = {} nit", nits))
+                (nits / 80.0, format!("{} nit", nits))
             }
             Err(e) => {
                 // 控制台程序可能无 current view，回退到常见 HDR 模式 SDR 亮度（scRGB 2.0）
-                (2.0, format!("query failed ({}), fallback to 2.0", e))
+                (2.0, format!("query failed ({}), fallback 2.0", e))
             }
         }
     }
@@ -249,8 +273,10 @@ mod imp {
         println!("=== PrismaSnap HDR capture probe ===\n");
 
         // 查询 SDR 白点（在捕获前，避免与捕获线程竞争 COM）
-        let (sdr_white_scrgb, white_note) = query_sdr_white_scrgb();
-        println!("[{}]", white_note);
+        let (sdr_white_scrgb, note) = query_sdr_white();
+        let _ = SDR_WHITE_SCRGB.set(sdr_white_scrgb);
+        let _ = SDR_WHITE_NOTE.set(note.clone());
+        println!("SDR white level: {}", note);
 
         // 枚举所有显示器
         let monitors = Monitor::enumerate()?;
@@ -275,7 +301,6 @@ mod imp {
             primary.height().unwrap_or(0)
         );
 
-        // 由于 GraphicsCaptureApiHandler::start 接管线程，白点信息通过 flags 传给 new()。
         let settings = Settings::new(
             primary,
             CursorCaptureSettings::WithoutCursor,
@@ -284,7 +309,7 @@ mod imp {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Rgba16F,
-            sdr_white_scrgb,
+            (),
         );
 
         CaptureHandler::start(settings)?;
