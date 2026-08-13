@@ -14,8 +14,12 @@
 //!   计算（物理准确）。
 //!
 //! 运行：Windows 实机（建议开启 HDR，屏幕上有高亮内容），双击运行后捕获
-//! 主显示器一帧，打印统计并在 exe 同目录生成 `hdr_probe_out.png` 与
-//! `hdr_probe_result.txt`（UTF-8 报告）。
+//! 主显示器一帧，打印统计并在 exe 同目录生成 `hdr_probe_result.txt`
+//! （UTF-8 报告）与 `hdr_cmp_<方案>.png` 对照图（每个色调映射方案一张）。
+//!
+//! 对照实验背景（2026-08-13）：knee/shoulder ease-out 曲线把 0.7~1.5 区间
+//! 局部对比度压掉 5~6 倍，是"画面发灰"的根源；实测 Windows 截图为
+//! "线性增益 ~0.62 + 硬裁剪"，全程保对比度。故输出多方案同帧对比。
 
 #[cfg(target_os = "windows")]
 mod imp {
@@ -94,7 +98,40 @@ mod imp {
     /// 每单位亮度对应的桶数（桶宽 ≈ 0.00098）。
     const HIST_SCALE: f32 = 1024.0;
 
-    /// 分析一帧 Rgba16F 数据并保存 sRGB PNG（含黑位校正对照图）。
+    /// 色调映射方案（对照实验用，同一帧输出多张图横向对比）。
+    #[derive(Clone, Copy)]
+    enum ToneOp {
+        /// v0 基线：knee/shoulder ease-out（已证实会把中高调压扁、画面发灰）
+        KneeShoulder,
+        /// 线性增益 + （可选）短肩部：gain 为增益，knee/max 为增益后线性域的
+        /// 肩部起点/终点，max <= knee 时硬裁剪（Windows 截图同款策略）
+        Gain { gain: f32, knee: f32, max: f32 },
+    }
+
+    /// 对照方案清单：标签直接作为输出文件名一部分。
+    ///
+    /// 参数依据（2026-08-13 实机反推 Windows Xbox Game Bar 截图）：
+    /// - Windows 行为 ≈ 归一化后线性增益 0.617 + 硬裁剪
+    ///   （SDR 白点 268nit → sRGB 206，>435nit 高光裁白），全程保对比度。
+    const VARIANTS: &[(&str, ToneOp)] = &[
+        ("v0_current_knee_shoulder", ToneOp::KneeShoulder),
+        ("v1_gain062_clip", ToneOp::Gain { gain: 0.617, knee: 1.0, max: 0.0 }),
+        ("v2_gain070_clip", ToneOp::Gain { gain: 0.70, knee: 1.0, max: 0.0 }),
+        ("v3_gain070_shoulder", ToneOp::Gain { gain: 0.70, knee: 0.9, max: 1.5 }),
+        ("v4_gain078_clip", ToneOp::Gain { gain: 0.78, knee: 1.0, max: 0.0 }),
+    ];
+
+    /// 按方案转换一个像素。
+    fn convert(op: &ToneOp, r: f32, g: f32, b: f32, sdr_white: f32, p: &HdrParams) -> [u8; 3] {
+        match op {
+            ToneOp::KneeShoulder => color::hdr_to_srgb(r, g, b, sdr_white, p.knee, p.headroom),
+            ToneOp::Gain { gain, knee, max } => {
+                color::hdr_to_srgb_gain(r, g, b, sdr_white, *gain, *knee, *max)
+            }
+        }
+    }
+
+    /// 分析一帧 Rgba16F 数据，输出统计报告 + 每个对照方案各一张 sRGB PNG。
     fn analyze_and_save(
         buffer: &mut FrameBuffer,
         width: u32,
@@ -162,12 +199,12 @@ mod imp {
             }
         }
 
-        // 黑位参考：最暗 0.1% 像素的归一化亮度（画面"发灰"时此值会明显 > 0）
+        // 黑位参考：最暗 0.1% 像素的归一化亮度（保留作诊断；此前已排除黑位抬升）
         let black_ref = percentile(&hist, total, 0.001);
 
-        // 第二遍：生成两张图（原始方案 + 黑位校正对照）
-        let mut img = RgbaImage::new(width, height);
-        let mut img_bp = RgbaImage::new(width, height);
+        // 第二遍：为每个对照方案生成一张图
+        let mut images: Vec<RgbaImage> =
+            VARIANTS.iter().map(|_| RgbaImage::new(width, height)).collect();
         {
             let raw = buffer.as_raw_buffer();
             for y in 0..h {
@@ -180,22 +217,20 @@ mod imp {
                     let a = read_f16(&raw[px + 6..px + 8]);
                     let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
 
-                    let [sr, sg, sb] =
-                        color::hdr_to_srgb(r, g, b, sdr_white_scrgb, params.knee, params.headroom);
-                    img.put_pixel(x as u32, y as u32, image::Rgba([sr, sg, sb, alpha]));
-
-                    let [br, bg, bb] = color::hdr_to_srgb_with_black_point(
-                        r, g, b, sdr_white_scrgb, params.knee, params.headroom, black_ref,
-                    );
-                    img_bp.put_pixel(x as u32, y as u32, image::Rgba([br, bg, bb, alpha]));
+                    for (img, (_, op)) in images.iter_mut().zip(VARIANTS.iter()) {
+                        let [sr, sg, sb] = convert(op, r, g, b, sdr_white_scrgb, params);
+                        img.put_pixel(x as u32, y as u32, image::Rgba([sr, sg, sb, alpha]));
+                    }
                 }
             }
         }
 
-        let out_path = exe_dir()?.join("hdr_probe_out.png");
-        let out_bp_path = exe_dir()?.join("hdr_probe_out_blackpoint.png");
-        img.save(&out_path)?;
-        img_bp.save(&out_bp_path)?;
+        let mut out_paths = Vec::new();
+        for (img, (label, _)) in images.iter().zip(VARIANTS.iter()) {
+            let path = exe_dir()?.join(format!("hdr_cmp_{label}.png"));
+            img.save(&path)?;
+            out_paths.push(path);
+        }
 
         // 汇总报告（英文避免 Windows 控制台代码页乱码，result.txt 为 UTF-8）
         let mut report = String::new();
@@ -250,16 +285,24 @@ mod imp {
             "Black point ref (0.1% percentile, normalized): {:.4}\n",
             black_ref
         ));
-        report.push_str(&format!(
-            "Output PNG (no black correction): {}\n",
-            out_path.display()
-        ));
-        report.push_str(&format!(
-            "Output PNG (black-point corrected): {}\n",
-            out_bp_path.display()
-        ));
+        report.push_str("\nTone-map comparison variants (same frame, one PNG each):\n");
+        for ((label, op), path) in VARIANTS.iter().zip(out_paths.iter()) {
+            let desc = match op {
+                ToneOp::KneeShoulder => {
+                    format!("knee/shoulder ease-out, knee={:.2}, headroom={:.2}", params.knee, params.headroom)
+                }
+                ToneOp::Gain { gain, knee, max } => {
+                    if max <= knee {
+                        format!("gain {gain:.3} + hard clip (SDR white -> byte {})", color::hdr_to_srgb_gain(1.0, 1.0, 1.0, 1.0, *gain, *knee, *max)[0])
+                    } else {
+                        format!("gain {gain:.3} + shoulder knee={knee:.2} max={max:.2} (SDR white -> byte {})", color::hdr_to_srgb_gain(1.0, 1.0, 1.0, 1.0, *gain, *knee, *max)[0])
+                    }
+                }
+            };
+            report.push_str(&format!("  [{label}] {desc}\n    {}\n", path.display()));
+        }
         report.push_str(
-            ">>> Compare hdr_probe_out.png vs hdr_probe_out_blackpoint.png for dark-detail.\n",
+            ">>> Compare hdr_cmp_*.png against each other and vs Windows Xbox Game Bar shots (1.png/2.png).\n",
         );
 
         if raw_over_one > 0 {
@@ -400,7 +443,7 @@ mod imp {
 
         CaptureHandler::start(settings)?;
 
-        println!("\nDone. See hdr_probe_result.txt / hdr_probe_out.png next to this exe.");
+        println!("\nDone. See hdr_probe_result.txt / hdr_cmp_*.png next to this exe.");
         println!("Press Enter to exit...");
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);

@@ -54,6 +54,36 @@ pub fn linear_to_srgb_gamma(x: f32) -> f32 {
     }
 }
 
+/// 线性增益 + 短肩部映射（实机对比 Windows 截图后定稿的方向）。
+///
+/// 背景：knee/shoulder ease-out 曲线在 knee 以上区间局部斜率仅 ~0.17，
+/// 把占画面大头的 0.7~1.5 归一化亮度（雾、天空、浅色 UI）对比度压掉 5~6 倍，
+/// 是"画面发灰"的根源。实测 Windows 自带 HDR 截图（Xbox Game Bar）的策略是
+/// **归一化 → 线性增益 ~0.62 → 硬裁剪**：线性域乘常数 = gamma 域平移，
+/// 局部对比度完全保留，仅高光细节被裁掉（可接受的取舍）。
+///
+/// 本函数在"增益后线性域"工作：
+/// - `y * gain <= knee`：恒等输出（斜率 = gain，对比度无损）；
+/// - `knee < y * gain <= max`：ease-out 压缩到 `[knee, 1]`（短肩部，
+///   仅用于软化裁剪边界，跨度应远小于 knee 以下的恒等区间）；
+/// - `y * gain > max`：裁剪为 1.0。
+/// - `max <= knee` 时退化为纯增益 + 硬裁剪（Windows 同款）。
+///
+/// 入参 `y` 为已按 SDR 白点归一化的线性亮度（SDR 白点 = 1.0），应非负。
+pub fn gain_map(y: f32, gain: f32, knee: f32, max: f32) -> f32 {
+    let yg = y * gain;
+    if max <= knee {
+        // 无肩部：纯增益 + 硬裁剪
+        return yg.clamp(0.0, 1.0);
+    }
+    if yg <= knee {
+        yg
+    } else {
+        let t = ((yg - knee) / (max - knee)).min(1.0);
+        knee + (1.0 - knee) * (t * (2.0 - t))
+    }
+}
+
 /// 黑位校正：把暗部参考点 `black_ref` 拉回 0，并重新拉伸到 `[0, 1]`。
 ///
 /// 用于修正 WGC scRGB 数据里 SDR 黑位被抬升（画面"发灰"、暗部发雾）的问题。
@@ -97,6 +127,39 @@ pub fn hdr_to_srgb_with_black_point(
     black_ref: f32,
 ) -> [u8; 3] {
     hdr_to_srgb_inner(r, g, b, sdr_white_scrgb, knee, headroom, black_ref)
+}
+
+/// 增益映射版保色相 HDR → SDR 转换，输出 sRGB 8-bit `[r, g, b]`。
+///
+/// 与 [`hdr_to_srgb`] 的差异仅在亮度映射曲线：用 [`gain_map`]（线性增益 +
+/// 短肩部 + 裁剪）替换 knee/shoulder ease-out。归一化、保色相（亮度缩放
+/// 系数回乘三通道）、gamma 编码逻辑完全一致。
+///
+/// 参数：`sdr_white_scrgb` 归一化因子（= `SdrWhiteLevelInNits / 80`）；
+/// `gain` 线性增益（实测 Windows 截图 ≈ 0.617，即 SDR 白点 → sRGB 206）；
+/// `knee` / `max` 为增益后线性域的肩部起点/终点，`max <= knee` 时硬裁剪。
+pub fn hdr_to_srgb_gain(
+    r: f32,
+    g: f32,
+    b: f32,
+    sdr_white_scrgb: f32,
+    gain: f32,
+    knee: f32,
+    max: f32,
+) -> [u8; 3] {
+    let rn = r / sdr_white_scrgb;
+    let gn = g / sdr_white_scrgb;
+    let bn = b / sdr_white_scrgb;
+    let y = LUM_R * rn + LUM_G * gn + LUM_B * bn;
+    let y_mapped = gain_map(y.max(0.0), gain, knee, max);
+    // y 极小时（含负值）不做缩放，避免 scale 为负导致颜色反转
+    let scale = if y > 1e-6 { y_mapped / y } else { 1.0 };
+    let to_byte = |v: f32| {
+        (linear_to_srgb_gamma((v * scale).clamp(0.0, 1.0)) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [to_byte(rn), to_byte(gn), to_byte(bn)]
 }
 
 /// [`hdr_to_srgb`] 的内部实现。
@@ -214,6 +277,76 @@ mod tests {
     fn hdr_to_srgb_clamps_out_of_gamut() {
         // 负值 / 极大值不产生越界字节
         let [r, g, b] = hdr_to_srgb(-0.04, 0.5, 100.0, 2.0, 0.7, 8.0);
+        assert_eq!(r, 0);
+        assert!(g > 0 && g < 255, "中灰不应被裁到两端");
+        assert_eq!(b, 255);
+    }
+
+    #[test]
+    fn gain_map_hard_clip_when_no_shoulder() {
+        // max <= knee：纯增益 + 硬裁剪
+        assert!(approx(gain_map(0.5, 0.617, 1.0, 0.0), 0.5 * 0.617));
+        assert!(approx(gain_map(2.0, 0.617, 1.0, 0.0), 1.0));
+        assert!(approx(gain_map(0.0, 0.617, 1.0, 0.0), 0.0));
+    }
+
+    #[test]
+    fn gain_map_shoulder_identity_below_knee() {
+        // 肩部起点（增益后 0.9）以下：输出 = y * gain，对比度无损
+        assert!(approx(gain_map(0.5, 0.7, 0.9, 1.5), 0.35));
+        assert!(approx(gain_map(1.0, 0.7, 0.9, 1.5), 0.7));
+    }
+
+    #[test]
+    fn gain_map_shoulder_compresses_and_reaches_white() {
+        // 肩部区间内被压缩但 > knee；max 处达满白；超过 max 饱和
+        let y = gain_map(1.6, 0.7, 0.9, 1.5); // y*gain = 1.12 ∈ (0.9, 1.5)
+        assert!(y > 0.9 && y < 1.0, "y={y}");
+        assert!(approx(gain_map(1.5 / 0.7, 0.7, 0.9, 1.5), 1.0));
+        assert!(approx(gain_map(100.0, 0.7, 0.9, 1.5), 1.0));
+    }
+
+    #[test]
+    fn gain_map_monotonic() {
+        let mut prev = 0.0f32;
+        let mut x = 0.0f32;
+        while x <= 20.0 {
+            let y = gain_map(x, 0.7, 0.9, 1.5);
+            assert!(y >= prev, "非单调：x={x} y={y} < prev={prev}");
+            prev = y;
+            x += 0.05;
+        }
+    }
+
+    #[test]
+    fn gain_map_preserves_local_contrast_below_knee() {
+        // 肩部以下任意两点的"增益后比值"应与输入比值一致（线性增益 = 对比度平移）
+        let a = gain_map(0.4, 0.7, 0.9, 1.5);
+        let b = gain_map(0.8, 0.7, 0.9, 1.5);
+        assert!(approx(a / b, 0.5));
+    }
+
+    #[test]
+    fn gain_sdr_white_lands_at_windows_reference() {
+        // Windows 实测：SDR 白点（归一化 1.0）经 0.617 增益 → sRGB 206
+        let [r, g, b] = hdr_to_srgb_gain(1.0, 1.0, 1.0, 1.0, 0.617, 1.0, 0.0);
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert!((203..=209).contains(&r), "SDR 白点应落在 206 附近，实际 {r}");
+    }
+
+    #[test]
+    fn gain_preserves_hue_direction() {
+        // 保色相：r > g == b 的输入，输出仍满足 r >= g 且 g == b
+        let [r, g, b] = hdr_to_srgb_gain(2.0, 0.5, 0.5, 1.0, 0.7, 0.9, 1.5);
+        assert!(r >= g);
+        assert_eq!(g, b);
+    }
+
+    #[test]
+    fn gain_clamps_out_of_gamut() {
+        // 负值 / 极大值不产生越界字节
+        let [r, g, b] = hdr_to_srgb_gain(-0.04, 0.5, 100.0, 2.0, 0.7, 0.9, 1.5);
         assert_eq!(r, 0);
         assert!(g > 0 && g < 255, "中灰不应被裁到两端");
         assert_eq!(b, 255);
