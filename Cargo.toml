@@ -11,6 +11,16 @@ license = "MIT"
 [dependencies]
 # 错误处理。AGENTS.md 约定：优先 anyhow::Result，避免 unwrap/expect。
 anyhow = "1"
+# f16 → f32 转换（windows-capture 的 Rgba16F 数据为 IEEE754 f16）
+half = "2"
+# 图像处理与 PNG/JPEG 编解码（纯 Rust，跨平台）。
+# 精简 features：默认会拉 exr/avif/tiff/webp 等大量 codec，只用 png/jpeg 以缩短交叉编译时间。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# 仅 Windows 平台（屏幕捕获基于 Windows Graphics Capture，无法跨平台编译）。
+# 放在 target-specific 依赖里，保证 WSL2 下 cargo check/test 不编译它。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2"
 
 # ─────────────────────────────────────────────────────────────────────────
 # 待分批引入的依赖清单（锁版本参考，查询于 2026-08-08，引入时需重新核实最新版本）
