@@ -89,7 +89,12 @@ mod imp {
         }
     }
 
-    /// 分析一帧 Rgba16F 数据并保存 sRGB PNG。
+    /// 归一化亮度直方图桶数（覆盖 [0, 2.0]）。
+    const HIST_BINS: usize = 2048;
+    /// 每单位亮度对应的桶数（桶宽 ≈ 0.00098）。
+    const HIST_SCALE: f32 = 1024.0;
+
+    /// 分析一帧 Rgba16F 数据并保存 sRGB PNG（含黑位校正对照图）。
     fn analyze_and_save(
         buffer: &mut FrameBuffer,
         width: u32,
@@ -104,12 +109,12 @@ mod imp {
         let w = width as usize;
         let h = height as usize;
         let row_pitch = buffer.row_pitch() as usize;
-        let raw = buffer.as_raw_buffer();
         let sdr_white_scrgb = params.sdr_white_scrgb;
 
         // 原始 scRGB 统计量
         let mut total: u64 = 0;
         let mut raw_over_one: u64 = 0;
+        let mut norm_over_one: u64 = 0;
         let mut max_r = f32::NEG_INFINITY;
         let mut max_g = f32::NEG_INFINITY;
         let mut max_b = f32::NEG_INFINITY;
@@ -117,59 +122,80 @@ mod imp {
         let mut min_g = f32::INFINITY;
         let mut min_b = f32::INFINITY;
         let mut lum_sum: f64 = 0.0;
+        let mut hist = [0u64; HIST_BINS];
 
-        // 归一化后 >1.0 的像素（真正的 HDR 高光）
-        let mut norm_over_one: u64 = 0;
+        // 第一遍：统计 + 归一化亮度直方图
+        {
+            let raw = buffer.as_raw_buffer();
+            for y in 0..h {
+                let row_start = y * row_pitch;
+                for x in 0..w {
+                    // Rgba16F：每像素 4 通道，每通道 2 字节（f16），共 8 字节
+                    let px = row_start + x * 8;
+                    let r = read_f16(&raw[px..px + 2]);
+                    let g = read_f16(&raw[px + 2..px + 4]);
+                    let b = read_f16(&raw[px + 4..px + 6]);
 
-        // 输出图（归一化 + tone map + sRGB 后）
+                    total += 1;
+                    if r > 1.0 || g > 1.0 || b > 1.0 {
+                        raw_over_one += 1;
+                    }
+                    let rn = r / sdr_white_scrgb;
+                    let gn = g / sdr_white_scrgb;
+                    let bn = b / sdr_white_scrgb;
+                    if rn > 1.0 || gn > 1.0 || bn > 1.0 {
+                        norm_over_one += 1;
+                    }
+                    max_r = max_r.max(r);
+                    max_g = max_g.max(g);
+                    max_b = max_b.max(b);
+                    min_r = min_r.min(r);
+                    min_g = min_g.min(g);
+                    min_b = min_b.min(b);
+                    // 亮度粗略按 Rec.709 加权
+                    lum_sum += 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
+
+                    let ylum = 0.2126 * rn + 0.7152 * gn + 0.0722 * bn;
+                    let bin = ((ylum * HIST_SCALE).clamp(0.0, (HIST_BINS - 1) as f32)) as usize;
+                    hist[bin] += 1;
+                }
+            }
+        }
+
+        // 黑位参考：最暗 0.1% 像素的归一化亮度（画面"发灰"时此值会明显 > 0）
+        let black_ref = percentile(&hist, total, 0.001);
+
+        // 第二遍：生成两张图（原始方案 + 黑位校正对照）
         let mut img = RgbaImage::new(width, height);
+        let mut img_bp = RgbaImage::new(width, height);
+        {
+            let raw = buffer.as_raw_buffer();
+            for y in 0..h {
+                let row_start = y * row_pitch;
+                for x in 0..w {
+                    let px = row_start + x * 8;
+                    let r = read_f16(&raw[px..px + 2]);
+                    let g = read_f16(&raw[px + 2..px + 4]);
+                    let b = read_f16(&raw[px + 4..px + 6]);
+                    let a = read_f16(&raw[px + 6..px + 8]);
+                    let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
 
-        for y in 0..h {
-            let row_start = y * row_pitch;
-            for x in 0..w {
-                // Rgba16F：每像素 4 通道，每通道 2 字节（f16），共 8 字节
-                let px = row_start + x * 8;
-                let r = read_f16(&raw[px..px + 2]);
-                let g = read_f16(&raw[px + 2..px + 4]);
-                let b = read_f16(&raw[px + 4..px + 6]);
-                let a = read_f16(&raw[px + 6..px + 8]);
+                    let [sr, sg, sb] =
+                        color::hdr_to_srgb(r, g, b, sdr_white_scrgb, params.knee, params.headroom);
+                    img.put_pixel(x as u32, y as u32, image::Rgba([sr, sg, sb, alpha]));
 
-                total += 1;
-                if r > 1.0 || g > 1.0 || b > 1.0 {
-                    raw_over_one += 1;
+                    let [br, bg, bb] = color::hdr_to_srgb_with_black_point(
+                        r, g, b, sdr_white_scrgb, params.knee, params.headroom, black_ref,
+                    );
+                    img_bp.put_pixel(x as u32, y as u32, image::Rgba([br, bg, bb, alpha]));
                 }
-                if r / sdr_white_scrgb > 1.0
-                    || g / sdr_white_scrgb > 1.0
-                    || b / sdr_white_scrgb > 1.0
-                {
-                    norm_over_one += 1;
-                }
-                max_r = max_r.max(r);
-                max_g = max_g.max(g);
-                max_b = max_b.max(b);
-                min_r = min_r.min(r);
-                min_g = min_g.min(g);
-                min_b = min_b.min(b);
-                // 亮度粗略按 Rec.709 加权
-                lum_sum += 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
-
-                let [sr, sg, sb] =
-                    color::hdr_to_srgb(r, g, b, sdr_white_scrgb, params.knee, params.headroom);
-                img.put_pixel(
-                    x as u32,
-                    y as u32,
-                    image::Rgba([
-                        sr,
-                        sg,
-                        sb,
-                        (a.clamp(0.0, 1.0) * 255.0).round() as u8,
-                    ]),
-                );
             }
         }
 
         let out_path = exe_dir()?.join("hdr_probe_out.png");
+        let out_bp_path = exe_dir()?.join("hdr_probe_out_blackpoint.png");
         img.save(&out_path)?;
+        img_bp.save(&out_bp_path)?;
 
         // 汇总报告（英文避免 Windows 控制台代码页乱码，result.txt 为 UTF-8）
         let mut report = String::new();
@@ -197,7 +223,44 @@ mod imp {
             norm_over_one,
             norm_over_one as f64 / total as f64 * 100.0
         ));
-        report.push_str(&format!("Output PNG: {}\n", out_path.display()));
+        report.push_str("\nNormalized luminance histogram (dark -> bright):\n");
+        for (lo, hi, label) in [
+            (0.0, 0.01, "  [0.00, 0.01)"),
+            (0.01, 0.05, "  [0.01, 0.05)"),
+            (0.05, 0.10, "  [0.05, 0.10)"),
+            (0.10, 0.50, "  [0.10, 0.50)"),
+            (0.50, 1.00, "  [0.50, 1.00)"),
+            (1.00, 2.00, "  [1.00, 2.00)"),
+        ] {
+            let c = hist_range(&hist, lo, hi);
+            report.push_str(&format!(
+                "{}: {} ({:.4}%)\n",
+                label,
+                c,
+                c as f64 / total as f64 * 100.0
+            ));
+        }
+        let over_two = hist_range(&hist, 2.0, f32::INFINITY);
+        report.push_str(&format!(
+            "  [2.00, inf): {} ({:.4}%)\n",
+            over_two,
+            over_two as f64 / total as f64 * 100.0
+        ));
+        report.push_str(&format!(
+            "Black point ref (0.1% percentile, normalized): {:.4}\n",
+            black_ref
+        ));
+        report.push_str(&format!(
+            "Output PNG (no black correction): {}\n",
+            out_path.display()
+        ));
+        report.push_str(&format!(
+            "Output PNG (black-point corrected): {}\n",
+            out_bp_path.display()
+        ));
+        report.push_str(
+            ">>> Compare hdr_probe_out.png vs hdr_probe_out_blackpoint.png for dark-detail.\n",
+        );
 
         if raw_over_one > 0 {
             report.push_str(">>> RESULT: HDR (scRGB) data detected (raw pixels > 1.0).\n");
@@ -211,6 +274,26 @@ mod imp {
         std::fs::write(exe_dir()?.join("hdr_probe_result.txt"), &report)?;
 
         Ok(())
+    }
+
+    /// 直方图第 `p` 分位的归一化亮度（`p ∈ [0,1]`，如 0.001 = 最暗 0.1%）。
+    fn percentile(hist: &[u64; HIST_BINS], total: u64, p: f64) -> f32 {
+        let target = ((total as f64) * p).round() as u64;
+        let mut acc = 0u64;
+        for (i, &c) in hist.iter().enumerate() {
+            acc += c;
+            if acc >= target.max(1) {
+                return (i as f32 + 0.5) / HIST_SCALE;
+            }
+        }
+        0.0
+    }
+
+    /// 直方图在 `[lo, hi)` 区间内的像素数。
+    fn hist_range(hist: &[u64; HIST_BINS], lo: f32, hi: f32) -> u64 {
+        let start = (lo * HIST_SCALE).max(0.0) as usize;
+        let end = ((hi * HIST_SCALE).ceil() as usize).min(HIST_BINS);
+        hist[start..end].iter().sum()
     }
 
     /// 从 2 字节小端数据读出 f16 并转 f32。

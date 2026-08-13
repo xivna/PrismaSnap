@@ -54,6 +54,19 @@ pub fn linear_to_srgb_gamma(x: f32) -> f32 {
     }
 }
 
+/// 黑位校正：把暗部参考点 `black_ref` 拉回 0，并重新拉伸到 `[0, 1]`。
+///
+/// 用于修正 WGC scRGB 数据里 SDR 黑位被抬升（画面"发灰"、暗部发雾）的问题。
+/// `x` 为归一化后的线性值，`black_ref` 为暗部参考（如最暗 0.1% 像素的亮度）。
+/// `black_ref <= 0` 或 `>= 1` 时不作校正，原样返回。
+pub fn black_point_correct(x: f32, black_ref: f32) -> f32 {
+    if black_ref <= 0.0 || black_ref >= 1.0 {
+        x
+    } else {
+        ((x - black_ref) / (1.0 - black_ref)).max(0.0)
+    }
+}
+
 /// 保色相 HDR → SDR 转换，输出 sRGB 8-bit `[r, g, b]`。
 ///
 /// 步骤：按 SDR 白点归一化 → 算亮度 Y → 仅对 Y 做 tone map → 把缩放系数
@@ -67,7 +80,43 @@ pub fn hdr_to_srgb(
     knee: f32,
     headroom: f32,
 ) -> [u8; 3] {
-    let (rn, gn, bn) = (r / sdr_white_scrgb, g / sdr_white_scrgb, b / sdr_white_scrgb);
+    hdr_to_srgb_inner(r, g, b, sdr_white_scrgb, knee, headroom, 0.0)
+}
+
+/// 带黑位校正的保色相 HDR → SDR 转换。
+///
+/// 与 [`hdr_to_srgb`] 相同，但在归一化后先做 [`black_point_correct`]，
+/// 用于修正暗部发灰。`black_ref` 为暗部参考亮度（0 = 不校正）。
+pub fn hdr_to_srgb_with_black_point(
+    r: f32,
+    g: f32,
+    b: f32,
+    sdr_white_scrgb: f32,
+    knee: f32,
+    headroom: f32,
+    black_ref: f32,
+) -> [u8; 3] {
+    hdr_to_srgb_inner(r, g, b, sdr_white_scrgb, knee, headroom, black_ref)
+}
+
+/// [`hdr_to_srgb`] 的内部实现。
+fn hdr_to_srgb_inner(
+    r: f32,
+    g: f32,
+    b: f32,
+    sdr_white_scrgb: f32,
+    knee: f32,
+    headroom: f32,
+    black_ref: f32,
+) -> [u8; 3] {
+    let mut rn = r / sdr_white_scrgb;
+    let mut gn = g / sdr_white_scrgb;
+    let mut bn = b / sdr_white_scrgb;
+    if black_ref > 0.0 {
+        rn = black_point_correct(rn, black_ref);
+        gn = black_point_correct(gn, black_ref);
+        bn = black_point_correct(bn, black_ref);
+    }
     let y = LUM_R * rn + LUM_G * gn + LUM_B * bn;
     let y_mapped = tone_map(y.max(0.0), knee, headroom);
     // y 极小时（含负值）不做缩放，避免 scale 为负导致颜色反转
@@ -168,5 +217,23 @@ mod tests {
         assert_eq!(r, 0);
         assert!(g > 0 && g < 255, "中灰不应被裁到两端");
         assert_eq!(b, 255);
+    }
+
+    #[test]
+    fn black_point_correct_pulls_black_to_zero() {
+        // 黑位抬升 0.02 时，最暗像素应被拉回 0
+        assert!(approx(black_point_correct(0.02, 0.02), 0.0));
+        // 黑位校正后白点（1.0）保持为 1.0
+        assert!(approx(black_point_correct(1.0, 0.02), 1.0));
+        // 低于黑位的值 clamp 到 0
+        assert!(approx(black_point_correct(0.01, 0.02), 0.0));
+    }
+
+    #[test]
+    fn black_point_correct_noop_when_black_is_zero() {
+        // black_ref 为 0 时不做校正
+        assert!(approx(black_point_correct(0.3, 0.0), 0.3));
+        // black_ref 非法（>= 1）时不做校正
+        assert!(approx(black_point_correct(0.3, 1.5), 0.3));
     }
 }
