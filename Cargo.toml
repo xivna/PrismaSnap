@@ -21,9 +21,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # 放在 target-specific 依赖里，保证 WSL2 下 cargo check/test 不编译它。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "2"
+# 剪贴板（Windows 实现同时写入 CF_DIBV5 + PNG 格式，微信/Office 兼容性好）
+arboard = "3.6"
 # Win32/WinRT 绑定：
 #   - Win32_Devices_Display   CCD API：DisplayConfigGetDeviceInfo 查询 SDR 白点（无 CoreWindow 依赖）
 #   - Win32_Graphics_Dxgi(_Common)/Gdi  DXGI：IDXGIOutput6::GetDesc1 查询显示器 MaxLuminance（算 headroom）
+#   - Win32_UI_WindowsAndMessaging  GetCursorPos（多显示器定位：鼠标所在屏）
 #   - Win32_System_WinRT      RoInitialize（HDR 相关 WinRT 调用兜底）
 # 版本须与 windows-capture 依赖的 windows 0.62 对齐。
 windows = { version = "0.62", features = [
@@ -31,6 +34,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_WinRT",
 ] }
 
@@ -42,12 +46,12 @@ windows = { version = "0.62", features = [
 #       一次性引入全量依赖会让首次交叉编译非常慢，且版本冲突排查困难。
 #
 #   核心链路（截图→输出）：
-#     windows-capture = "2.0"          # 屏幕捕获（WGC，Rgba16F 支持 HDR）
-#     half             = "2.7"          # f16 → f32 转换
-#     image            = "0.25"         # 图像处理 / PNG/JPEG 编解码
+#     windows-capture = "2.0"          # 屏幕捕获（WGC，Rgba16F 支持 HDR）✅ 已引入
+#     half             = "2.7"          # f16 → f32 转换 ✅ 已引入
+#     image            = "0.25"         # 图像处理 / PNG/JPEG 编解码 ✅ 已引入
 #     imageproc        = "0.27"         # 标注绘制（马赛克需自行实现）
-#     arboard          = "3.6"          # 剪贴板
-#     windows          = "0.62"         # Win32/WinRT 绑定（色彩空间/HDR 检测、多显示器）
+#     arboard          = "3.6"          # 剪贴板 ✅ 已引入（2026-08-14，最新核实 3.6.1）
+#     windows          = "0.62"         # Win32/WinRT 绑定（色彩空间/HDR 检测、多显示器）✅ 已引入
 #
 #   框架外壳：
 #     tray-icon        = "0.24"         # 系统托盘
