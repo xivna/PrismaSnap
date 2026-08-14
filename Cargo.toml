@@ -8,6 +8,11 @@ license = "MIT"
 # 目标平台：Windows 11 x86_64（MSVC），便携版分发。
 # 交叉编译命令：cargo build --target x86_64-pc-windows-msvc --release
 
+[features]
+# 调试用：编译出带控制台窗口的版本（默认无窗口，日志走 logs/ 文件）。
+# 用法：cargo build --target x86_64-pc-windows-msvc --release --features console
+console = []
+
 [dependencies]
 # 错误处理。AGENTS.md 约定：优先 anyhow::Result，避免 unwrap/expect。
 anyhow = "1"

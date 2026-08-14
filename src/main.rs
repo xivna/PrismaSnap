@@ -3,6 +3,15 @@
 //! 启动流程：单实例检测 → 日志 → 配置 → 托盘 → 全局热键 → 常驻消息循环。
 //! 无主窗口（设置界面 Phase 2 后续接入）；热键或托盘菜单触发截图：
 //! 「定位鼠标所在屏 → Rgba16F 捕获 → HDR 转换 → 按配置保存 → 复制剪贴板」。
+//!
+//! 发布版无控制台窗口（GUI 程序），日志写入 exe 同目录 logs/；
+//! 调试需要控制台时用 `--features console` 编译。
+
+// 无控制台窗口（除非启用 console feature 调试）
+#![cfg_attr(
+    all(target_os = "windows", not(feature = "console")),
+    windows_subsystem = "windows"
+)]
 
 #[cfg(target_os = "windows")]
 mod imp {
@@ -14,7 +23,7 @@ mod imp {
 
     use prismsnap::capture::{display_info, engine, frame};
     use prismsnap::config::{Config, SaveFormat, SaveMode};
-    use prismsnap::hotkey::{self, HotkeyManager};
+    use prismsnap::hotkey::HotkeyManager;
     use prismsnap::ui::tray::{Tray, TrayAction};
     use prismsnap::utils::{clipboard, image_codec, logging, paths, single_instance, time};
 
@@ -103,17 +112,26 @@ mod imp {
     }
 
     /// 泵取 Windows 窗口消息（托盘图标依赖消息泵才能收到菜单事件）。
-    fn pump_messages() {
+    ///
+    /// 同时检测 WM_HOTKEY 热键消息：`RegisterHotKey` 把 WM_HOTKEY 投递到
+    /// 注册窗口所在线程（即本线程）的消息队列，wParam 为注册时的热键 id。
+    /// 返回 `true` 表示目标热键被按下（触发一次截图）。
+    fn pump_messages(hotkey_id: u32) -> bool {
         use windows::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_HOTKEY,
         };
+        let mut triggered = false;
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            if msg.message == WM_HOTKEY && msg.wParam.0 as u32 == hotkey_id {
+                triggered = true;
+            }
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
+        triggered
     }
 
     pub fn run() -> anyhow::Result<()> {
@@ -121,7 +139,18 @@ mod imp {
         let _instance = match single_instance::acquire("Global\\PrismaSnap-SingleInstance")? {
             Some(guard) => guard,
             None => {
-                eprintln!("PrismaSnap 已在运行（托盘区查看），本次启动退出。");
+                // 第二个实例：弹窗提示后退出（无控制台窗口，eprintln 用户看不到）
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MessageBoxW, MB_ICONINFORMATION, MB_OK,
+                };
+                unsafe {
+                    let _ = MessageBoxW(
+                        None,
+                        windows::core::w!("PrismaSnap 已在运行，请查看系统托盘。"),
+                        windows::core::w!("PrismaSnap"),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
                 return Ok(());
             }
         };
@@ -147,7 +176,7 @@ mod imp {
         // 5. 全局热键
         let hotkeys = match HotkeyManager::register(&config.hotkey) {
             Ok(h) => {
-                info!("全局热键已注册: {}", config.hotkey);
+                info!("全局热键已注册: {} (id {})", config.hotkey, h.id());
                 h
             }
             Err(e) => {
@@ -160,9 +189,7 @@ mod imp {
 
         // 6. 消息循环
         loop {
-            pump_messages();
-
-            if hotkey::poll_trigger(hotkeys.id()) {
+            if pump_messages(hotkeys.id()) {
                 if let Err(e) = capture_and_output(&config) {
                     error!("截图失败: {e:#}");
                 }

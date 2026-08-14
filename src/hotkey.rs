@@ -1,13 +1,17 @@
-//! 全局热键注册与事件接收（仅 Windows 平台编译）。
+//! 全局热键注册（仅 Windows 平台编译）。
 //!
 //! 基于 `global-hotkey`（底层 `RegisterHotKey`，不拦截无关按键，
 //! 见 AGENTS.md 3.1 选型说明）。热键字符串格式兼容其 `FromStr`，
-//! 如 `"Ctrl+Shift+A"`。事件经 `GlobalHotKeyEvent::receiver()` 的
-//! channel 接收（跨线程 unbounded channel，无需消息循环）。
+//! 如 `"Ctrl+Shift+A"`。
+//!
+//! **触发检测走 WM_HOTKEY 窗口消息**（在 `main.rs` 的消息泵里），
+//! 不走 global-hotkey 的事件 channel：RegisterHotKey 把消息投递到
+//! 注册窗口所在线程的消息队列，channel 方案需要多一层窗口过程回调，
+//! 消息级检测更直接可靠（见 PROGRESS.md 已知问题记录）。
 
 use anyhow::Context;
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::GlobalHotKeyManager;
 
 /// 热键管理器：持有注册关系，drop 不自动注销（进程退出即回收）。
 ///
@@ -48,19 +52,8 @@ impl HotkeyManager {
         Ok(())
     }
 
-    /// 当前已注册热键的 id（用于匹配事件）。
+    /// 当前已注册热键的 id（WM_HOTKEY 消息的 wParam 与之比较）。
     pub fn id(&self) -> u32 {
         self.hotkey.id()
-    }
-}
-
-/// 从全局热键事件 channel 取一个**按下**事件，且属于目标热键 id。
-///
-/// 返回 `true` 表示该事件已消费（截图触发）；无事件或无关事件返回 `false`。
-/// 注意用 `try_recv` 非阻塞轮询，主循环自行控制节拍。
-pub fn poll_trigger(hotkey_id: u32) -> bool {
-    match GlobalHotKeyEvent::receiver().try_recv() {
-        Ok(event) => event.state == HotKeyState::Pressed && event.id() == hotkey_id,
-        Err(_) => false,
     }
 }
