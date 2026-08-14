@@ -23,6 +23,7 @@ use windows_capture::settings::{
 };
 
 use super::frame::RawFrame;
+use crate::utils::math::Rect;
 
 /// 等待首帧的最长时限。
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -111,6 +112,39 @@ pub fn monitor_at_cursor() -> anyhow::Result<Monitor> {
         anyhow::bail!("MonitorFromPoint returned null for cursor position");
     }
     Ok(Monitor::from_raw_hmonitor(hmonitor.0))
+}
+
+/// 定位鼠标光标当前所在的显示器并返回其物理矩形
+/// （`GetMonitorInfoW` 的 `rcMonitor`，全屏区域、含任务栏覆盖范围）。
+///
+/// 覆盖层窗口按此矩形定位铺满显示器（含任务栏），选区也限制在其内。
+pub fn monitor_rect_at_cursor() -> anyhow::Result<Rect> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONULL,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.context("GetCursorPos failed")?;
+    let hmonitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONULL) };
+    if hmonitor == HMONITOR::default() {
+        anyhow::bail!("MonitorFromPoint returned null for cursor position");
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetMonitorInfoW(hmonitor, &mut info) }
+        .ok()
+        .context("GetMonitorInfoW failed")?;
+    let rc = info.rcMonitor;
+    Ok(Rect {
+        x: rc.left,
+        y: rc.top,
+        width: (rc.right - rc.left) as u32,
+        height: (rc.bottom - rc.top) as u32,
+    })
 }
 
 /// 捕获指定显示器的一帧 `Rgba16F` 数据（阻塞调用，内部起独立线程）。

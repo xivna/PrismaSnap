@@ -34,6 +34,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-capture = "2"
 # 剪贴板（Windows 实现同时写入 CF_DIBV5 + PNG 格式，微信/Office 兼容性好）
 arboard = "3.6"
+# GUI 栈（版本核实于 2026-08-14，egui 三件套必须同版本）：
+#   egui-wgpu 0.36.1 已升级依赖 wgpu 30（附录里 29 作废），egui-winit 0.36.1 锁 winit 0.30.13。
+#   wgpu 30 引入 SurfaceColorSpace（ExtendedSrgbLinear = scRGB 线性，HDR 输出关键）。
+#   egui-wgpu 关闭 default（不拉 wgpu/webgl），手动声明 wgpu 后端 features 只保留 dx12 + vulkan 兜底。
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false, features = ["winit"] }
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard"] }
+winit = { version = "0.30", features = ["rwh_06"] }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12", "vulkan"] }
+# 同步阻塞 poll wgpu 异步初始化（官方 demo 用法）
+pollster = "1"
+# wgpu 纹理数据上传（cast_slice）
+bytemuck = "1"
 # 系统托盘（tray-icon 0.24，事件经 channel 接收，需宿主跑 Windows 消息泵）
 tray-icon = "0.24"
 # 全局热键（底层 RegisterHotKey，轻量不拦截无关按键）
