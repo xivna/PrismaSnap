@@ -7,4 +7,7 @@ pub mod editor;
 pub mod overlay;
 pub mod settings;
 pub mod toolbar;
+
+// 托盘基于 tray-icon（仅 Windows target 引入），WSL2 下不编译。
+#[cfg(target_os = "windows")]
 pub mod tray;

@@ -16,6 +16,12 @@ half = "2"
 # 图像处理与 PNG/JPEG 编解码（纯 Rust，跨平台）。
 # 精简 features：默认会拉 exr/avif/tiff/webp 等大量 codec，只用 png/jpeg 以缩短交叉编译时间。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 配置序列化（TOML 配置文件）
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# 结构化日志（控制台 + 文件输出）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 仅 Windows 平台（屏幕捕获基于 Windows Graphics Capture，无法跨平台编译）。
 # 放在 target-specific 依赖里，保证 WSL2 下 cargo check/test 不编译它。
@@ -23,17 +29,26 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 windows-capture = "2"
 # 剪贴板（Windows 实现同时写入 CF_DIBV5 + PNG 格式，微信/Office 兼容性好）
 arboard = "3.6"
+# 系统托盘（tray-icon 0.24，事件经 channel 接收，需宿主跑 Windows 消息泵）
+tray-icon = "0.24"
+# 全局热键（底层 RegisterHotKey，轻量不拦截无关按键）
+global-hotkey = "0.8"
 # Win32/WinRT 绑定：
 #   - Win32_Devices_Display   CCD API：DisplayConfigGetDeviceInfo 查询 SDR 白点（无 CoreWindow 依赖）
+#   - Win32_Foundation        GetLastError / ERROR_ALREADY_EXISTS（单实例检测）
 #   - Win32_Graphics_Dxgi(_Common)/Gdi  DXGI：IDXGIOutput6::GetDesc1 查询显示器 MaxLuminance（算 headroom）
-#   - Win32_UI_WindowsAndMessaging  GetCursorPos（多显示器定位：鼠标所在屏）
+#   - Win32_System_Threading  CreateMutexW（单实例检测）
+#   - Win32_UI_WindowsAndMessaging  GetCursorPos / PeekMessageW 消息泵
 #   - Win32_System_WinRT      RoInitialize（HDR 相关 WinRT 调用兜底）
 # 版本须与 windows-capture 依赖的 windows 0.62 对齐。
 windows = { version = "0.62", features = [
     "Win32_Devices_Display",
+    "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_WinRT",
 ] }
@@ -54,8 +69,8 @@ windows = { version = "0.62", features = [
 #     windows          = "0.62"         # Win32/WinRT 绑定（色彩空间/HDR 检测、多显示器）✅ 已引入
 #
 #   框架外壳：
-#     tray-icon        = "0.24"         # 系统托盘
-#     global-hotkey    = "0.8"          # 全局热键（RegisterHotKey）
+#     tray-icon        = "0.24"         # 系统托盘 ✅ 已引入（2026-08-14）
+#     global-hotkey    = "0.8"          # 全局热键（RegisterHotKey）✅ 已引入（2026-08-14）
 #
 #   GUI 栈（版本必须对齐，见 AGENTS.md 3.1）：
 #     egui             = "0.36"

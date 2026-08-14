@@ -6,7 +6,10 @@
 pub mod annotation;
 pub mod capture;
 pub mod config;
-pub mod hotkey;
 pub mod llm;
 pub mod ui;
 pub mod utils;
+
+// 热键基于 global-hotkey（仅 Windows target 引入），WSL2 下不编译。
+#[cfg(target_os = "windows")]
+pub mod hotkey;
