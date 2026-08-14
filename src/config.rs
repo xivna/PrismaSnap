@@ -29,7 +29,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hotkey: String::from("Ctrl+Shift+A"),
+            // 注意：不要用 Ctrl+Shift 开头的组合——那是 Windows 中文系统
+            // "输入语言切换"的默认热键，会在按键到达 RegisterHotKey 之前
+            // 被系统抢跑（注册成功但永不触发，见 docs/热键问题排查.md）
+            hotkey: String::from("Ctrl+Alt+A"),
             save: SaveConfig::default(),
             capture: CaptureConfig::default(),
             llm: LlmConfig::default(),

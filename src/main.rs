@@ -123,8 +123,11 @@ mod imp {
         let mut triggered = false;
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            if msg.message == WM_HOTKEY && msg.wParam.0 as u32 == hotkey_id {
-                triggered = true;
+            if msg.message == WM_HOTKEY {
+                tracing::info!("泵到 WM_HOTKEY: wParam={} (期望 id {hotkey_id})", msg.wParam.0);
+                if msg.wParam.0 as u32 == hotkey_id {
+                    triggered = true;
+                }
             }
             unsafe {
                 let _ = TranslateMessage(&msg);
