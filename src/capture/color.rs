@@ -64,6 +64,20 @@ pub fn linear_to_srgb_gamma(x: f32) -> f32 {
     }
 }
 
+/// 线性 SDR → sRGB 8-bit 直通转换（无增益、无归一化），输出 `[r, g, b]`。
+///
+/// 适用于系统未开启 HDR 的显示器：此时 WGC 的 `Rgba16F` 缓冲就是
+/// 0~1.0 的线性 sRGB 数据（不存在 >1.0 高光），直接 gamma 编码即为原图。
+/// 不应复用 [`hdr_to_srgb`]（其默认增益 0.617 会整体压暗画面）。
+pub fn sdr_linear_to_srgb(r: f32, g: f32, b: f32) -> [u8; 3] {
+    let to_byte = |v: f32| {
+        (linear_to_srgb_gamma(v.clamp(0.0, 1.0)) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [to_byte(r), to_byte(g), to_byte(b)]
+}
+
 /// 保色相 HDR → SDR 转换（默认参数），输出 sRGB 8-bit `[r, g, b]`。
 ///
 /// 使用 [`DEFAULT_GAIN`] + 硬裁剪（与 Windows 自带 HDR 截图行为一致）。
@@ -109,6 +123,30 @@ mod tests {
     /// 两值近似相等（浮点容差）。
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn sdr_linear_to_srgb_endpoints() {
+        assert_eq!(sdr_linear_to_srgb(0.0, 0.0, 0.0), [0, 0, 0]);
+        assert_eq!(sdr_linear_to_srgb(1.0, 1.0, 1.0), [255, 255, 255]);
+    }
+
+    #[test]
+    fn sdr_linear_to_srgb_mid_gray() {
+        // 0.5 线性灰 → gamma 编码 ≈ 0.7354 → 188（直通无增益，对比 hdr 路径的 147）
+        let [r, g, b] = sdr_linear_to_srgb(0.5, 0.5, 0.5);
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert!((187..=189).contains(&r), "0.5 线性灰应约 188，实际 {r}");
+    }
+
+    #[test]
+    fn sdr_linear_to_srgb_clamps() {
+        // 越界值 clamp 到 [0,1] 后再编码，不产生越界字节
+        let [r, g, b] = sdr_linear_to_srgb(-0.5, 0.5, 1.5);
+        assert_eq!(r, 0);
+        assert!((187..=189).contains(&g));
+        assert_eq!(b, 255);
     }
 
     #[test]

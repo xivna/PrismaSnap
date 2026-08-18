@@ -1,20 +1,27 @@
 //! Windows 显示信息查询（仅 Windows 平台编译）。
 //!
-//! 提供两项截图 HDR 处理所需的显示器参数：
-//! 1. **SDR 白点**（nit）：用 CCD API `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)`，
+//! 提供截图 HDR 处理所需的显示器参数：
+//! 1. **HDR 状态**：用 DXGI `IDXGIOutput6::GetDesc1().ColorSpace`，
+//!    等于 HDR10（ST.2084 PQ + BT.2020）即判定系统已开 HDR。
+//! 2. **SDR 白点**（nit）：用 CCD API `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)`，
 //!    纯 Win32 调用，无 CoreWindow 依赖（console / 后台线程都能用）。
 //!    绕开 `DisplayInformation::GetForCurrentView()` 的 CoreWindow 限制。
-//! 2. **最大亮度**（nit）：用 DXGI `IDXGIOutput6::GetDesc1().MaxLuminance`，
-//!    用于计算 tone map 的物理 headroom（= 最大亮度 / SDR 白点）。
+//! 3. **最大亮度**（nit）：用 DXGI `IDXGIOutput6::GetDesc1().MaxLuminance`，
+//!    用于 HDR 状态诊断（色彩映射本身不依赖它，见 PROGRESS.md 决策记录 v3）。
 //!
-//! 两者均需按 GDI 设备名（如 `\\.\DISPLAY1`）匹配到目标显示器，
+//! DXGI 查询均需按 GDI 设备名（如 `\\.\DISPLAY1`）匹配到目标显示器，
 //! 多显示器场景下不能省（见 AGENTS.md 3.4 节）。
 
+use windows::core::Interface;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
     DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6, DXGI_OUTPUT_DESC1,
 };
 
 /// 把以 `\0` 结尾的 UTF-16 数组转成 Rust `String`。
@@ -78,14 +85,9 @@ pub fn query_sdr_white_nits(device_name: &str) -> anyhow::Result<f32> {
     anyhow::bail!("no active display path matched device name `{device_name}`")
 }
 
-/// 查询指定显示器（GDI 设备名）的最大亮度，单位 nit。
-///
-/// 通过 DXGI 枚举 adapter / output，用 `DXGI_OUTPUT_DESC.DeviceName` 匹配，
-/// 再 `cast` 到 `IDXGIOutput6` 读取 `MaxLuminance`。
-pub fn query_max_luminance_nits(device_name: &str) -> anyhow::Result<f32> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};
-    use windows::core::Interface;
-
+/// 按 GDI 设备名（如 `\\.\DISPLAY1`）枚举 DXGI adapter/output，
+/// 返回匹配的 `IDXGIOutput6`。
+fn find_output6(device_name: &str) -> anyhow::Result<IDXGIOutput6> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
 
     for adapter_idx in 0u32.. {
@@ -103,11 +105,35 @@ pub fn query_max_luminance_nits(device_name: &str) -> anyhow::Result<f32> {
             if utf16_to_string(&desc.DeviceName) != device_name {
                 continue;
             }
-            let output6: IDXGIOutput6 = output.cast()?;
-            let desc1 = unsafe { output6.GetDesc1()? };
-            return Ok(desc1.MaxLuminance);
+            return Ok(output.cast()?);
         }
     }
 
     anyhow::bail!("no DXGI output matched device name `{device_name}`")
+}
+
+/// 查询指定显示器（GDI 设备名）的 `DXGI_OUTPUT_DESC1`（含色彩空间与最大亮度）。
+fn query_output_desc1(device_name: &str) -> anyhow::Result<DXGI_OUTPUT_DESC1> {
+    let output6 = find_output6(device_name)?;
+    Ok(unsafe { output6.GetDesc1()? })
+}
+
+/// 查询指定显示器（GDI 设备名）是否处于 HDR 输出模式。
+///
+/// 判定依据：`DXGI_OUTPUT_DESC1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`
+/// （HDR10：BT.2020 + ST.2084 PQ），这是系统级"HDR 已开启"的标准信号。
+/// SDR 屏（含"HDR 屏但系统未开 HDR"）返回 false，此时 WGC 的 Rgba16F
+/// 缓冲就是 0~1.0 的线性 SDR 数据，应原图直出、不做 HDR 增益。
+pub fn query_is_hdr(device_name: &str) -> anyhow::Result<bool> {
+    let desc1 = query_output_desc1(device_name)?;
+    Ok(desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+}
+
+/// 查询指定显示器（GDI 设备名）的最大亮度，单位 nit。
+///
+/// 经 [`query_output_desc1`] 读取 `MaxLuminance`，用于 HDR 状态诊断
+/// （色彩映射本身不需要它，见 PROGRESS.md 决策记录 v3）。
+pub fn query_max_luminance_nits(device_name: &str) -> anyhow::Result<f32> {
+    let desc1 = query_output_desc1(device_name)?;
+    Ok(desc1.MaxLuminance)
 }

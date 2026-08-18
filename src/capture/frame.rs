@@ -44,6 +44,22 @@ pub fn read_f16(bytes: &[u8]) -> f32 {
 ///
 /// alpha 通道做简单 clamp（屏幕捕获 alpha 恒为 1.0，仅作兼容处理）。
 pub fn frame_to_srgb_image(frame: &RawFrame, sdr_white_scrgb: f32) -> RgbaImage {
+    convert_frame(frame, |r, g, b| {
+        crate::capture::color::hdr_to_srgb(r, g, b, sdr_white_scrgb)
+    })
+}
+
+/// 把 Rgba16F 原始帧按 **SDR 直通**转换为 8-bit sRGB RGBA 图像。
+///
+/// 用于系统未开启 HDR 的显示器：数据本身就是 0~1.0 的线性 SDR，
+/// 直接 gamma 编码即为原图（无增益、无归一化，见
+/// [`crate::capture::color::sdr_linear_to_srgb`]）。
+pub fn frame_to_srgb_image_direct(frame: &RawFrame) -> RgbaImage {
+    convert_frame(frame, crate::capture::color::sdr_linear_to_srgb)
+}
+
+/// 按逐像素转换函数把 Rgba16F 帧转成 RGBA8 图像（两公开函数共用）。
+fn convert_frame(frame: &RawFrame, convert: impl Fn(f32, f32, f32) -> [u8; 3]) -> RgbaImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
     let mut img = RgbaImage::new(frame.width, frame.height);
@@ -57,7 +73,7 @@ pub fn frame_to_srgb_image(frame: &RawFrame, sdr_white_scrgb: f32) -> RgbaImage 
             let b = read_f16(&frame.data[px + 4..px + 6]);
             let a = read_f16(&frame.data[px + 6..px + 8]);
 
-            let [sr, sg, sb] = crate::capture::color::hdr_to_srgb(r, g, b, sdr_white_scrgb);
+            let [sr, sg, sb] = convert(r, g, b);
             let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
             img.put_pixel(x as u32, y as u32, image::Rgba([sr, sg, sb, alpha]));
         }
@@ -113,6 +129,18 @@ mod tests {
         let expected = crate::capture::color::hdr_to_srgb(0.5, 0.5, 0.5, 1.0);
         assert_eq!([p[0], p[1], p[2]], expected);
         // alpha 恒 1.0 → 255
+        assert_eq!(p[3], 255);
+    }
+
+    #[test]
+    fn frame_to_srgb_image_direct_matches_color_fn() {
+        // 直通版与 color::sdr_linear_to_srgb 输出一致，且 1.0 白不压暗（SDR 屏原图直出）
+        let frame = make_frame([1.0, 0.5, 0.0]);
+        let img = frame_to_srgb_image_direct(&frame);
+        let p = img.get_pixel(0, 0);
+        let expected = crate::capture::color::sdr_linear_to_srgb(1.0, 0.5, 0.0);
+        assert_eq!([p[0], p[1], p[2]], expected);
+        assert_eq!(p[0], 255, "纯白不应被压暗");
         assert_eq!(p[3], 255);
     }
 }

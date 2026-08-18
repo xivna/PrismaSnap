@@ -171,22 +171,38 @@ mod imp {
         let raw = engine::capture_frame(monitor).map_err(|e| e.to_string())?;
         info!("捕获完成: {}x{}", raw.width, raw.height);
 
-        // HDR 降级开关：直接把 scRGB clamp 当 SDR 处理（SDR 白点 = 1.0）
-        let sdr_white = if config.capture.hdr_degrade {
-            1.0
-        } else {
-            match display_info::query_sdr_white_nits(&raw.device_name) {
-                Ok(n) => {
-                    info!("SDR 白点: {n} nit");
-                    n / 80.0
-                }
-                Err(e) => {
-                    warn!("SDR 白点查询失败: {e}，回退 80 nit");
-                    1.0
-                }
+        // 色彩转换路径按显示器 HDR 状态分流：
+        // - 非 HDR 屏：Rgba16F 数据即 0~1.0 线性 SDR，直通 gamma 编码 = 原图；
+        // - HDR 屏：scRGB 高光 >1.0，走 SDR 白点归一化 + 增益（对齐 Windows 截图行为）。
+        let is_hdr = match display_info::query_is_hdr(&raw.device_name) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("HDR 状态查询失败: {e}，按 SDR 屏原图直出");
+                false
             }
         };
-        let img = frame::frame_to_srgb_image(&raw, sdr_white);
+        let img = if is_hdr {
+            info!("显示器处于 HDR 模式，走 HDR 色彩转换");
+            // HDR 降级开关：直接把 scRGB clamp 当 SDR 处理（SDR 白点 = 1.0）
+            let sdr_white = if config.capture.hdr_degrade {
+                1.0
+            } else {
+                match display_info::query_sdr_white_nits(&raw.device_name) {
+                    Ok(n) => {
+                        info!("SDR 白点: {n} nit");
+                        n / 80.0
+                    }
+                    Err(e) => {
+                        warn!("SDR 白点查询失败: {e}，回退 80 nit");
+                        1.0
+                    }
+                }
+            };
+            frame::frame_to_srgb_image(&raw, sdr_white)
+        } else {
+            info!("显示器处于 SDR 模式，原图直出");
+            frame::frame_to_srgb_image_direct(&raw)
+        };
         Ok(CapturedShot { img, monitor_rect })
     }
 
