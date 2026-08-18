@@ -28,6 +28,27 @@ pub struct RawFrame {
     pub device_name: String,
 }
 
+impl RawFrame {
+    /// 把 Rgba16F 帧数据紧凑化为连续布局，行按 256 字节对齐（行尾补零）。
+    ///
+    /// WGC 返回的行距 `row_pitch` 可能带对齐填充，且不保证是 256 的倍数；
+    /// wgpu 的 `write_texture` 要求 `bytes_per_row` 为 256 的倍数。
+    /// 因此每行取前 `width * 8` 字节有效数据紧凑排列，行尾补零到 256 对齐
+    /// （padding 在像素区之外，采样不会触达）。
+    pub fn compact_rgba16f_data(&self) -> Vec<u8> {
+        let bytes_per_row = self.width as usize * 8;
+        let aligned = bytes_per_row.next_multiple_of(256);
+        let mut out = vec![0u8; aligned * self.height as usize];
+        for y in 0..self.height as usize {
+            let src = y * self.row_pitch;
+            let dst = y * aligned;
+            out[dst..dst + bytes_per_row]
+                .copy_from_slice(&self.data[src..src + bytes_per_row]);
+        }
+        out
+    }
+}
+
 /// 从 2 字节小端数据读出 f16 并转 f32。
 ///
 /// # Panics
@@ -142,5 +163,46 @@ mod tests {
         assert_eq!([p[0], p[1], p[2]], expected);
         assert_eq!(p[0], 255, "纯白不应被压暗");
         assert_eq!(p[3], 255);
+    }
+
+    #[test]
+    fn compact_rgba16f_data_strips_padding_and_aligns() {
+        // 2 像素宽的帧，row_pitch = 24（含 8 字节行尾填充）：
+        // 行 0 有效数据 16 字节 + 8 字节填充，行 1 同。构造时逐字节写入以区分填充。
+        let mut data = vec![0xFFu8; 24 * 2];
+        for y in 0..2 {
+            for i in 0..16 {
+                data[y * 24 + i] = (y * 16 + i) as u8;
+            }
+            // 行尾 8 字节填充保持 0xFF
+        }
+        let frame = RawFrame {
+            width: 2,
+            height: 2,
+            row_pitch: 24,
+            data,
+            device_name: String::from("test"),
+        };
+        let compact = frame.compact_rgba16f_data();
+        // 每行对齐 256 字节，共 2 行
+        assert_eq!(compact.len(), 256 * 2);
+        for y in 0..2 {
+            let row = &compact[y * 256..y * 256 + 16];
+            for (i, &b) in row.iter().enumerate() {
+                assert_eq!(b, (y * 16 + i) as u8, "行 {y} 字节 {i} 与源数据不一致");
+            }
+            // 行尾补零（而非填充字节 0xFF）
+            assert!(compact[y * 256 + 16..(y + 1) * 256].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn compact_rgba16f_data_pitch_equals_row() {
+        // 无填充时（row_pitch == width*8）紧凑化结果 = 原数据 + 行对齐补零
+        let frame = make_frame([0.25, 0.5, 1.0]);
+        let compact = frame.compact_rgba16f_data();
+        assert_eq!(compact.len(), 256);
+        assert_eq!(&compact[..16], &frame.data[..16]);
+        assert!(compact[16..].iter().all(|&b| b == 0));
     }
 }

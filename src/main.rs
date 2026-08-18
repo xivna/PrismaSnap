@@ -203,7 +203,12 @@ mod imp {
             info!("显示器处于 SDR 模式，原图直出");
             frame::frame_to_srgb_image_direct(&raw)
         };
-        Ok(CapturedShot { img, monitor_rect })
+        Ok(CapturedShot {
+            img,
+            raw,
+            is_hdr,
+            monitor_rect,
+        })
     }
 
     /// 程序入口：单实例 → 日志 → 配置 → 热键 → 托盘 → 事件循环。

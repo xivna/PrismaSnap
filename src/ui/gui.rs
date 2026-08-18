@@ -4,10 +4,16 @@
 //! （`take_egui_input` → `run` → `handle_platform_output` → `tessellate` →
 //! `renderer.render`），以及截图纹理上传。
 //!
-//! 当前 MVP 走 **SDR 路径**（`Rgba8UnormSrgb` + `SurfaceColorSpace::Srgb`），
-//! 显示经 HDR 转换后的 sRGB 截图（与最终输出一致，所见即所得）；
-//! HDR swapchain（`Rgba16Float` + `ExtendedSrgbLinear`，scRGB 直通）已由
-//! `wgpu_hdr_demo` 验证机制，待实机确认后接入合成管线（见 PROGRESS.md）。
+//! 双输出模式：
+//! - **SDR 路径**（默认）：swapchain `Rgba8Unorm` + `SurfaceColorSpace::Srgb`，
+//!   截图以 sRGB 纹理走 egui 绘制（与最终输出一致，所见即所得）。
+//! - **HDR 路径**（HDR 屏 + surface 支持时）：swapchain `Rgba16Float` +
+//!   `ExtendedSrgbLinear`（scRGB 线性，高光 >1.0 直通显示器）。
+//!   合成两段式：① egui 渲染到中间纹理 `Rgba8UnormSrgb`（egui-wgpu 的
+//!   `fs_main_linear_framebuffer` 路径，存储 sRGB 编码值）；② 合成 pass
+//!   采样截图 scRGB 纹理（Rgba16Float，线性原样直通）+ egui 中间纹理
+//!   （*Srgb 采样自动解码为线性），按预乘 alpha 混合输出到 swapchain。
+//!   遮罩/UI 层因此在 linear 空间与截图混合（AGENTS.md 3.2 节）。
 
 use std::sync::Arc;
 
@@ -15,6 +21,92 @@ use anyhow::Context;
 use winit::event::WindowEvent;
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::Window;
+
+use crate::capture::frame::RawFrame;
+
+/// HDR 合成 shader：截图 scRGB 直通 + egui 层预乘混合。
+///
+/// - `shot_tex`：Rgba16Float scRGB 截图（线性，原样输出，>1.0 高光透传）；
+/// - `ui_tex`：Rgba8UnormSrgb egui 中间纹理（采样时硬件自动 sRGB→linear 解码，
+///   存储为预乘 alpha 的 sRGB 值）；
+/// - 混合公式（premultiplied over）：`ui.rgb + shot.rgb * (1 - ui.a)`。
+const COMPOSITE_SHADER: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    var positions = array<vec2f, 3>(
+        vec2f(-1.0, -1.0),
+        vec2f(3.0, -1.0),
+        vec2f(-1.0, 3.0),
+    );
+    let p = positions[vi];
+    var out: VsOut;
+    out.pos = vec4f(p, 0.0, 1.0);
+    // uv.y 翻转：clip y=+1（屏幕顶部）应对应纹理 v=0（数据第一行），
+    // 否则截图与 egui 层整体上下倒转
+    out.uv = vec2f((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+    return out;
+}
+
+@group(0) @binding(0) var shot_tex: texture_2d<f32>;
+@group(0) @binding(1) var ui_tex: texture_2d<f32>;
+@group(0) @binding(2) var tex_sampler: sampler;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+    let shot = textureSample(shot_tex, tex_sampler, in.uv);
+    let ui = textureSample(ui_tex, tex_sampler, in.uv);
+    return vec4f(ui.rgb + shot.rgb * (1.0 - ui.a), 1.0);
+}
+"#;
+
+/// HDR 合成资源（仅 HDR 输出模式存在）。
+struct HdrComposite {
+    /// egui 中间纹理（`Rgba8UnormSrgb`，尺寸 = 窗口物理像素）。
+    ui_texture: wgpu::Texture,
+    ui_texture_view: wgpu::TextureView,
+    /// 截图 scRGB 纹理（`Rgba16Float`），截图上传后存在。
+    scrgb_texture: Option<wgpu::Texture>,
+    scrgb_view: Option<wgpu::TextureView>,
+    /// 线性采样器（clamp 到边缘）。
+    sampler: wgpu::Sampler,
+    bind_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    /// 合成 bind group（依赖截图视图与中间纹理视图，随二者重建）。
+    bind_group: Option<wgpu::BindGroup>,
+}
+
+impl HdrComposite {
+    /// 重建合成 bind group（截图上传或窗口 resize 后调用）。
+    fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
+        let Some(scrgb_view) = &self.scrgb_view else {
+            self.bind_group = None;
+            return;
+        };
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite_bind_group"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scrgb_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.ui_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        }));
+    }
+}
 
 /// wgpu + egui 渲染栈。
 pub struct GuiState {
@@ -25,13 +117,17 @@ pub struct GuiState {
     renderer: egui_wgpu::Renderer,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
+    /// HDR 合成资源；`None` 表示走 SDR 路径（swapchain 直渲 egui）。
+    hdr: Option<HdrComposite>,
 }
 
 impl GuiState {
     /// 初始化 GPU 设备、surface 与 egui 渲染器。
     ///
     /// * `window` - 目标窗口（surface 按其尺寸/DPI 配置）。
-    pub fn new(window: &Arc<Window>) -> anyhow::Result<Self> {
+    /// * `want_hdr` - 请求 HDR 输出（HDR 屏截图预览用）；surface 不支持
+    ///   `Rgba16Float + ExtendedSrgbLinear` 时自动回退 SDR 路径。
+    pub fn new(window: &Arc<Window>, want_hdr: bool) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window.clone())
@@ -50,16 +146,36 @@ impl GuiState {
         .context("请求 GPU 设备失败")?;
 
         let caps = surface.get_capabilities(&adapter);
-        // egui 偏好非 sRGB framebuffer（egui 输出 sRGB 编码值，写 unorm 直通；
-        // *Srgb 格式会触发二次编码）。SurfaceColorSpace::Srgb 声明"值已 sRGB 编码"。
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let color_space = wgpu::SurfaceColorSpace::Srgb;
+        let hdr_supported = want_hdr
+            && caps.format_capabilities.iter().any(|fc| {
+                fc.format == wgpu::TextureFormat::Rgba16Float
+                    && wgpu::SurfaceColorSpace::ExtendedSrgbLinear
+                        .to_color_spaces()
+                        .is_some_and(|flags| fc.color_spaces.contains(flags))
+            });
+
+        let (format, color_space) = if hdr_supported {
+            (
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+            )
+        } else {
+            // egui 偏好非 sRGB framebuffer（egui 输出 sRGB 编码值，写 unorm 直通；
+            // *Srgb 格式会触发二次编码）。SurfaceColorSpace::Srgb 声明"值已 sRGB 编码"。
+            (
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::SurfaceColorSpace::Srgb,
+            )
+        };
+        let expected_cs = color_space
+            .to_color_spaces()
+            .expect("已选定的 SurfaceColorSpace 应可转 SurfaceColorSpaces");
         if !caps
             .format_capabilities
             .iter()
-            .any(|fc| fc.format == format && fc.color_spaces.contains(wgpu::SurfaceColorSpaces::SRGB))
+            .any(|fc| fc.format == format && fc.color_spaces.contains(expected_cs))
         {
-            anyhow::bail!("surface 不支持 Rgba8Unorm + Srgb: {:?}", caps.formats);
+            anyhow::bail!("surface 不支持 {format:?} + {color_space:?}: {:?}", caps.formats);
         }
 
         let size = window.inner_size();
@@ -76,7 +192,15 @@ impl GuiState {
         };
         surface.configure(&device, &config);
 
-        let renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        // egui 渲染目标：HDR 模式画到中间纹理（Rgba8UnormSrgb，egui-wgpu 走
+        // linear_framebuffer 变体输出 linear、硬件编码回 sRGB 存储），
+        // SDR 模式直接画 swapchain（Rgba8Unorm）。
+        let renderer_format = if hdr_supported {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let renderer = egui_wgpu::Renderer::new(&device, renderer_format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         let ppp = window.scale_factor() as f32;
         let egui_state = egui_winit::State::new(
@@ -94,6 +218,36 @@ impl GuiState {
             repaint_window.request_redraw();
         });
 
+        let hdr = if hdr_supported {
+            let (ui_texture, ui_texture_view) = create_ui_texture(&device, config.width, config.height);
+            let (bind_layout, pipeline) = create_composite_pipeline(&device, format);
+            let mut hdr = HdrComposite {
+                ui_texture,
+                ui_texture_view,
+                scrgb_texture: None,
+                scrgb_view: None,
+                sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("composite_sampler"),
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                    ..Default::default()
+                }),
+                bind_layout,
+                pipeline,
+                bind_group: None,
+            };
+            hdr.rebuild_bind_group(&device);
+            tracing::info!("覆盖层 HDR 输出已启用: {format:?} + {color_space:?}");
+            Some(hdr)
+        } else {
+            tracing::info!("覆盖层走 SDR 输出: {format:?} + {color_space:?}");
+            None
+        };
+
         Ok(Self {
             surface,
             device,
@@ -102,7 +256,13 @@ impl GuiState {
             renderer,
             egui_ctx,
             egui_state,
+            hdr,
         })
+    }
+
+    /// 是否启用了 HDR 输出（合成管线）。
+    pub fn is_hdr(&self) -> bool {
+        self.hdr.is_some()
     }
 
     /// 把窗口事件喂给 egui（记录输入状态），返回 egui 是否消费了该事件。
@@ -163,29 +323,79 @@ impl GuiState {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        {
-            let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("prismsnap_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            // forget_lifetime：wgpu 官方模式，pass 不交给外部即安全
-            self.renderer.render(
-                &mut rp.forget_lifetime(),
-                &primitives,
-                &screen_descriptor,
-            );
+
+        if let Some(hdr) = &self.hdr {
+            // HDR 两段式：pass 1 egui → 中间纹理；pass 2 合成 → swapchain
+            {
+                let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui_ui_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &hdr.ui_texture_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                // forget_lifetime：wgpu 官方模式，pass 不交给外部即安全
+                self.renderer.render(
+                    &mut rp.forget_lifetime(),
+                    &primitives,
+                    &screen_descriptor,
+                );
+            }
+            if let Some(bind_group) = &hdr.bind_group {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("composite_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&hdr.pipeline);
+                rp.set_bind_group(0, bind_group, &[]);
+                rp.draw(0..3, 0..1);
+            }
+        } else {
+            {
+                let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("prismsnap_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                // forget_lifetime：wgpu 官方模式，pass 不交给外部即安全
+                self.renderer.render(
+                    &mut rp.forget_lifetime(),
+                    &primitives,
+                    &screen_descriptor,
+                );
+            }
         }
         self.queue
             .submit(user_cmd_bufs.into_iter().chain([encoder.finish()]));
@@ -199,7 +409,7 @@ impl GuiState {
         self.queue.present(frame);
     }
 
-    /// 窗口尺寸变化后重配 surface。
+    /// 窗口尺寸变化后重配 surface（HDR 模式下同步重建中间纹理）。
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -207,6 +417,10 @@ impl GuiState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        if let Some(hdr) = &mut self.hdr {
+            (hdr.ui_texture, hdr.ui_texture_view) = create_ui_texture(&self.device, width, height);
+            hdr.rebuild_bind_group(&self.device);
+        }
     }
 
     /// egui 上下文（注册纹理等）。
@@ -217,8 +431,12 @@ impl GuiState {
     /// 把 RGBA8 图像上传为 GPU 纹理并注册到 egui，返回
     /// `(TextureId, Texture, TextureView)`。
     ///
-    /// 纹理为 `Rgba8UnormSrgb`（图像已是 sRGB 编码值），egui 按 sRGB 纹理采样；
-    /// 调用方须持有返回的 `Texture`/`TextureView` 直到不再使用该 `TextureId`。
+    /// 纹理为 `Rgba8Unorm`（非 `*Srgb`）：图像已是 sRGB 编码值，egui-wgpu
+    /// 假设纹理"NOT sRGB-aware"（采样不转换、原样输出）。若用 `*Srgb` 格式，
+    /// wgpu 采样时会自动解码为 linear，egui 再当 sRGB 输出 → 双重 gamma、
+    /// 预览偏亮偏饱和。调用方须持有返回的 `Texture`/`TextureView` 直到不再
+    /// 使用该 `TextureId`。仅 SDR 路径使用（HDR 路径截图走
+    /// [`Self::upload_scrgb_texture`]）。
     pub fn upload_texture(
         &mut self,
         img: &image::RgbaImage,
@@ -235,7 +453,7 @@ impl GuiState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -260,4 +478,143 @@ impl GuiState {
             .register_native_texture(&self.device, &view, wgpu::FilterMode::Linear);
         (id, texture, view)
     }
+
+    /// 把 scRGB 原始帧（f16 小端字节流）上传为 `Rgba16Float` 纹理，
+    /// 供合成 pass 直通显示（HDR 路径，线性值零转换）。
+    ///
+    /// 纹理与视图存于 `GuiState` 内部（合成管线持有视图引用），
+    /// 上传前会紧凑化数据并 256 字节行对齐（wgpu 要求）。
+    pub fn upload_scrgb_texture(&mut self, raw: &RawFrame) -> anyhow::Result<()> {
+        let hdr = self.hdr.as_mut().context("HDR 合成管线未启用")?;
+        let data = raw.compact_rgba16f_data();
+        let bytes_per_row = (raw.width as usize * 8).next_multiple_of(256) as u32;
+        let texture_size = wgpu::Extent3d {
+            width: raw.width,
+            height: raw.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot_scrgb"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: None,
+            },
+            texture_size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        hdr.scrgb_texture = Some(texture);
+        hdr.scrgb_view = Some(view);
+        hdr.rebuild_bind_group(&self.device);
+        Ok(())
+    }
+}
+
+/// 创建 egui 中间纹理（`Rgba8UnormSrgb`，尺寸 = 窗口物理像素）。
+fn create_ui_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("egui_ui_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// 创建合成管线与 bind group layout。
+fn create_composite_pipeline(
+    device: &wgpu::Device,
+    output_format: wgpu::TextureFormat,
+) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("composite_shader"),
+        source: wgpu::ShaderSource::Wgsl(COMPOSITE_SHADER.into()),
+    });
+    let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_bind_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("composite_layout"),
+        bind_group_layouts: &[Some(&bind_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("composite_pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: output_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (bind_layout, pipeline)
 }

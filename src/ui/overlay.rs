@@ -41,8 +41,12 @@ const MIN_SELECTION_SIZE: u32 = 3;
 
 /// 截图负载（捕获线程产出，经 `EventLoopProxy` 传回主线程）。
 pub struct CapturedShot {
-    /// HDR 转换后的 sRGB 截图（与最终输出一致，所见即所得）。
+    /// HDR 转换后的 sRGB 截图（与最终输出一致，所见即所得；SDR 预览用）。
     pub img: image::RgbaImage,
+    /// 原始 scRGB 帧（HDR 预览直通显示用；SDR 屏不用）。
+    pub raw: crate::capture::frame::RawFrame,
+    /// 来源显示器是否处于 HDR 模式（决定覆盖层输出路径）。
+    pub is_hdr: bool,
     /// 来源显示器物理矩形（覆盖层窗口铺满范围，含任务栏区域）。
     pub monitor_rect: Rect,
 }
@@ -52,10 +56,13 @@ pub struct Overlay {
     window: Arc<Window>,
     gui: GuiState,
     image: Arc<image::RgbaImage>,
-    /// 截图纹理（须存活至 Overlay 销毁）。
-    _texture: wgpu::Texture,
-    _texture_view: wgpu::TextureView,
-    texture_id: egui::TextureId,
+    /// 截图纹理（须存活至 Overlay 销毁）。仅 SDR 路径使用，
+    /// HDR 路径纹理存于 `GuiState` 合成管线内。
+    _texture: Option<wgpu::Texture>,
+    _texture_view: Option<wgpu::TextureView>,
+    texture_id: Option<egui::TextureId>,
+    /// HDR 输出模式（截图由合成 pass 直通显示，不画 egui Image）。
+    hdr_mode: bool,
     mode: Mode,
     /// 最近一次光标位置（物理像素；`MouseInput` 事件不带坐标，以此补足）。
     current_cursor: Option<(f32, f32)>,
@@ -109,13 +116,22 @@ impl Overlay {
     }
 
     /// 初始化覆盖层（上传截图纹理，进入 `Selecting` 模式）。
+    ///
+    /// HDR 屏走 scRGB 直通合成管线（预览完整高光），SDR 屏上传 sRGB 纹理走 egui。
     pub fn new(
         window: Arc<Window>,
         shot: CapturedShot,
         config: Arc<Config>,
     ) -> anyhow::Result<Self> {
-        let mut gui = GuiState::new(&window)?;
-        let (texture_id, texture, view) = gui.upload_texture(&shot.img);
+        let mut gui = GuiState::new(&window, shot.is_hdr)?;
+        let (texture_id, texture, view) = if gui.is_hdr() {
+            gui.upload_scrgb_texture(&shot.raw)?;
+            (None, None, None)
+        } else {
+            let (id, t, v) = gui.upload_texture(&shot.img);
+            (Some(id), Some(t), Some(v))
+        };
+        let hdr_mode = gui.is_hdr();
         Ok(Self {
             window,
             gui,
@@ -123,6 +139,7 @@ impl Overlay {
             _texture: texture,
             _texture_view: view,
             texture_id,
+            hdr_mode,
             mode: Mode::Selecting,
             current_cursor: None,
             drag_start: None,
@@ -280,12 +297,13 @@ impl Overlay {
     /// 避免露出未渲染的默认背景（闪烁）。
     pub fn redraw(&mut self) {
         let texture_id = self.texture_id;
+        let hdr_mode = self.hdr_mode;
         let img_size = self.image.dimensions();
         let mode = self.mode;
         let selection = self.selection;
         let monitor_rect = self.monitor_rect;
         self.gui.render(self.window.as_ref(), move |ui| {
-            draw_frame(ui, texture_id, img_size, mode, selection, monitor_rect);
+            draw_frame(ui, texture_id, hdr_mode, img_size, mode, selection, monitor_rect);
         });
     }
 }
@@ -301,9 +319,12 @@ fn to_pts(rect: &Rect, ppp: f32) -> egui::Rect {
 /// 覆盖层一帧的 egui 绘制。
 ///
 /// 注意：egui 默认字体不含 CJK，提示文字暂用英文（中文字体嵌入见 Phase 3）。
+///
+/// HDR 模式下截图不在这里绘制（由合成 pass 直通显示），egui 只画遮罩/选区/提示层。
 fn draw_frame(
     ui: &mut egui::Ui,
-    texture_id: egui::TextureId,
+    texture_id: Option<egui::TextureId>,
+    hdr_mode: bool,
     img_size: (u32, u32),
     mode: Mode,
     selection: Option<Rect>,
@@ -313,9 +334,13 @@ fn draw_frame(
     let ppp = ctx.pixels_per_point();
     let screen_rect = to_pts(&monitor_rect, ppp);
 
-    // 截图（物理分辨率 1:1 铺满）
-    egui::Image::new((texture_id, egui::vec2(img_size.0 as f32, img_size.1 as f32)))
-        .paint_at(ui, screen_rect);
+    // 截图（物理分辨率 1:1 铺满）；HDR 模式由合成 pass 绘制，这里跳过
+    if !hdr_mode {
+        if let Some(texture_id) = texture_id {
+            egui::Image::new((texture_id, egui::vec2(img_size.0 as f32, img_size.1 as f32)))
+                .paint_at(ui, screen_rect);
+        }
+    }
 
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
