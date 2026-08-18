@@ -12,6 +12,10 @@
 //! `EventLoopProxy` 发 `CaptureDone` 唤醒主循环 → 创建覆盖层窗口选区 →
 //! Esc 取消 / Enter·Ctrl+C 复制 / Ctrl+S 保存（AGENTS.md 2.1 节）。
 //!
+//! 设置主界面：托盘「打开设置」菜单项或双击托盘图标打开；编辑缓冲保存后
+//! 热键即时改绑、配置写盘热更新。截图期间隐藏设置窗口、结束后恢复（避免
+//! 遮挡与抢焦点）。
+//!
 //! 发布版无控制台窗口（GUI 程序），日志写入 exe 同目录 logs/；
 //! 调试需要控制台时用 `--features console` 编译。
 
@@ -23,7 +27,8 @@
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     use anyhow::Context;
@@ -38,6 +43,7 @@ mod imp {
     use prismsnap::config::Config;
     use prismsnap::hotkey::HotkeyManager;
     use prismsnap::ui::overlay::{CapturedShot, Overlay};
+    use prismsnap::ui::settings::Settings;
     use prismsnap::ui::tray::{Tray, TrayAction};
     use prismsnap::utils::{logging, paths, single_instance};
 
@@ -46,16 +52,26 @@ mod imp {
         CaptureDone(Result<CapturedShot, String>),
     }
 
-    /// 应用状态：托盘 + 热键 + 覆盖层窗口。
+    /// 应用状态：托盘 + 热键 + 覆盖层窗口 + 设置窗口。
     struct App {
         config: Arc<Config>,
+        /// 配置文件路径（设置保存时写回）。
+        config_path: PathBuf,
         tray: Tray,
+        /// 热键管理器（设置界面改绑时 `rebind`）。
+        hotkeys: HotkeyManager,
+        /// 当前已注册热键 id（`Arc<AtomicU32>` 供消息钩子实时读取，改绑后更新）。
+        hotkey_id: Arc<AtomicU32>,
         /// 消息钩子检测到热键时置位，主循环在 `about_to_wait` 里消费。
         hotkey_triggered: Arc<AtomicBool>,
         /// 捕获线程回传结果的通道（克隆进线程）。
         proxy: EventLoopProxy<UserEvent>,
         /// 当前覆盖层窗口（None 表示无截图会话）。
         overlay: Option<Overlay>,
+        /// 设置主界面窗口（None 表示未打开）。
+        settings: Option<Settings>,
+        /// 热键是否因录制被挂起（录制结束恢复）。
+        hotkey_suspended: bool,
         /// 捕获进行中（防止热键连按重复触发）。
         capturing: bool,
     }
@@ -68,6 +84,10 @@ mod imp {
             }
             self.capturing = true;
             info!("触发截图");
+            // 隐藏设置窗口，避免遮挡与抢焦点（截图结束恢复）
+            if let Some(settings) = &self.settings {
+                settings.hide();
+            }
             let config = self.config.clone();
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -106,7 +126,139 @@ mod imp {
         fn close_overlay(&mut self, event_loop: &ActiveEventLoop) {
             info!("关闭覆盖层");
             self.overlay = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // 截图期间被隐藏的设置窗口恢复显示
+            if let Some(settings) = &self.settings {
+                settings.show();
+                event_loop.set_control_flow(ControlFlow::Poll);
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        }
+
+        /// 打开设置窗口（已打开则聚焦）。
+        fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
+            // 截图会话中不打开设置窗口，避免与全屏置顶覆盖层抢焦点
+            if self.overlay.is_some() {
+                return;
+            }
+            if let Some(settings) = &self.settings {
+                settings.focus();
+                return;
+            }
+            let window = match Settings::create_window(event_loop) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("创建设置窗口失败: {e:#}");
+                    return;
+                }
+            };
+            let mut settings = match Settings::new(window.clone(), &self.config) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("初始化设置窗口失败: {e:#}");
+                    return;
+                }
+            };
+            settings.redraw();
+            window.set_visible(true);
+            window.focus_window();
+            window.request_redraw();
+            self.settings = Some(settings);
+            event_loop.set_control_flow(ControlFlow::Poll);
+        }
+
+        /// 关闭设置窗口（丢弃编辑缓冲）。
+        fn close_settings(&mut self, event_loop: &ActiveEventLoop) {
+            // 录制期间关闭窗口：恢复被挂起的全局热键
+            if self.hotkey_suspended {
+                if let Err(e) = self.hotkeys.resume() {
+                    error!("恢复全局热键失败: {e:#}");
+                }
+                self.hotkey_suspended = false;
+            }
+            self.settings = None;
+            if self.overlay.is_none() {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        }
+
+        /// 消费设置窗口的保存/关闭请求（窗口事件后调用，借用独立）。
+        fn handle_settings_flags(&mut self, event_loop: &ActiveEventLoop) {
+            // 录制状态变化 → 挂起/恢复全局热键（避免旧热键拦截录制按键）
+            self.sync_hotkey_suspension();
+
+            let (pending, close) = match &self.settings {
+                Some(s) => (s.pending_save, s.close_requested),
+                None => return,
+            };
+            if close {
+                if let Some(s) = &mut self.settings {
+                    s.close_requested = false;
+                }
+                self.close_settings(event_loop);
+                return;
+            }
+            if pending {
+                if let Some(s) = &mut self.settings {
+                    s.pending_save = false;
+                }
+                self.apply_settings();
+            }
+        }
+
+        /// 按设置窗口的录制状态挂起/恢复全局热键。
+        fn sync_hotkey_suspension(&mut self) {
+            let recording = self
+                .settings
+                .as_ref()
+                .is_some_and(|s| s.is_recording());
+            if recording == self.hotkey_suspended {
+                return;
+            }
+            if recording {
+                if let Err(e) = self.hotkeys.suspend() {
+                    warn!("挂起全局热键失败: {e:#}");
+                } else {
+                    self.hotkey_suspended = true;
+                }
+            } else if let Err(e) = self.hotkeys.resume() {
+                error!("恢复全局热键失败: {e:#}");
+            } else {
+                self.hotkey_suspended = false;
+            }
+        }
+
+        /// 实时保存设置：热键变更则 `rebind`，其余变更静默写盘并热更新 `App.config`。
+        fn apply_settings(&mut self) {
+            // 先把编辑缓冲同步出 owned 副本，释放对 settings 的借用
+            let draft = match &mut self.settings {
+                Some(s) => s.apply_draft().clone(),
+                None => return,
+            };
+            // 热键变化才 rebind（先注册新热键，失败回退并提示，不写盘）
+            if draft.hotkey != self.config.hotkey {
+                if let Err(e) = self.hotkeys.rebind(&draft.hotkey) {
+                    if let Some(s) = &mut self.settings {
+                        s.set_status(false, format!("热键注册失败：{e:#}"));
+                        s.revert_hotkey(&self.config.hotkey);
+                    }
+                    return;
+                }
+                self.hotkey_id.store(self.hotkeys.id(), Ordering::SeqCst);
+                info!("全局热键已改绑: {}", draft.hotkey);
+                if let Some(s) = &mut self.settings {
+                    s.set_status(true, "热键已更新");
+                }
+            }
+            // 写盘
+            if let Err(e) = draft.save(&self.config_path) {
+                if let Some(s) = &mut self.settings {
+                    s.set_status(false, format!("保存失败：{e:#}"));
+                }
+                return;
+            }
+            self.config = Arc::new(draft);
+            info!("配置已保存: {}", self.config_path.display());
         }
     }
 
@@ -119,16 +271,28 @@ mod imp {
             window_id: WindowId,
             event: WindowEvent,
         ) {
-            let Some(overlay) = self.overlay.as_mut() else {
-                return;
-            };
-            if overlay.window_id() != window_id {
+            // 覆盖层窗口事件
+            if let Some(overlay) = &mut self.overlay {
+                if overlay.window_id() == window_id {
+                    overlay.on_window_event(&event);
+                    if overlay.exit_requested {
+                        self.close_overlay(event_loop);
+                    }
+                    return;
+                }
+            }
+            // 设置窗口事件
+            if let Some(settings) = &mut self.settings {
+                if settings.window_id() == window_id {
+                    settings.on_window_event(&event);
+                } else {
+                    return;
+                }
+            } else {
                 return;
             }
-            overlay.on_window_event(&event);
-            if overlay.exit_requested {
-                self.close_overlay(event_loop);
-            }
+            // 处理设置窗口的保存/关闭请求（借用独立，避免与上面的可变借用冲突）
+            self.handle_settings_flags(event_loop);
         }
 
         fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -153,6 +317,7 @@ mod imp {
             }
             match self.tray.poll_action() {
                 Some(TrayAction::Capture) => self.trigger_capture(),
+                Some(TrayAction::OpenSettings) => self.open_settings(event_loop),
                 Some(TrayAction::Exit) => {
                     info!("托盘菜单退出");
                     event_loop.exit();
@@ -168,7 +333,8 @@ mod imp {
     fn capture_shot(config: &Config) -> Result<CapturedShot, String> {
         let monitor_rect = engine::monitor_rect_at_cursor().map_err(|e| e.to_string())?;
         let monitor = engine::monitor_at_cursor().map_err(|e| e.to_string())?;
-        let raw = engine::capture_frame(monitor).map_err(|e| e.to_string())?;
+        let raw = engine::capture_frame(monitor, config.capture.cursor_visible)
+            .map_err(|e| e.to_string())?;
         info!("捕获完成: {}x{}", raw.width, raw.height);
 
         // 色彩转换路径按显示器 HDR 状态分流：
@@ -183,19 +349,14 @@ mod imp {
         };
         let img = if is_hdr {
             info!("显示器处于 HDR 模式，走 HDR 色彩转换");
-            // HDR 降级开关：直接把 scRGB clamp 当 SDR 处理（SDR 白点 = 1.0）
-            let sdr_white = if config.capture.hdr_degrade {
-                1.0
-            } else {
-                match display_info::query_sdr_white_nits(&raw.device_name) {
-                    Ok(n) => {
-                        info!("SDR 白点: {n} nit");
-                        n / 80.0
-                    }
-                    Err(e) => {
-                        warn!("SDR 白点查询失败: {e}，回退 80 nit");
-                        1.0
-                    }
+            let sdr_white = match display_info::query_sdr_white_nits(&raw.device_name) {
+                Ok(n) => {
+                    info!("SDR 白点: {n} nit");
+                    n / 80.0
+                }
+                Err(e) => {
+                    warn!("SDR 白点查询失败: {e}，回退 80 nit");
+                    1.0
                 }
             };
             frame::frame_to_srgb_image(&raw, sdr_white)
@@ -258,8 +419,8 @@ mod imp {
         let hotkeys = HotkeyManager::register(&config.hotkey).with_context(|| {
             format!("注册全局热键失败（可能被其他程序占用）: {}", config.hotkey)
         })?;
-        let hotkey_id = hotkeys.id();
-        info!("全局热键已注册: {} (id {hotkey_id})", config.hotkey);
+        let hotkey_id = Arc::new(AtomicU32::new(hotkeys.id()));
+        info!("全局热键已注册: {} (id {})", config.hotkey, hotkey_id.load(Ordering::SeqCst));
 
         // 5. 托盘
         let tray = Tray::new()?;
@@ -269,11 +430,14 @@ mod imp {
         let mut builder = EventLoop::<UserEvent>::with_user_event();
         {
             let flag = hotkey_triggered.clone();
+            let hotkey_id_flag = hotkey_id.clone();
             builder.with_msg_hook(move |msg| {
                 use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
                 // Safety: winit 保证传入的指针指向有效的 MSG
                 let msg = unsafe { &*(msg as *const MSG) };
-                if msg.message == WM_HOTKEY && msg.wParam.0 as u32 == hotkey_id {
+                if msg.message == WM_HOTKEY
+                    && msg.wParam.0 as u32 == hotkey_id_flag.load(Ordering::SeqCst)
+                {
                     flag.store(true, Ordering::SeqCst);
                     // 返回 true 消费消息，避免 winit 再次分发
                     return true;
@@ -287,10 +451,15 @@ mod imp {
 
         let mut app = App {
             config: Arc::new(config),
+            config_path,
             tray,
+            hotkeys,
+            hotkey_id,
             hotkey_triggered,
             proxy,
             overlay: None,
+            settings: None,
+            hotkey_suspended: false,
             capturing: false,
         };
         info!("进入事件循环（热键 {} 截图，托盘菜单退出）", app.config.hotkey);

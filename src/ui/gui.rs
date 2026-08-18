@@ -202,6 +202,7 @@ impl GuiState {
         };
         let renderer = egui_wgpu::Renderer::new(&device, renderer_format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        install_cjk_font(&egui_ctx);
         let ppp = window.scale_factor() as f32;
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -266,8 +267,16 @@ impl GuiState {
     }
 
     /// 把窗口事件喂给 egui（记录输入状态），返回 egui 是否消费了该事件。
+    ///
+    /// 注意：egui-winit 0.36 的 `on_window_event` 返回 `repaint` 标志（该事件
+    /// 是否需要刷新画面），但**不会**自己触发重绘，须由调用方据此 `request_redraw`；
+    /// 否则纯 egui 交互（按钮点击、文本输入）会因等不到下一次渲染而"无响应"。
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-        self.egui_state.on_window_event(window, event).consumed
+        let response = self.egui_state.on_window_event(window, event);
+        if response.repaint {
+            window.request_redraw();
+        }
+        response.consumed
     }
 
     /// 渲染一帧。
@@ -617,4 +626,52 @@ fn create_composite_pipeline(
         cache: None,
     });
     (bind_layout, pipeline)
+}
+
+/// 加载系统中文字体字节（进程内缓存，避免每次截图重复读盘）。
+///
+/// 依次尝试 Windows 自带字体：微软雅黑（`msyh.ttc`，ttc index 0 为常规体）、
+/// 黑体（`simhei.ttf`）；都找不到返回 `None`（界面中文退化为方块，不崩溃）。
+fn cjk_font_bytes() -> Option<&'static [u8]> {
+    static FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        const CANDIDATES: [&str; 4] = [
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyh.ttf",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+        ];
+        for path in CANDIDATES {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    tracing::info!("已加载系统中文字体: {path}");
+                    return Some(bytes);
+                }
+                Err(_) => continue,
+            }
+        }
+        tracing::warn!("未找到系统中文字体，界面中文可能显示为方块");
+        None
+    })
+    .as_deref()
+}
+
+/// 把系统中文字体追加为 egui 的 fallback 字体（英文/数字仍用默认字体）。
+fn install_cjk_font(ctx: &egui::Context) {
+    let Some(bytes) = cjk_font_bytes() else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }

@@ -15,10 +15,14 @@ use global_hotkey::GlobalHotKeyManager;
 
 /// 热键管理器：持有注册关系，drop 不自动注销（进程退出即回收）。
 ///
-/// 如需运行时改绑（设置界面改热键），用 [`HotkeyManager::rebind`]。
+/// 如需运行时改绑（设置界面录制热键），用 [`HotkeyManager::rebind`]。
+/// 录制期间用 [`HotkeyManager::suspend`] 临时注销，避免旧热键拦截用户
+/// 正在录制的组合键（重录相同组合时 WM_HOTKEY 会先于窗口按键被系统拦截）。
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
     hotkey: HotKey,
+    /// 当前热键是否已注册（`suspend` 后为 false）。
+    registered: bool,
 }
 
 impl HotkeyManager {
@@ -33,22 +37,53 @@ impl HotkeyManager {
         manager
             .register(hotkey)
             .with_context(|| format!("注册热键失败（可能被其他程序占用）: {hotkey_str}"))?;
-        Ok(Self { manager, hotkey })
+        Ok(Self {
+            manager,
+            hotkey,
+            registered: true,
+        })
     }
 
-    /// 注销旧热键并注册新热键（设置界面改绑时调用）。
+    /// 注销旧热键并注册新热键（设置界面录制新热键后调用）。
     ///
     /// * `new_str` - 新的热键字符串；解析失败或注册失败时旧热键保持有效。
     pub fn rebind(&mut self, new_str: &str) -> anyhow::Result<()> {
         let new_hotkey: HotKey = new_str
             .parse()
             .with_context(|| format!("解析热键字符串失败: {new_str}"))?;
+        // 与当前热键相同且已注册：无需操作
+        if self.registered && new_hotkey == self.hotkey {
+            return Ok(());
+        }
         // 先注册新的，成功后再注销旧的，保证失败时旧热键不丢
         self.manager
             .register(new_hotkey)
             .with_context(|| format!("注册新热键失败（可能被其他程序占用）: {new_str}"))?;
-        self.manager.unregister(self.hotkey)?;
+        if self.registered {
+            self.manager
+                .unregister(self.hotkey)
+                .with_context(|| format!("注销旧热键失败: {}", self.hotkey))?;
+        }
         self.hotkey = new_hotkey;
+        self.registered = true;
+        Ok(())
+    }
+
+    /// 临时注销热键（录制期间调用，幂等）。
+    pub fn suspend(&mut self) -> anyhow::Result<()> {
+        if self.registered {
+            self.manager.unregister(self.hotkey)?;
+            self.registered = false;
+        }
+        Ok(())
+    }
+
+    /// 恢复注册热键（录制结束调用，幂等）。
+    pub fn resume(&mut self) -> anyhow::Result<()> {
+        if !self.registered {
+            self.manager.register(self.hotkey)?;
+            self.registered = true;
+        }
         Ok(())
     }
 

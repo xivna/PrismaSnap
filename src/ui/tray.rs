@@ -9,13 +9,15 @@
 
 use anyhow::Context;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// 托盘菜单动作标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     /// 立即截图（同全局热键）。
     Capture,
+    /// 打开设置主界面。
+    OpenSettings,
     /// 退出程序。
     Exit,
 }
@@ -26,6 +28,8 @@ pub struct Tray {
     _icon: TrayIcon,
     /// 「截图」菜单项 id。
     capture_id: MenuId,
+    /// 「打开设置」菜单项 id。
+    settings_id: MenuId,
     /// 「退出」菜单项 id。
     exit_id: MenuId,
 }
@@ -35,11 +39,14 @@ impl Tray {
     pub fn new() -> anyhow::Result<Self> {
         let menu = Menu::new();
         let capture_item = MenuItem::new("截图", true, None);
+        let settings_item = MenuItem::new("打开设置", true, None);
         let exit_item = MenuItem::new("退出", true, None);
         menu.append(&capture_item).context("添加「截图」菜单项失败")?;
+        menu.append(&settings_item).context("添加「打开设置」菜单项失败")?;
         menu.append(&exit_item).context("添加「退出」菜单项失败")?;
 
         let capture_id = capture_item.id().clone();
+        let settings_id = settings_item.id().clone();
         let exit_id = exit_item.id().clone();
 
         let icon = TrayIconBuilder::new()
@@ -52,18 +59,30 @@ impl Tray {
         Ok(Self {
             _icon: icon,
             capture_id,
+            settings_id,
             exit_id,
         })
     }
 
-    /// 非阻塞地取一个待处理的菜单动作（无事件时返回 `None`）。
+    /// 非阻塞地取一个待处理的动作（菜单点击或图标双击；无事件时返回 `None`）。
+    ///
+    /// 两个来源：右键菜单点击（`MenuEvent`）与图标双击（`TrayIconEvent::DoubleClick`，
+    /// Windows 下双击托盘图标打开设置主界面，AGENTS.md 2.1 节）。
     pub fn poll_action(&self) -> Option<TrayAction> {
         match MenuEvent::receiver().try_recv() {
-            Ok(event) if event.id == self.capture_id => Some(TrayAction::Capture),
-            Ok(event) if event.id == self.exit_id => Some(TrayAction::Exit),
-            Ok(_) => None,
-            Err(_) => None,
+            Ok(event) if event.id == self.capture_id => return Some(TrayAction::Capture),
+            Ok(event) if event.id == self.settings_id => return Some(TrayAction::OpenSettings),
+            Ok(event) if event.id == self.exit_id => return Some(TrayAction::Exit),
+            Ok(_) => {}
+            Err(_) => {}
         }
+        // 图标双击事件走独立的全局 channel
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick { .. } = event {
+                return Some(TrayAction::OpenSettings);
+            }
+        }
+        None
     }
 }
 

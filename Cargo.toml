@@ -51,6 +51,9 @@ bytemuck = "1"
 tray-icon = "0.24"
 # 全局热键（底层 RegisterHotKey，轻量不拦截无关按键）
 global-hotkey = "0.8"
+# 原生文件对话框（保存位置的"始终询问"模式，底层 Win32 IFileDialog）。
+# default-features 关掉 Linux 的 xdg-portal/wayland；common-controls-v6 启用现代对话框样式。
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
 # Win32/WinRT 绑定：
 #   - Win32_Devices_Display   CCD API：DisplayConfigGetDeviceInfo 查询 SDR 白点（无 CoreWindow 依赖）
 #   - Win32_Foundation        GetLastError / ERROR_ALREADY_EXISTS（单实例检测）

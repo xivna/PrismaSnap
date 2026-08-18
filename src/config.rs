@@ -92,9 +92,6 @@ pub enum SaveFormat {
 pub struct CaptureConfig {
     /// 截图是否包含系统光标（默认不含，见 AGENTS.md 3.1「光标捕获需显式配置」）。
     pub cursor_visible: bool,
-    /// 色彩映射降级开关：HDR 数据不做归一化增益，直接 clamp 当 SDR 处理，
-    /// 用于规避特定显卡驱动在 HDR 模式下的已知色差问题（AGENTS.md 3.2 节）。
-    pub hdr_degrade: bool,
 }
 
 /// LLM API 配置（OpenAI 兼容格式，支持本地 llama.cpp 等）。

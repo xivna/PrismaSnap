@@ -21,7 +21,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::config::{Config, SaveFormat};
+use crate::config::{Config, SaveFormat, SaveMode};
 use crate::utils::math::Rect;
 use crate::utils::{clipboard, image_codec, paths, time};
 
@@ -280,15 +280,37 @@ impl Overlay {
     }
 
     /// 保存选区到文件并请求退出（按配置的保存行为）。
+    ///
+    /// 「始终询问」模式先弹系统保存对话框；用户取消或保存失败时**不退出**，
+    /// 留在 Preview 模式让用户重试（焦点恢复到覆盖层窗口）。
     fn save_and_exit(&mut self) {
-        match self.crop_selection() {
-            Some(img) => match save_shot(&img, &self.config) {
-                Ok(path) => tracing::info!("已保存选区: {}", path.display()),
-                Err(e) => tracing::error!("保存失败: {e:#}"),
-            },
-            None => tracing::warn!("保存请求但选区为空"),
+        let Some(img) = self.crop_selection() else {
+            tracing::warn!("保存请求但选区为空");
+            return;
+        };
+        // AlwaysAsk 模式弹对话框前临时隐藏 topmost 窗口，避免遮挡模态对话框
+        let hide = self.config.save.mode == SaveMode::AlwaysAsk;
+        if hide {
+            self.window.set_visible(false);
         }
-        self.exit_requested = true;
+        let result = save_shot(&img, &self.config);
+        if hide {
+            self.window.set_visible(true);
+        }
+        match result {
+            Ok(Some(path)) => {
+                tracing::info!("已保存选区: {}", path.display());
+                self.exit_requested = true;
+            }
+            Ok(None) => {
+                tracing::info!("用户取消保存");
+                self.window.focus_window();
+            }
+            Err(e) => {
+                tracing::error!("保存失败: {e:#}");
+                self.window.focus_window();
+            }
+        }
     }
 
     /// 渲染一帧：截图 + 遮罩 + 选区 + 提示条。
@@ -317,8 +339,6 @@ fn to_pts(rect: &Rect, ppp: f32) -> egui::Rect {
 }
 
 /// 覆盖层一帧的 egui 绘制。
-///
-/// 注意：egui 默认字体不含 CJK，提示文字暂用英文（中文字体嵌入见 Phase 3）。
 ///
 /// HDR 模式下截图不在这里绘制（由合成 pass 直通显示），egui 只画遮罩/选区/提示层。
 fn draw_frame(
@@ -367,7 +387,7 @@ fn draw_frame(
                 painter.text(
                     screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Drag to select area   (Esc to cancel)",
+                    "拖动鼠标选择区域（Esc 取消）",
                     egui::FontId::proportional(18.0),
                     egui::Color32::WHITE,
                 );
@@ -448,7 +468,7 @@ fn draw_size_label(painter: &egui::Painter, sel: &Rect, sel_pts: egui::Rect) {
 
 /// 预览模式动作提示条（选区下方居中，贴底时翻到上方）。
 fn draw_action_bar(painter: &egui::Painter, sel_pts: egui::Rect, screen_rect: egui::Rect) {
-    let text = "Enter / Ctrl+C Copy    Ctrl+S Save    Esc Cancel".to_owned();
+    let text = "Enter / Ctrl+C 复制    Ctrl+S 保存    Esc 取消".to_owned();
     let galley = painter.layout_no_wrap(
         text,
         egui::FontId::proportional(14.0),
@@ -499,10 +519,15 @@ fn exe_dir_fallback() -> std::path::PathBuf {
     paths::exe_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// 按配置把截图保存到文件，返回保存路径。
-fn save_shot(img: &image::RgbaImage, config: &Config) -> anyhow::Result<std::path::PathBuf> {
+/// 按配置把截图保存到文件。
+///
+/// 返回值：`Ok(Some(path))` 保存成功；`Ok(None)` 用户在「始终询问」对话框里取消；
+/// `Err(e)` 保存失败（IO 错误等）。
+fn save_shot(
+    img: &image::RgbaImage,
+    config: &Config,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
     let dir = resolve_save_dir(&config.save.dir);
-    std::fs::create_dir_all(&dir)?;
     let name = format!(
         "PrismaSnap_{}.{}",
         time::timestamp_str(),
@@ -511,10 +536,36 @@ fn save_shot(img: &image::RgbaImage, config: &Config) -> anyhow::Result<std::pat
             SaveFormat::Jpeg => "jpg",
         }
     );
-    let path = dir.join(name);
+    let path = match config.save.mode {
+        SaveMode::Silent => {
+            std::fs::create_dir_all(&dir)?;
+            dir.join(name)
+        }
+        SaveMode::AlwaysAsk => {
+            // 保证默认目录存在，避免对话框静默回退到别的目录
+            let _ = std::fs::create_dir_all(&dir);
+            let mut dialog = rfd::FileDialog::new()
+                .set_directory(&dir)
+                .set_file_name(&name);
+            dialog = match config.save.format {
+                SaveFormat::Png => dialog.add_filter("PNG", &["png"]),
+                SaveFormat::Jpeg => dialog.add_filter("JPEG", &["jpg", "jpeg"]),
+            };
+            match dialog.save_file() {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        }
+    };
+    save_to_path(img, config, &path)?;
+    Ok(Some(path))
+}
+
+/// 按配置格式把图像写到指定路径。
+fn save_to_path(img: &image::RgbaImage, config: &Config, path: &std::path::Path) -> anyhow::Result<()> {
     match config.save.format {
-        SaveFormat::Png => image_codec::save_png(img, &path)?,
-        SaveFormat::Jpeg => image_codec::save_jpeg(img, &path, config.save.jpeg_quality)?,
+        SaveFormat::Png => image_codec::save_png(img, path)?,
+        SaveFormat::Jpeg => image_codec::save_jpeg(img, path, config.save.jpeg_quality)?,
     }
-    Ok(path)
+    Ok(())
 }

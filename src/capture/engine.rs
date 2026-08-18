@@ -152,9 +152,12 @@ pub fn monitor_rect_at_cursor() -> anyhow::Result<Rect> {
 /// `Capture::start()` 会接管调用它的线程，故在线程内执行；首帧到达后立即
 /// 停止捕获，结果经 channel 传回。
 ///
+/// * `cursor_visible` - 是否在捕获结果中包含系统光标（AGENTS.md 3.1 节：
+///   光标捕获显式配置，不用 `Default`）。
+///
 /// # Errors
 /// 捕获启动失败、线程提前退出、或超时未收到帧时返回错误。
-pub fn capture_frame(monitor: Monitor) -> anyhow::Result<RawFrame> {
+pub fn capture_frame(monitor: Monitor, cursor_visible: bool) -> anyhow::Result<RawFrame> {
     let device_name = monitor
         .device_name()
         .unwrap_or_else(|_| String::from("\\\\.\\DISPLAY1"));
@@ -162,7 +165,7 @@ pub fn capture_frame(monitor: Monitor) -> anyhow::Result<RawFrame> {
     let (tx, rx) = channel::<FrameResult>();
     // 预留一个发送端给「start 失败」的错误路径（start 成功时该端随线程退出而 drop）
     let err_tx = tx.clone();
-    let handle = spawn_capture_thread(monitor, device_name, tx, err_tx);
+    let handle = spawn_capture_thread(monitor, device_name, cursor_visible, tx, err_tx);
 
     // 轮询等待首帧：每 POLL_INTERVAL 检查一次 channel；
     // 若线程已结束仍无消息（start 失败等），提前报错而非傻等超时。
@@ -198,13 +201,19 @@ pub fn capture_frame(monitor: Monitor) -> anyhow::Result<RawFrame> {
 fn spawn_capture_thread(
     monitor: Monitor,
     device_name: String,
+    cursor_visible: bool,
     tx: Sender<FrameResult>,
     err_tx: Sender<FrameResult>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        let cursor = if cursor_visible {
+            CursorCaptureSettings::WithCursor
+        } else {
+            CursorCaptureSettings::WithoutCursor
+        };
         let settings = Settings::new(
             monitor,
-            CursorCaptureSettings::WithoutCursor,
+            cursor,
             DrawBorderSettings::Default,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
