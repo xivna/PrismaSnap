@@ -22,6 +22,8 @@ pub struct Config {
     pub save: SaveConfig,
     /// 捕获选项。
     pub capture: CaptureConfig,
+    /// 界面外观。
+    pub ui: UiConfig,
     /// LLM API 配置（Phase 4 使用，先定义结构）。
     pub llm: LlmConfig,
 }
@@ -35,9 +37,29 @@ impl Default for Config {
             hotkey: String::from("Ctrl+Alt+A"),
             save: SaveConfig::default(),
             capture: CaptureConfig::default(),
+            ui: UiConfig::default(),
             llm: LlmConfig::default(),
         }
     }
+}
+
+/// 界面外观配置。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// 主题（深色工具条文字辨识度差，默认浅色）。
+    pub theme: Theme,
+}
+
+/// 界面主题（TOML 里蛇形小写，如 `theme = "light"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    /// 浅色（默认）。
+    #[default]
+    Light,
+    /// 深色。
+    Dark,
 }
 
 /// 保存行为配置。

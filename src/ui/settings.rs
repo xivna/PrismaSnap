@@ -25,7 +25,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{Config, SaveFormat, SaveMode};
+use crate::config::{Config, SaveFormat, SaveMode, Theme};
 
 use super::gui::GuiState;
 
@@ -189,6 +189,8 @@ impl Settings {
         let status = self.status.clone();
 
         self.gui.render(self.window.as_ref(), |ui| {
+            // 主题实时预览：改选项立即生效（正式写盘仍走 pending_save）
+            super::gui::apply_theme(ui.ctx(), draft.ui.theme);
             draw_settings_ui(
                 ui,
                 &mut draft,
@@ -329,6 +331,23 @@ fn draw_settings_ui(
                     *changed |= ui
                         .checkbox(&mut draft.capture.cursor_visible, "截图包含鼠标光标")
                         .changed();
+                    ui.end_row();
+
+                    // ── 界面 ──
+                    ui.add_space(4.0);
+                    ui.end_row();
+                    section_title(ui, "界面");
+                    ui.end_row();
+
+                    ui.label("主题");
+                    ui.horizontal(|ui| {
+                        *changed |= ui
+                            .radio_value(&mut draft.ui.theme, Theme::Light, "浅色")
+                            .changed();
+                        *changed |= ui
+                            .radio_value(&mut draft.ui.theme, Theme::Dark, "深色")
+                            .changed();
+                    });
                     ui.end_row();
 
                     // ── AI 接口 ──

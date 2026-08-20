@@ -628,6 +628,14 @@ fn create_composite_pipeline(
     (bind_layout, pipeline)
 }
 
+/// 按配置主题应用 egui visuals（设置窗口与覆盖层工具条共用）。
+pub fn apply_theme(ctx: &egui::Context, theme: crate::config::Theme) {
+    ctx.set_visuals(match theme {
+        crate::config::Theme::Light => egui::Visuals::light(),
+        crate::config::Theme::Dark => egui::Visuals::dark(),
+    });
+}
+
 /// 加载系统中文字体字节（进程内缓存，避免每次截图重复读盘）。
 ///
 /// 依次尝试 Windows 自带字体：微软雅黑（`msyh.ttc`，ttc index 0 为常规体）、
