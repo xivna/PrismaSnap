@@ -2,8 +2,9 @@
 //!
 //! 单窗口切换架构（Snipaste 式，见 PROGRESS.md 决策记录）：
 //! 同一窗口内 `Selecting`（截图 + 半透明遮罩 + 拖动选区）→
-//! `Preview`（遮罩加深 + 选区高亮 + 确认提示条）两种模式切换，
-//! 不做销毁重建。选区确认后 Esc 取消、Enter / Ctrl+C 复制、Ctrl+S 保存。
+//! `Preview`（遮罩加深 + 选区高亮 + 工具条）→ `Edit`（标注编辑）三种
+//! 模式切换，不做销毁重建。Esc 取消、Enter / Ctrl+C 复制、Ctrl+S 保存，
+//! 编辑态另支持 Ctrl+Z 撤销 / Ctrl+Shift+Z 重做。
 //!
 //! 窗口层级：`WS_EX_TOPMOST`（with_window_level）+
 //! `WS_EX_TOOLWINDOW`（with_skip_taskbar）；`WS_EX_NOACTIVATE` 暂不启用——
@@ -21,19 +22,24 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowId, WindowLevel};
 
+use crate::annotation;
 use crate::config::{Config, SaveFormat, SaveMode};
 use crate::utils::math::Rect;
 use crate::utils::{clipboard, image_codec, paths, time};
 
+use super::editor::Editor;
 use super::gui::GuiState;
+use super::toolbar::{self, ToolbarAction};
 
 /// 覆盖层模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// 选择中：截图 + 半透明遮罩，等待拖动选区。
     Selecting,
-    /// 已选定：遮罩加深、选区高亮，等待确认（复制/保存/取消）。
+    /// 已选定：遮罩加深、选区高亮 + 工具条，等待确认（复制/保存/取消/进入标注）。
     Preview,
+    /// 标注编辑中：选区锁定，画布接受标注笔画，工具条高亮当前工具。
+    Edit,
 }
 
 /// 选区最小边长（物理像素），小于此值视为无效拖动。
@@ -64,6 +70,8 @@ pub struct Overlay {
     /// HDR 输出模式（截图由合成 pass 直通显示，不画 egui Image）。
     hdr_mode: bool,
     mode: Mode,
+    /// 标注编辑器（Edit 模式的画布状态与标注数据）。
+    editor: Editor,
     /// 最近一次光标位置（物理像素；`MouseInput` 事件不带坐标，以此补足）。
     current_cursor: Option<(f32, f32)>,
     /// 拖动起点（物理像素）。
@@ -141,6 +149,7 @@ impl Overlay {
             texture_id,
             hdr_mode,
             mode: Mode::Selecting,
+            editor: Editor::new(),
             current_cursor: None,
             drag_start: None,
             selection: None,
@@ -158,23 +167,28 @@ impl Overlay {
 
     /// 事件入口：先喂 egui 记录输入，再处理业务逻辑与重绘。
     pub fn on_window_event(&mut self, event: &WindowEvent) {
-        self.gui.on_window_event(self.window.as_ref(), event);
+        // egui 消费的事件（如工具条按钮点击）不再走覆盖层业务逻辑
+        let consumed = self.gui.on_window_event(self.window.as_ref(), event);
         match event {
             WindowEvent::CloseRequested => self.exit_requested = true,
             WindowEvent::Resized(size) => self.gui.resize(size.width, size.height),
             WindowEvent::ModifiersChanged(state) => self.modifiers = state.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.current_cursor = Some((position.x as f32, position.y as f32));
-                // 拖动中实时更新选区
+                // 拖动中实时更新选区 / 进行中的标注笔画
                 if self.drag_start.is_some() {
                     self.update_selection_from_drag();
+                }
+                if self.mode == Mode::Edit && self.editor.is_stroking() {
+                    self.editor.update_stroke((position.x as f32, position.y as f32));
+                    self.window.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.on_press(),
+            } => self.on_press(consumed),
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
@@ -186,19 +200,40 @@ impl Overlay {
         }
     }
 
-    /// 按下左键：`Preview` 模式重置选区回到 `Selecting`；否则开始拖动。
-    fn on_press(&mut self) {
-        if self.mode == Mode::Preview {
-            self.mode = Mode::Selecting;
-            self.selection = None;
+    /// 按下左键：`Preview` 重置选区回到 `Selecting`（重新框选）；
+    /// `Edit` 开始标注笔画；`Selecting` 开始拖动选区。
+    ///
+    /// * `egui_consumed` - 事件已被 egui 消费（点在工具条上）时不做画布处理。
+    fn on_press(&mut self, egui_consumed: bool) {
+        if egui_consumed {
+            return;
         }
-        self.drag_start = self.current_cursor;
+        match self.mode {
+            Mode::Preview => {
+                self.mode = Mode::Selecting;
+                self.selection = None;
+                self.drag_start = self.current_cursor;
+            }
+            Mode::Edit => {
+                if let Some(cursor) = self.current_cursor {
+                    self.editor.begin_stroke(cursor);
+                }
+            }
+            Mode::Selecting => self.drag_start = self.current_cursor,
+        }
         self.window.request_redraw();
     }
 
-    /// 释放左键：选区有效则进入 `Preview`，否则视为无效拖动清空。
+    /// 释放左键：`Selecting` 选区有效则进入 `Preview`；`Edit` 提交笔画。
     fn on_release(&mut self) {
-        self.drag_start = None;
+        match self.mode {
+            Mode::Edit => {
+                self.editor.commit_stroke();
+                self.window.request_redraw();
+                return;
+            }
+            _ => self.drag_start = None,
+        }
         if self
             .selection
             .is_some_and(|s| s.width >= MIN_SELECTION_SIZE && s.height >= MIN_SELECTION_SIZE)
@@ -221,47 +256,62 @@ impl Overlay {
         }
     }
 
-    /// 键盘动作：Esc 取消、Enter 复制、Ctrl+C 复制、Ctrl+S 保存。
+    /// 键盘动作：Esc 取消、Enter 复制、Ctrl+C 复制、Ctrl+S 保存、
+    /// Ctrl+Z 撤销、Ctrl+Shift+Z 重做（后两者仅编辑态）。
     fn on_key(&mut self, key: &KeyEvent) {
         if key.state != ElementState::Pressed {
             return;
         }
+        let has_selection = matches!(self.mode, Mode::Preview | Mode::Edit);
         match key.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => {
                 self.exit_requested = true;
             }
             PhysicalKey::Code(KeyCode::Enter) => {
-                if self.mode == Mode::Preview {
+                if has_selection {
                     self.copy_and_exit();
                 }
             }
             PhysicalKey::Code(KeyCode::KeyC) if self.modifiers.control_key() => {
-                if self.mode == Mode::Preview {
+                if has_selection {
                     self.copy_and_exit();
                 }
             }
             PhysicalKey::Code(KeyCode::KeyS)
-                if self.modifiers.control_key() && self.mode == Mode::Preview =>
+                if self.modifiers.control_key() && has_selection =>
             {
                 self.save_and_exit();
+            }
+            PhysicalKey::Code(KeyCode::KeyZ)
+                if self.modifiers.control_key() && self.mode == Mode::Edit =>
+            {
+                if self.modifiers.shift_key() {
+                    self.editor.redo();
+                } else {
+                    self.editor.undo();
+                }
+                self.window.request_redraw();
             }
             _ => {}
         }
     }
 
     /// 裁剪选区图像（物理坐标 = 图像像素坐标，直接裁剪）。
+    ///
+    /// 裁剪后把已提交标注 CPU 重绘上去（方案 B 导出端，见
+    /// [`annotation::apply_to_image`]；骨架阶段为接通管线，逐工具落地）。
     fn crop_selection(&self) -> Option<image::RgbaImage> {
         let sel = self.selection?;
-        Some(
-            image::imageops::crop_imm(
-                self.image.as_ref(),
-                sel.x as u32,
-                sel.y as u32,
-                sel.width,
-                sel.height,
-            )
-            .to_image(),
+        let mut img = image::imageops::crop_imm(
+            self.image.as_ref(),
+            sel.x as u32,
+            sel.y as u32,
+            sel.width,
+            sel.height,
         )
+        .to_image();
+        annotation::apply_to_image(&mut img, self.editor.annotations(), (sel.x, sel.y));
+        Some(img)
     }
 
     /// 复制选区到剪贴板并请求退出。
@@ -313,7 +363,7 @@ impl Overlay {
         }
     }
 
-    /// 渲染一帧：截图 + 遮罩 + 选区 + 提示条。
+    /// 渲染一帧：截图 + 遮罩 + 选区 + 标注预览 + 工具条。
     ///
     /// 公开给宿主：打开覆盖层时在窗口显示前先同步渲染首帧，
     /// 避免露出未渲染的默认背景（闪烁）。
@@ -324,9 +374,67 @@ impl Overlay {
         let mode = self.mode;
         let selection = self.selection;
         let monitor_rect = self.monitor_rect;
-        self.gui.render(self.window.as_ref(), move |ui| {
+        // 工具条点击动作在渲染闭包外统一处理（需 &mut self）
+        let mut action: Option<ToolbarAction> = None;
+        let theme = self.config.ui.theme;
+        let editor = &mut self.editor;
+        let window = self.window.clone();
+        self.gui.render(window.as_ref(), |ui| {
+            super::gui::apply_theme(ui.ctx(), theme);
             draw_frame(ui, texture_id, hdr_mode, img_size, mode, selection, monitor_rect);
+            // 编辑态：egui 层绘制标注预览（方案 B 预览端）
+            if mode == Mode::Edit {
+                let ppp = ui.ctx().pixels_per_point();
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("annotations"),
+                ));
+                editor.draw_annotations(&painter, ppp);
+            }
+            // 工具条：Preview / Edit 均显示（Selecting 不显示）
+            if let Some(sel) = selection.filter(|_| mode != Mode::Selecting) {
+                let ppp = ui.ctx().pixels_per_point();
+                let pos = toolbar::toolbar_pos_pts(&sel, &monitor_rect, toolbar::BAR_SIZE, ppp);
+                action = toolbar::toolbar_ui(
+                    ui.ctx(),
+                    pos,
+                    editor.active_tool(),
+                    editor.can_undo(),
+                    editor.can_redo(),
+                );
+            }
         });
+        if let Some(a) = action {
+            self.handle_toolbar_action(a);
+        }
+    }
+
+    /// 响应工具条动作：切换工具 / 撤销重做 / 复制 / 保存 / 取消。
+    fn handle_toolbar_action(&mut self, action: ToolbarAction) {
+        match action {
+            ToolbarAction::ActivateTool(tool) => {
+                if self.editor.active_tool() == Some(tool) {
+                    // 再点当前工具 → 退出编辑态回到预览
+                    self.editor.deactivate();
+                    self.mode = Mode::Preview;
+                } else {
+                    self.editor.activate(tool);
+                    self.mode = Mode::Edit;
+                }
+                self.window.request_redraw();
+            }
+            ToolbarAction::Undo => {
+                self.editor.undo();
+                self.window.request_redraw();
+            }
+            ToolbarAction::Redo => {
+                self.editor.redo();
+                self.window.request_redraw();
+            }
+            ToolbarAction::Copy => self.copy_and_exit(),
+            ToolbarAction::Save => self.save_and_exit(),
+            ToolbarAction::Cancel => self.exit_requested = true,
+        }
     }
 }
 
@@ -393,7 +501,9 @@ fn draw_frame(
                 );
             }
         },
-        Mode::Preview => {
+        // Preview / Edit：遮罩加深突出选区（复制/保存等动作走工具条，
+        // 标注预览在 draw_frame 之后由编辑器绘制）
+        Mode::Preview | Mode::Edit => {
             if let Some(sel) = selection {
                 let sel_pts = to_pts(&sel, ppp);
                 // 更深遮罩突出选区（挖洞保留选区亮度）
@@ -405,7 +515,6 @@ fn draw_frame(
                     egui::StrokeKind::Outside,
                 );
                 draw_size_label(&painter, &sel, sel_pts);
-                draw_action_bar(&painter, sel_pts, screen_rect);
             }
         }
     }
@@ -464,43 +573,6 @@ fn draw_size_label(painter: &egui::Painter, sel: &Rect, sel_pts: egui::Rect) {
     );
     painter.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(160));
     painter.galley(pos, galley, egui::Color32::WHITE);
-}
-
-/// 预览模式动作提示条（选区下方居中，贴底时翻到上方）。
-fn draw_action_bar(painter: &egui::Painter, sel_pts: egui::Rect, screen_rect: egui::Rect) {
-    let text = "Enter / Ctrl+C 复制    Ctrl+S 保存    Esc 取消".to_owned();
-    let galley = painter.layout_no_wrap(
-        text,
-        egui::FontId::proportional(14.0),
-        egui::Color32::WHITE,
-    );
-    let pad = egui::vec2(14.0, 8.0);
-    let bar_size = galley.size() + pad * 2.0;
-    let gap = 10.0;
-    // 优先放选区下方，空间不足放上方
-    let bar_min_y = if sel_pts.max.y + gap + bar_size.y <= screen_rect.max.y {
-        sel_pts.max.y + gap
-    } else {
-        (sel_pts.min.y - gap - bar_size.y).max(screen_rect.min.y)
-    };
-    let bar_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            (sel_pts.center().x - bar_size.x / 2.0).clamp(
-                screen_rect.min.x + 4.0,
-                screen_rect.max.x - bar_size.x - 4.0,
-            ),
-            bar_min_y,
-        ),
-        bar_size,
-    );
-    painter.rect_filled(bar_rect, 6.0, egui::Color32::from_black_alpha(200));
-    painter.rect_stroke(
-        bar_rect,
-        6.0,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
-        egui::StrokeKind::Outside,
-    );
-    painter.galley(bar_rect.min + pad, galley, egui::Color32::WHITE);
 }
 
 /// 解析保存目录：配置为空时用 exe 目录下 `screenshots/`。
