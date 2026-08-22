@@ -24,7 +24,7 @@ use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::annotation;
 use crate::config::{Config, SaveFormat, SaveMode};
-use crate::utils::math::Rect;
+use crate::utils::math::{self, Rect};
 use crate::utils::{clipboard, image_codec, paths, time};
 
 use super::editor::Editor;
@@ -611,89 +611,41 @@ fn dim_outside_selection(
 /// 在 `block` 内绘制挖去**圆角**矩形 `hole` 的半透明遮罩，洞轮廓与工具条
 /// 卡片完全贴合（含圆角，半径 [`toolbar::CORNER_RADIUS`]）。
 ///
-/// 分解：上下两条全宽条带 + 左右中块（纵向两端收进圆角半径 r）+
-/// 四个「方块减四分之一圆」的月牙补块。月牙是凹多边形，但其所有边界点
-/// 从洞外角可见（星形域），以洞外角为扇心做 fan 三角化恰好正确，
-/// 故可直接用 `PathShape` 填充。
+/// 几何分解（矩形块 + 四角月牙）由跨平台纯函数
+/// [`math::block_minus_rounded_hole`] 完成（含"无漏无重"密集采样单测），
+/// 这里只做 egui 类型转换与填充。
 fn paint_block_with_rounded_hole(
     painter: &egui::Painter,
     block: egui::Rect,
     hole: egui::Rect,
     dark: egui::Color32,
 ) {
-    if !block.intersects(hole) {
-        painter.rect_filled(block, 0.0, dark);
-        return;
-    }
-    let h = hole.intersect(block);
-    if !h.is_positive() {
-        painter.rect_filled(block, 0.0, dark);
-        return;
-    }
-    let r = toolbar::CORNER_RADIUS.min(h.width() * 0.5).min(h.height() * 0.5);
-    let (l, t, rt, b) = (h.left(), h.top(), h.right(), h.bottom());
-
-    // 上 / 下全宽条带
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(block.left(), block.top()),
-            egui::pos2(block.right(), t),
-        ),
-        0.0,
-        dark,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(block.left(), b),
-            egui::pos2(block.right(), block.bottom()),
-        ),
-        0.0,
-        dark,
-    );
-    // 左 / 右中块（y 两端收进 r，给四角月牙留位）
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(block.left(), t + r),
-            egui::pos2(l, b - r),
-        ),
-        0.0,
-        dark,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(rt, t + r),
-            egui::pos2(block.right(), b - r),
-        ),
-        0.0,
-        dark,
-    );
-
-    // 四角月牙：(px,py) = 洞角点，(dx,dy) = 从角指向洞中心的方向
-    for &(px, py, dx, dy) in &[
-        (l, t, 1.0, 1.0),    // 左上
-        (rt, t, -1.0, 1.0),  // 右上
-        (l, b, 1.0, -1.0),   // 左下
-        (rt, b, -1.0, -1.0), // 右下
-    ] {
-        let c = egui::pos2(px + dx * r, py + dy * r); // 圆角圆心
-        let mut pts = vec![
-            egui::pos2(px, py),           // 方形外角
-            egui::pos2(px + dx * r, py),  // 弧起点
-        ];
-        for t in [0.25f32, 0.5, 0.75] {
-            // 弧方向向量：从 P1-C=(0,-dy) 插值到 P2-C=(-dx,0)
-            let vx = -t * dx;
-            let vy = -(1.0 - t) * dy;
-            let len = (vx * vx + vy * vy).sqrt();
-            pts.push(egui::pos2(c.x + vx / len * r, c.y + vy / len * r));
+    let to_rectf = |r: egui::Rect| math::RectF::new(r.left(), r.top(), r.right(), r.bottom());
+    for piece in math::block_minus_rounded_hole(
+        &to_rectf(block),
+        &to_rectf(hole),
+        toolbar::CORNER_RADIUS,
+    ) {
+        match piece {
+            math::HolePiece::Rect(r) => {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(r.min_x, r.min_y),
+                        egui::pos2(r.max_x, r.max_y),
+                    ),
+                    0.0,
+                    dark,
+                );
+            }
+            math::HolePiece::Crescent(pts) => {
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: pts.into_iter().map(|(x, y)| egui::pos2(x, y)).collect(),
+                    closed: true,
+                    fill: dark,
+                    stroke: egui::epaint::PathStroke::default(),
+                }));
+            }
         }
-        pts.push(egui::pos2(px, py + dy * r)); // 弧终点
-        painter.add(egui::Shape::Path(egui::epaint::PathShape {
-            points: pts,
-            closed: true,
-            fill: dark,
-            stroke: egui::epaint::PathStroke::default(),
-        }));
     }
 }
 
