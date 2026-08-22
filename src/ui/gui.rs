@@ -687,37 +687,61 @@ pub fn apply_theme(ctx: &egui::Context, theme: crate::config::Theme) {
     });
 }
 
-/// 设置窗口 Apple 风配色（iOS 系统色板，跟随主题）。
+/// 设置窗口 Apple 风配色（iOS/macOS 系统色板，跟随主题）。
 pub struct Palette {
-    /// 页面底色（设置窗口背景）。
+    /// 内容区底色（设置窗口背景）。
     pub page_bg: egui::Color32,
+    /// 左侧栏底色（比内容区略深一档，形成层次）。
+    pub sidebar_bg: egui::Color32,
+    /// 侧栏导航项悬停底色。
+    pub nav_hover: egui::Color32,
+    /// 侧栏导航项选中底色。
+    pub nav_selected: egui::Color32,
     /// 分组卡片底色。
     pub card_bg: egui::Color32,
     /// 卡片描边。
     pub card_stroke: egui::Color32,
-    /// 次级文字（分组标题、说明文字）。
+    /// 卡片内行分隔线。
+    pub separator: egui::Color32,
+    /// 次级文字（说明文字、未选中分段）。
     pub secondary: egui::Color32,
+    /// 弱控件底色（键帽、分段选择器槽、toggle 槽）。
+    pub control_bg: egui::Color32,
+    /// 强调色（主按钮、toggle 开启态）。
+    pub accent: egui::Color32,
 }
 
 /// 按主题取配色：浅色 = 浅灰页面 + 白卡片；深色 = 近黑页面 + 提亮卡片。
 ///
 /// 采用固定 iOS 色板而非 egui 默认 visuals——dark 主题默认 `window_fill`
-/// 仅 gray(27)，卡片层次会反转。仅用于设置窗口（覆盖层工具条为固定深色
-/// 半透明浮层，见 `toolbar::BAR_BG`，不随主题）。
+/// 仅 gray(27)，卡片层次会反转。仅用于设置窗口（覆盖层工具条随主题
+/// 自行取色，见 `toolbar::toolbar_ui`）。
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            page_bg: egui::Color32::from_rgb(16, 16, 18),
+            page_bg: egui::Color32::from_rgb(24, 24, 27),
+            sidebar_bg: egui::Color32::from_rgb(30, 30, 34),
+            nav_hover: egui::Color32::from_white_alpha(10),
+            nav_selected: egui::Color32::from_white_alpha(26),
             card_bg: egui::Color32::from_rgb(43, 43, 48),
-            card_stroke: egui::Color32::from_white_alpha(30),
-            secondary: egui::Color32::from_rgb(160, 160, 168),
+            card_stroke: egui::Color32::from_white_alpha(24),
+            separator: egui::Color32::from_white_alpha(20),
+            secondary: egui::Color32::from_rgb(152, 152, 160),
+            control_bg: egui::Color32::from_rgb(56, 56, 62),
+            accent: egui::Color32::from_rgb(10, 132, 255),
         }
     } else {
         Palette {
             page_bg: egui::Color32::from_rgb(242, 242, 247),
+            sidebar_bg: egui::Color32::from_rgb(233, 233, 238),
+            nav_hover: egui::Color32::from_black_alpha(8),
+            nav_selected: egui::Color32::from_black_alpha(20),
             card_bg: egui::Color32::WHITE,
-            card_stroke: egui::Color32::from_black_alpha(36),
+            card_stroke: egui::Color32::from_black_alpha(28),
+            separator: egui::Color32::from_black_alpha(16),
             secondary: egui::Color32::from_rgb(110, 110, 118),
+            control_bg: egui::Color32::from_rgb(228, 228, 234),
+            accent: egui::Color32::from_rgb(0, 122, 255),
         }
     }
 }
