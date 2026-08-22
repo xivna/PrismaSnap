@@ -9,3 +9,6 @@ config.toml
 .idea/
 *.swp
 .DS_Store
+
+# 临时验收截图（根目录，不入库）
+/*.png
