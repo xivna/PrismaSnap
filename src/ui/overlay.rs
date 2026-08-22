@@ -53,6 +53,9 @@ pub struct CapturedShot {
     pub raw: crate::capture::frame::RawFrame,
     /// 来源显示器是否处于 HDR 模式（决定覆盖层输出路径）。
     pub is_hdr: bool,
+    /// SDR 白点 scRGB 值（= nit / 80）。HDR 预览时 egui UI 层按此提升亮度，
+    /// 使其与截图内容中的 SDR 白同亮（否则 UI 暗数倍）；SDR 屏为 1.0。
+    pub sdr_white_scrgb: f32,
     /// 来源显示器物理矩形（覆盖层窗口铺满范围，含任务栏区域）。
     pub monitor_rect: Rect,
 }
@@ -83,6 +86,9 @@ pub struct Overlay {
     /// 当前修饰键状态（判断 Ctrl+C / Ctrl+S）。
     modifiers: ModifiersState,
     config: Arc<Config>,
+    /// 工具条上一帧的实际渲染矩形（egui 逻辑点，遮罩挖洞用；
+    /// 首帧测量后帧间复用，选区确定后位置固定不变）。
+    bar_rect_cache: Option<egui::Rect>,
     /// 请求退出（Esc / Enter / 复制 / 保存后置位，宿主负责销毁）。
     pub exit_requested: bool,
 }
@@ -134,6 +140,8 @@ impl Overlay {
         let mut gui = GuiState::new(&window, shot.is_hdr)?;
         let (texture_id, texture, view) = if gui.is_hdr() {
             gui.upload_scrgb_texture(&shot.raw)?;
+            // UI 层亮度提升到显示器 SDR 白点（否则工具条/标注比截图内容暗数倍）
+            gui.set_ui_boost(shot.sdr_white_scrgb);
             (None, None, None)
         } else {
             let (id, t, v) = gui.upload_texture(&shot.img);
@@ -156,6 +164,7 @@ impl Overlay {
             monitor_rect: shot.monitor_rect,
             modifiers: ModifiersState::empty(),
             config,
+            bar_rect_cache: None,
             exit_requested: false,
         })
     }
@@ -379,9 +388,23 @@ impl Overlay {
         let theme = self.config.ui.theme;
         let editor = &mut self.editor;
         let window = self.window.clone();
+        // 工具条矩形（egui 逻辑点）：遮罩挖洞用，保证工具条浮在原始画面上
+        // 而非压暗区内（2026-08-22 用户反馈）。首帧无缓存时暂不挖洞，
+        // 渲染后拿到实际矩形会主动请求再绘一帧补上
+        let cached_bar_rect = self.bar_rect_cache;
+        let mut bar_actual: Option<egui::Rect> = None;
         self.gui.render(window.as_ref(), |ui| {
             super::gui::apply_theme(ui.ctx(), theme);
-            draw_frame(ui, texture_id, hdr_mode, img_size, mode, selection, monitor_rect);
+            draw_frame(
+                ui,
+                texture_id,
+                hdr_mode,
+                img_size,
+                mode,
+                selection,
+                monitor_rect,
+                cached_bar_rect,
+            );
             // 编辑态：egui 层绘制标注预览（方案 B 预览端）
             if mode == Mode::Edit {
                 let ppp = ui.ctx().pixels_per_point();
@@ -399,11 +422,21 @@ impl Overlay {
                     ui.ctx(),
                     pos,
                     editor.active_tool(),
+                    editor.stroke_color(),
+                    editor.stroke_width(),
                     editor.can_undo(),
                     editor.can_redo(),
+                    &mut bar_actual,
                 );
             }
         });
+        // 缓存工具条实际渲染矩形；首帧测量到边界后请求再绘一帧，
+        // 让贴合的遮罩挖洞立即生效
+        let first_measure = self.bar_rect_cache.is_none() && bar_actual.is_some();
+        self.bar_rect_cache = bar_actual;
+        if first_measure {
+            window.request_redraw();
+        }
         if let Some(a) = action {
             self.handle_toolbar_action(a);
         }
@@ -421,6 +454,14 @@ impl Overlay {
                     self.editor.activate(tool);
                     self.mode = Mode::Edit;
                 }
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetColor(color) => {
+                self.editor.set_stroke_color(color);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetStrokeWidth(width) => {
+                self.editor.set_stroke_width(width);
                 self.window.request_redraw();
             }
             ToolbarAction::Undo => {
@@ -449,6 +490,9 @@ fn to_pts(rect: &Rect, ppp: f32) -> egui::Rect {
 /// 覆盖层一帧的 egui 绘制。
 ///
 /// HDR 模式下截图不在这里绘制（由合成 pass 直通显示），egui 只画遮罩/选区/提示层。
+///
+/// `bar_rect`：工具条矩形（egui 逻辑点）。Preview / Edit 模式下从遮罩中挖除，
+/// 让工具条浮在原始亮度的画面上（Selecting 无工具条，传 `None`）。
 fn draw_frame(
     ui: &mut egui::Ui,
     texture_id: Option<egui::TextureId>,
@@ -457,6 +501,7 @@ fn draw_frame(
     mode: Mode,
     selection: Option<Rect>,
     monitor_rect: Rect,
+    bar_rect: Option<egui::Rect>,
 ) {
     let ctx = ui.ctx().clone();
     let ppp = ctx.pixels_per_point();
@@ -479,7 +524,7 @@ fn draw_frame(
         Mode::Selecting => match selection {
             Some(sel) => {
                 let sel_pts = to_pts(&sel, ppp);
-                dim_outside_selection(&painter, sel_pts, screen_rect, 110);
+                dim_outside_selection(&painter, sel_pts, screen_rect, 110, None);
                 // 选区边框 + 尺寸标签
                 painter.rect_stroke(
                     sel_pts,
@@ -506,8 +551,9 @@ fn draw_frame(
         Mode::Preview | Mode::Edit => {
             if let Some(sel) = selection {
                 let sel_pts = to_pts(&sel, ppp);
-                // 更深遮罩突出选区（挖洞保留选区亮度）
-                dim_outside_selection(&painter, sel_pts, screen_rect, 170);
+                // 更深遮罩突出选区（挖洞保留选区亮度）；
+                // 工具条区域从遮罩中挖除，浮在原始画面上
+                dim_outside_selection(&painter, sel_pts, screen_rect, 170, bar_rect);
                 painter.rect_stroke(
                     sel_pts,
                     0.0,
@@ -521,42 +567,134 @@ fn draw_frame(
 }
 
 /// 选区外四块矩形半透明遮罩（egui painter 无挖洞原语，用四块拼）。
+///
+/// `exclude`：不画遮罩的区域（工具条上一帧实际矩形，egui 逻辑点）——
+/// 工具条因此浮在**原始亮度**的画面上，不被遮罩的暗氛围吞没。
+/// 挖洞仅外扩 [`BAR_HOLE_PAD`]（2pt）补偿抗锯齿软边，视觉与工具条完全贴合。
 fn dim_outside_selection(
     painter: &egui::Painter,
     sel_pts: egui::Rect,
     screen_rect: egui::Rect,
     alpha: u8,
+    exclude: Option<egui::Rect>,
 ) {
     let dark = egui::Color32::from_black_alpha(alpha);
-    painter.rect_filled(
+    let blocks = [
+        // 上
         egui::Rect::from_min_max(screen_rect.min, egui::pos2(screen_rect.max.x, sel_pts.min.y)),
-        0.0,
-        dark,
-    );
-    painter.rect_filled(
+        // 左
         egui::Rect::from_min_max(
             egui::pos2(screen_rect.min.x, sel_pts.min.y),
             egui::pos2(sel_pts.min.x, sel_pts.max.y),
         ),
-        0.0,
-        dark,
-    );
-    painter.rect_filled(
+        // 右
         egui::Rect::from_min_max(
             egui::pos2(sel_pts.max.x, sel_pts.min.y),
             egui::pos2(screen_rect.max.x, sel_pts.max.y),
         ),
+        // 下
+        egui::Rect::from_min_max(
+            egui::pos2(screen_rect.min.x, sel_pts.max.y),
+            screen_rect.max,
+        ),
+    ];
+    for block in blocks {
+        match exclude {
+            Some(hole) => paint_block_with_rounded_hole(painter, block, hole, dark),
+            None => {
+                painter.rect_filled(block, 0.0, dark);
+            }
+        }
+    }
+}
+
+/// 在 `block` 内绘制挖去**圆角**矩形 `hole` 的半透明遮罩，洞轮廓与工具条
+/// 卡片完全贴合（含圆角，半径 [`toolbar::CORNER_RADIUS`]）。
+///
+/// 分解：上下两条全宽条带 + 左右中块（纵向两端收进圆角半径 r）+
+/// 四个「方块减四分之一圆」的月牙补块。月牙是凹多边形，但其所有边界点
+/// 从洞外角可见（星形域），以洞外角为扇心做 fan 三角化恰好正确，
+/// 故可直接用 `PathShape` 填充。
+fn paint_block_with_rounded_hole(
+    painter: &egui::Painter,
+    block: egui::Rect,
+    hole: egui::Rect,
+    dark: egui::Color32,
+) {
+    if !block.intersects(hole) {
+        painter.rect_filled(block, 0.0, dark);
+        return;
+    }
+    let h = hole.intersect(block);
+    if !h.is_positive() {
+        painter.rect_filled(block, 0.0, dark);
+        return;
+    }
+    let r = toolbar::CORNER_RADIUS.min(h.width() * 0.5).min(h.height() * 0.5);
+    let (l, t, rt, b) = (h.left(), h.top(), h.right(), h.bottom());
+
+    // 上 / 下全宽条带
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(block.left(), block.top()),
+            egui::pos2(block.right(), t),
+        ),
         0.0,
         dark,
     );
     painter.rect_filled(
         egui::Rect::from_min_max(
-            egui::pos2(screen_rect.min.x, sel_pts.max.y),
-            screen_rect.max,
+            egui::pos2(block.left(), b),
+            egui::pos2(block.right(), block.bottom()),
         ),
         0.0,
         dark,
     );
+    // 左 / 右中块（y 两端收进 r，给四角月牙留位）
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(block.left(), t + r),
+            egui::pos2(l, b - r),
+        ),
+        0.0,
+        dark,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rt, t + r),
+            egui::pos2(block.right(), b - r),
+        ),
+        0.0,
+        dark,
+    );
+
+    // 四角月牙：(px,py) = 洞角点，(dx,dy) = 从角指向洞中心的方向
+    for &(px, py, dx, dy) in &[
+        (l, t, 1.0, 1.0),    // 左上
+        (rt, t, -1.0, 1.0),  // 右上
+        (l, b, 1.0, -1.0),   // 左下
+        (rt, b, -1.0, -1.0), // 右下
+    ] {
+        let c = egui::pos2(px + dx * r, py + dy * r); // 圆角圆心
+        let mut pts = vec![
+            egui::pos2(px, py),           // 方形外角
+            egui::pos2(px + dx * r, py),  // 弧起点
+        ];
+        for t in [0.25f32, 0.5, 0.75] {
+            // 弧方向向量：从 P1-C=(0,-dy) 插值到 P2-C=(-dx,0)
+            let vx = -t * dx;
+            let vy = -(1.0 - t) * dy;
+            let len = (vx * vx + vy * vy).sqrt();
+            pts.push(egui::pos2(c.x + vx / len * r, c.y + vy / len * r));
+        }
+        pts.push(egui::pos2(px, py + dy * r)); // 弧终点
+        painter.add(egui::Shape::Path(egui::epaint::PathShape {
+            points: pts,
+            closed: true,
+            fill: dark,
+            stroke: egui::epaint::PathStroke::default(),
+        }));
+    }
 }
 
 /// 选区尺寸标签（选区左上角内侧）。

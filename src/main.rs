@@ -347,9 +347,10 @@ mod imp {
                 false
             }
         };
+        let mut sdr_white_scrgb = 1.0f32;
         let img = if is_hdr {
             info!("显示器处于 HDR 模式，走 HDR 色彩转换");
-            let sdr_white = match display_info::query_sdr_white_nits(&raw.device_name) {
+            sdr_white_scrgb = match display_info::query_sdr_white_nits(&raw.device_name) {
                 Ok(n) => {
                     info!("SDR 白点: {n} nit");
                     n / 80.0
@@ -359,7 +360,7 @@ mod imp {
                     1.0
                 }
             };
-            frame::frame_to_srgb_image(&raw, sdr_white)
+            frame::frame_to_srgb_image(&raw, sdr_white_scrgb)
         } else {
             info!("显示器处于 SDR 模式，原图直出");
             frame::frame_to_srgb_image_direct(&raw)
@@ -368,6 +369,8 @@ mod imp {
             img,
             raw,
             is_hdr,
+            // HDR 预览 UI 层亮度提升用（SDR 屏为 1.0，不生效）
+            sdr_white_scrgb,
             monitor_rect,
         })
     }

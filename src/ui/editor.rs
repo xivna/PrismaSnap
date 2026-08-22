@@ -41,6 +41,26 @@ impl Editor {
         self.mgr.in_progress().is_some()
     }
 
+    /// 当前描边颜色（工具条选中高亮用）。
+    pub fn stroke_color(&self) -> Color {
+        self.mgr.stroke_color
+    }
+
+    /// 切换当前描边颜色（对新标注生效）。
+    pub fn set_stroke_color(&mut self, color: Color) {
+        self.mgr.stroke_color = color;
+    }
+
+    /// 当前描边宽度（物理像素，工具条选中高亮用）。
+    pub fn stroke_width(&self) -> f32 {
+        self.mgr.stroke_width
+    }
+
+    /// 切换当前描边宽度（对新标注生效）。
+    pub fn set_stroke_width(&mut self, width: f32) {
+        self.mgr.stroke_width = width;
+    }
+
     /// 激活工具（进入编辑态）。
     pub fn activate(&mut self, tool: Tool) {
         self.active_tool = Some(tool);

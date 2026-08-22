@@ -29,7 +29,15 @@ use crate::capture::frame::RawFrame;
 /// - `shot_tex`：Rgba16Float scRGB 截图（线性，原样输出，>1.0 高光透传）；
 /// - `ui_tex`：Rgba8UnormSrgb egui 中间纹理（采样时硬件自动 sRGB→linear 解码，
 ///   存储为预乘 alpha 的 sRGB 值）；
-/// - 混合公式（premultiplied over）：`ui.rgb + shot.rgb * (1 - ui.a)`。
+/// - `ui_params.x`：UI 亮度提升系数（= 显示器 SDR 白点 nit / 80）；
+/// - 混合公式（premultiplied over）：`ui.rgb * boost + shot.rgb * (1 - ui.a)`。
+///
+/// boost 的由来：scRGB 规定线性值 1.0 = 80 nit 固定物理亮度，而 HDR 桌面上
+/// DWM 会把 SDR 内容（含 WGC 捕获帧里的桌面画面）提升到「SDR 内容亮度」滑块
+/// 对应的亮度（如 268 nit → scRGB ≈ 3.35）。截图直通保留了该高值，若 UI 层
+/// 按 1.0 输出就会比截图内容暗数倍（工具条发灰、框线显深，2026-08-22 实机
+/// 反馈）。乘以 boost 把 UI 白拉到与截图中的 SDR 白同亮度——等价于 DWM 对
+/// 普通 SDR 窗口的处理。
 const COMPOSITE_SHADER: &str = r#"
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -55,12 +63,13 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(0) var shot_tex: texture_2d<f32>;
 @group(0) @binding(1) var ui_tex: texture_2d<f32>;
 @group(0) @binding(2) var tex_sampler: sampler;
+@group(0) @binding(3) var<uniform> ui_params: vec4f;
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     let shot = textureSample(shot_tex, tex_sampler, in.uv);
     let ui = textureSample(ui_tex, tex_sampler, in.uv);
-    return vec4f(ui.rgb + shot.rgb * (1.0 - ui.a), 1.0);
+    return vec4f(ui.rgb * ui_params.x + shot.rgb * (1.0 - ui.a), 1.0);
 }
 "#;
 
@@ -72,6 +81,8 @@ struct HdrComposite {
     /// 截图 scRGB 纹理（`Rgba16Float`），截图上传后存在。
     scrgb_texture: Option<wgpu::Texture>,
     scrgb_view: Option<wgpu::TextureView>,
+    /// UI 亮度提升系数 uniform（vec4：x = SDR 白点 nit / 80，其余保留）。
+    ui_params_buf: wgpu::Buffer,
     /// 线性采样器（clamp 到边缘）。
     sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
@@ -102,6 +113,10 @@ impl HdrComposite {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ui_params_buf.as_entire_binding(),
                 },
             ],
         }));
@@ -222,11 +237,20 @@ impl GuiState {
         let hdr = if hdr_supported {
             let (ui_texture, ui_texture_view) = create_ui_texture(&device, config.width, config.height);
             let (bind_layout, pipeline) = create_composite_pipeline(&device, format);
+            let ui_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("composite_ui_params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // 默认 boost = 1.0（覆盖层上传截图后由 set_ui_boost 按显示器白点覆写）
+            queue.write_buffer(&ui_params_buf, 0, bytemuck::cast_slice(&[1.0f32, 0.0, 0.0, 0.0]));
             let mut hdr = HdrComposite {
                 ui_texture,
                 ui_texture_view,
                 scrgb_texture: None,
                 scrgb_view: None,
+                ui_params_buf,
                 sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("composite_sampler"),
                     address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -264,6 +288,23 @@ impl GuiState {
     /// 是否启用了 HDR 输出（合成管线）。
     pub fn is_hdr(&self) -> bool {
         self.hdr.is_some()
+    }
+
+    /// 设置 HDR 合成中 UI 层的亮度提升系数。
+    ///
+    /// * `boost` - SDR 白点 scRGB 值（= 显示器 SDR 白点 nit / 80，由
+    ///   `query_sdr_white_nits` 查询）。scRGB 线性 1.0 = 80 nit 固定物理亮度，
+    ///   而 HDR 桌面把 SDR 内容提升到滑块对应亮度；不乘此系数 egui UI 会比
+    ///   截图内容暗数倍（见 COMPOSITE_SHADER 注释）。仅 HDR 路径有效。
+    pub fn set_ui_boost(&mut self, boost: f32) {
+        let Some(hdr) = &self.hdr else {
+            return;
+        };
+        self.queue.write_buffer(
+            &hdr.ui_params_buf,
+            0,
+            bytemuck::cast_slice(&[boost.max(1.0), 0.0, 0.0, 0.0]),
+        );
     }
 
     /// 把窗口事件喂给 egui（记录输入状态），返回 egui 是否消费了该事件。
@@ -593,6 +634,16 @@ fn create_composite_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(16),
+                },
+                count: None,
+            },
         ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -634,6 +685,41 @@ pub fn apply_theme(ctx: &egui::Context, theme: crate::config::Theme) {
         crate::config::Theme::Light => egui::Visuals::light(),
         crate::config::Theme::Dark => egui::Visuals::dark(),
     });
+}
+
+/// 设置窗口 Apple 风配色（iOS 系统色板，跟随主题）。
+pub struct Palette {
+    /// 页面底色（设置窗口背景）。
+    pub page_bg: egui::Color32,
+    /// 分组卡片底色。
+    pub card_bg: egui::Color32,
+    /// 卡片描边。
+    pub card_stroke: egui::Color32,
+    /// 次级文字（分组标题、说明文字）。
+    pub secondary: egui::Color32,
+}
+
+/// 按主题取配色：浅色 = 浅灰页面 + 白卡片；深色 = 近黑页面 + 提亮卡片。
+///
+/// 采用固定 iOS 色板而非 egui 默认 visuals——dark 主题默认 `window_fill`
+/// 仅 gray(27)，卡片层次会反转。仅用于设置窗口（覆盖层工具条为固定深色
+/// 半透明浮层，见 `toolbar::BAR_BG`，不随主题）。
+pub fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette {
+            page_bg: egui::Color32::from_rgb(16, 16, 18),
+            card_bg: egui::Color32::from_rgb(43, 43, 48),
+            card_stroke: egui::Color32::from_white_alpha(30),
+            secondary: egui::Color32::from_rgb(160, 160, 168),
+        }
+    } else {
+        Palette {
+            page_bg: egui::Color32::from_rgb(242, 242, 247),
+            card_bg: egui::Color32::WHITE,
+            card_stroke: egui::Color32::from_black_alpha(36),
+            secondary: egui::Color32::from_rgb(110, 110, 118),
+        }
+    }
 }
 
 /// 加载系统中文字体字节（进程内缓存，避免每次截图重复读盘）。

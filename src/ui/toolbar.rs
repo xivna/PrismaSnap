@@ -9,17 +9,39 @@
 //! - **egui 绘制**（`toolbar_ui`，仅 Windows）：文字按钮占位（图标素材
 //!   用户准备中），点击结果以 [`ToolbarAction`] 返回给调用方处理。
 
+#[cfg(target_os = "windows")]
+use crate::annotation::Color;
 use crate::utils::math::Rect;
 
 /// 工具条估算尺寸（egui 点）。
 ///
-/// 10 个文字按钮（5 工具 + 撤销/重做 + 复制/保存/取消，每个约 54pt）
-/// + 分隔符与内边距。仅用于弹出前的位置计算（需先知尺寸才能定位），
+/// 两行布局：第一行 10 个文字按钮（5 工具 + 撤销/重做 + 复制/保存/取消，
+/// 每个约 54pt）+ 分隔符与内边距；第二行 6 色块 + 三档线宽（约 30pt）。
+/// 仅用于弹出前的位置计算（需先知尺寸才能定位），
 /// 与实际渲染尺寸的小偏差不影响正确性（水平钳制留了余量）。
-pub const BAR_SIZE: (f32, f32) = (600.0, 44.0);
+pub const BAR_SIZE: (f32, f32) = (600.0, 80.0);
 
 /// 工具条与选区间的间距（egui 点）。
 pub const BAR_GAP: f32 = 10.0;
+
+/// 工具条卡片圆角（egui 点）。覆盖层遮罩挖洞需与此保持一致，
+/// 保证洞的圆角与工具条卡片完全重合（见 `overlay::dim_outside_selection`）。
+pub const CORNER_RADIUS: f32 = 10.0;
+
+/// 预设标注颜色（展示顺序，取自 [`Color`] 常量）。
+#[cfg(target_os = "windows")]
+const PRESET_COLORS: [Color; 6] = [
+    Color::RED,
+    Color::YELLOW,
+    Color::GREEN,
+    Color::BLUE,
+    Color::WHITE,
+    Color::BLACK,
+];
+
+/// 线宽档位 `(线宽物理像素, 按钮圆点字号 pt)`。
+#[cfg(target_os = "windows")]
+const WIDTH_STEPS: [(f32, f32); 3] = [(3.0, 10.0), (6.0, 13.0), (10.0, 16.0)];
 
 /// 计算工具条左上角位置（egui 逻辑点）。
 ///
@@ -122,10 +144,14 @@ mod tests {
 
 /// 工具条点击结果（由覆盖层在处理完渲染后统一响应）。
 #[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolbarAction {
     /// 激活/切换标注工具。
     ActivateTool(crate::annotation::Tool),
+    /// 切换当前描边颜色（对新标注生效）。
+    SetColor(Color),
+    /// 切换当前描边宽度（对新标注生效）。
+    SetStrokeWidth(f32),
     Undo,
     Redo,
     Copy,
@@ -136,59 +162,131 @@ pub enum ToolbarAction {
 /// 绘制工具条，返回本帧被点击的动作（无点击返回 `None`）。
 ///
 /// * `pos` - 左上角（egui 逻辑点，由 [`toolbar_pos_pts`] 计算）；
-/// * `active_tool` - 当前激活的标注工具（高亮显示）；
-/// * `can_undo` / `can_redo` - 撤销/重做按钮可用状态。
+/// * `active_tool` - 当前激活的标注工具（高亮显示）;
+/// * `stroke_color` / `stroke_width` - 当前颜色与线宽（第二行选中高亮）；
+/// * `can_undo` / `can_redo` - 撤销/重做按钮可用状态；
+/// * `actual_rect` - 输出本帧工具条的**实际**渲染矩形（egui 逻辑点），
+///   调用方用于遮罩挖洞（[`crate::ui::overlay`]），与估算尺寸 [`BAR_SIZE`]
+///   相比这才是真实边界。
 #[cfg(target_os = "windows")]
 pub fn toolbar_ui(
     ctx: &egui::Context,
     pos: (f32, f32),
     active_tool: Option<crate::annotation::Tool>,
+    stroke_color: Color,
+    stroke_width: f32,
     can_undo: bool,
     can_redo: bool,
+    actual_rect: &mut Option<egui::Rect>,
 ) -> Option<ToolbarAction> {
     use crate::annotation::Tool;
 
     let mut action = None;
-    egui::Area::new(egui::Id::new("prismsnap_toolbar"))
+    let area_response = egui::Area::new(egui::Id::new("prismsnap_toolbar"))
         .fixed_pos(egui::pos2(pos.0, pos.1))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            // 填充/描边跟随当前主题（深色工具条文字辨识度差，见配置 ui.theme）
+            // 浮层风格跟随界面主题（设置界面「主题」项即时生效）：
+            // 浅色 = 白卡片 + 投影；深色 = 深灰卡片 + 白描边。
+            // 柔和投影是浮层质感的关键——人眼识别"悬浮"靠阴影而非绝对亮度；
+            // 子树 visuals 同步切换，保证文字/控件与底色协调
+            let dark_mode = ui.visuals().dark_mode;
+            ui.style_mut().visuals = if dark_mode {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            let (fill, frame_stroke) = if dark_mode {
+                (
+                    egui::Color32::from_rgba_unmultiplied(44, 44, 50, 244),
+                    egui::Color32::from_white_alpha(30),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgba_unmultiplied(250, 250, 252, 248),
+                    egui::Color32::from_black_alpha(28),
+                )
+            };
             egui::Frame::new()
-                .fill(ui.visuals().window_fill())
-                .stroke(ui.visuals().window_stroke())
-                .corner_radius(8.0)
+                .fill(fill)
+                .stroke(egui::Stroke::new(1.0, frame_stroke))
+                .shadow(egui::Shadow {
+                    offset: [0, 4],
+                    blur: 18,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(70),
+                })
+                .corner_radius(CORNER_RADIUS)
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for tool in Tool::ALL {
-                            let mut btn = egui::Button::new(tool.label());
-                            if active_tool == Some(tool) {
-                                btn = btn.fill(egui::Color32::from_rgb(0, 110, 200));
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            for tool in Tool::ALL {
+                                let mut btn = egui::Button::new(tool.label());
+                                if active_tool == Some(tool) {
+                                    btn = btn.fill(ui.visuals().selection.bg_fill);
+                                }
+                                if ui.add(btn).clicked() {
+                                    action = Some(ToolbarAction::ActivateTool(tool));
+                                }
                             }
-                            if ui.add(btn).clicked() {
-                                action = Some(ToolbarAction::ActivateTool(tool));
+                            ui.separator();
+                            if ui.add_enabled(can_undo, egui::Button::new("撤销")).clicked() {
+                                action = Some(ToolbarAction::Undo);
                             }
-                        }
-                        ui.separator();
-                        if ui.add_enabled(can_undo, egui::Button::new("撤销")).clicked() {
-                            action = Some(ToolbarAction::Undo);
-                        }
-                        if ui.add_enabled(can_redo, egui::Button::new("重做")).clicked() {
-                            action = Some(ToolbarAction::Redo);
-                        }
-                        ui.separator();
-                        if ui.button("复制").clicked() {
-                            action = Some(ToolbarAction::Copy);
-                        }
-                        if ui.button("保存").clicked() {
-                            action = Some(ToolbarAction::Save);
-                        }
-                        if ui.button("取消").clicked() {
-                            action = Some(ToolbarAction::Cancel);
-                        }
+                            if ui.add_enabled(can_redo, egui::Button::new("重做")).clicked() {
+                                action = Some(ToolbarAction::Redo);
+                            }
+                            ui.separator();
+                            if ui.button("复制").clicked() {
+                                action = Some(ToolbarAction::Copy);
+                            }
+                            if ui.button("保存").clicked() {
+                                action = Some(ToolbarAction::Save);
+                            }
+                            if ui.button("取消").clicked() {
+                                action = Some(ToolbarAction::Cancel);
+                            }
+                        });
+                        // 第二行：颜色 + 线宽（对新标注生效）
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            for &c in &PRESET_COLORS {
+                                let selected = stroke_color == c;
+                                // 统一细描边保证白/黄等浅色块在浅色背景上可见
+                                let stroke = if selected {
+                                    egui::Stroke::new(2.5, ui.visuals().strong_text_color())
+                                } else {
+                                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
+                                };
+                                let btn = egui::Button::new("")
+                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                        c.r, c.g, c.b, c.a,
+                                    ))
+                                    .stroke(stroke)
+                                    .min_size(egui::vec2(20.0, 20.0))
+                                    .corner_radius(10.0);
+                                if ui.add(btn).clicked() {
+                                    action = Some(ToolbarAction::SetColor(c));
+                                }
+                            }
+                            ui.separator();
+                            for &(w, dot) in &WIDTH_STEPS {
+                                let selected = (stroke_width - w).abs() < f32::EPSILON;
+                                let mut btn =
+                                    egui::Button::new(egui::RichText::new("●").size(dot));
+                                if selected {
+                                    btn = btn.fill(ui.visuals().selection.bg_fill);
+                                }
+                                if ui.add(btn).clicked() {
+                                    action = Some(ToolbarAction::SetStrokeWidth(w));
+                                }
+                            }
+                        });
                     });
                 });
         });
+    // 记录本帧 Area 的实际边界（含 Frame 内边距），供遮罩精确挖洞
+    *actual_rect = Some(area_response.response.rect);
     action
 }

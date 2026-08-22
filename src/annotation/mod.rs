@@ -254,19 +254,25 @@ impl AnnotationManager {
 /// * `img` - 已裁剪的选区图（sRGB）；
 /// * `origin` - 选区在全图中的原点（标注坐标为全图物理像素，需平移）。
 ///
-/// Phase 3 骨架阶段：导出管线已接通，各工具的 CPU 绘制随对应工具任务逐个
-/// 落地（见 `tools/`）；当前有标注时记录警告并原样返回。
+/// 各工具的光栅化实现随 Phase 3 逐个落地于 `tools/`；
+/// 未落地的工具记录警告并跳过（不影响其他标注写入）。
 pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], origin: (i32, i32)) {
-    if annotations.is_empty() {
-        return;
+    for ann in annotations {
+        match ann {
+            Annotation::Rect { rect, color, stroke_width } => {
+                let local = Rect {
+                    x: rect.x - origin.0,
+                    y: rect.y - origin.1,
+                    width: rect.width,
+                    height: rect.height,
+                };
+                tools::rect::draw_rect(img, local, *color, *stroke_width);
+            }
+            other => tracing::warn!(
+                "标注 {other:?} 的 CPU 导出重绘尚未实现，本条未写入导出图"
+            ),
+        }
     }
-    // TODO(Phase 3): 各工具 CPU 光栅化落地后删除此警告
-    tracing::warn!(
-        "导出标注 CPU 重绘尚未实现，{} 条标注未写入导出图（origin={origin:?}，img={}x{}）",
-        annotations.len(),
-        img.width(),
-        img.height(),
-    );
 }
 
 #[cfg(test)]
@@ -332,5 +338,27 @@ mod tests {
         assert!(Annotation::Arrow { from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
         assert!(!Annotation::Arrow { from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
         assert!(Annotation::Text { pos: (0.0, 0.0), content: "  ".into(), color: Color::RED, font_size: 16.0 }.is_degenerate());
+    }
+
+    #[test]
+    fn apply_to_image_translates_by_selection_origin() {
+        use crate::utils::math::Rect;
+        let mut img = image::RgbaImage::from_pixel(50, 50, image::Rgba([255, 255, 255, 255]));
+        // 全图坐标 (20, 30) 的矩形，选区原点 (10, 20) → 图内应落在 (10, 10)
+        let ann = Annotation::Rect {
+            rect: Rect { x: 20, y: 30, width: 15, height: 10 },
+            color: Color::RED,
+            stroke_width: 1.0,
+        };
+        apply_to_image(&mut img, &[ann], (10, 20));
+        let at = |x: u32, y: u32| {
+            let p = img.get_pixel(x, y).0;
+            [p[0], p[1], p[2]]
+        };
+        // 平移后描边贴矩形外侧：上条带 y ∈ [9,10)、下条带 y ∈ [20,21)
+        assert_eq!(at(12, 9), [255, 59, 48]);
+        assert_eq!(at(25, 20), [255, 59, 48]);
+        // 内部保持白
+        assert_eq!(at(15, 15), [255, 255, 255]);
     }
 }

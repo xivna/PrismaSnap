@@ -27,7 +27,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{Config, SaveFormat, SaveMode, Theme};
 
-use super::gui::GuiState;
+use super::gui::{palette, GuiState, Palette};
 
 /// 设置窗口默认大小（逻辑像素）。
 const DEFAULT_SIZE: (u32, u32) = (620, 600);
@@ -196,17 +196,10 @@ impl Settings {
                 &mut draft,
                 &mut dir_input,
                 recording,
+                status.as_ref(),
                 &mut changed,
                 &mut start_recording,
             );
-            if let Some((ok, msg)) = &status {
-                let color = if *ok {
-                    egui::Color32::from_rgb(80, 200, 120)
-                } else {
-                    egui::Color32::from_rgb(255, 90, 90)
-                };
-                ui.colored_label(color, msg);
-            }
         });
 
         // 闭包同步执行完毕，把编辑结果写回
@@ -222,169 +215,218 @@ impl Settings {
 }
 
 /// 绘制全部设置项（在 `redraw` 闭包内调用，编辑局部 `draft`/`dir_input`）。
+///
+/// 布局为 Apple 系统设置风格：全屏主题页面底色 + 居中大标题 +
+/// 各分组「小标题 + 圆角卡片」，卡片内两列 Grid 对齐排布。
 fn draw_settings_ui(
     ui: &mut egui::Ui,
     draft: &mut Config,
     dir_input: &mut String,
     recording: bool,
+    status: Option<&(bool, String)>,
     changed: &mut bool,
     start_recording: &mut bool,
 ) {
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("PrismaSnap 设置").size(20.0).strong());
-    });
-    ui.add_space(6.0);
+    let pal = palette(matches!(draft.ui.theme, Theme::Dark));
+
+    // 根 Ui 无自带背景填充（渲染栈清屏色是黑色），按主题铺满页面底色——
+    // 否则浅色主题下窗口依旧透黑（2026-08-20 用户实机反馈）
+    ui.painter().rect_filled(ui.max_rect(), 0.0, pal.page_bg);
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("settings_main")
-                .num_columns(2)
-                .spacing([24.0, 12.0])
-                .min_col_width(96.0)
-                .show(ui, |ui| {
-                    // ── 全局热键 ──
-                    section_title(ui, "全局热键");
-                    ui.end_row();
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("PrismaSnap 设置").size(22.0).strong());
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("截图 · 标注 · AI")
+                        .size(12.0)
+                        .color(pal.secondary),
+                );
+            });
+            ui.add_space(10.0);
 
-                    ui.label("截图热键");
-                    ui.horizontal(|ui| {
-                        if recording {
-                            ui.label(
-                                egui::RichText::new("请按下组合键（Esc 取消）")
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(0, 160, 255)),
-                            );
-                        } else {
-                            ui.label(egui::RichText::new(display_hotkey(&draft.hotkey)).size(14.0));
-                            if ui
-                                .add_sized(
-                                    [72.0, 26.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("录制").size(14.0),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                *start_recording = true;
-                            }
+            // ── 全局热键 ──
+            section_card(ui, "全局热键", &pal, |ui| {
+                ui.label("截图热键");
+                ui.horizontal(|ui| {
+                    if recording {
+                        ui.label(
+                            egui::RichText::new("请按下组合键（Esc 取消）")
+                                .size(14.0)
+                                .color(ui.visuals().hyperlink_color),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new(display_hotkey(&draft.hotkey)).size(14.0));
+                        if ui
+                            .add_sized(
+                                [72.0, 26.0],
+                                egui::Button::new(egui::RichText::new("录制").size(13.0)),
+                            )
+                            .clicked()
+                        {
+                            *start_recording = true;
                         }
-                    });
-                    ui.end_row();
-
-                    // ── 保存行为 ──
-                    ui.add_space(4.0);
-                    ui.end_row();
-                    section_title(ui, "保存行为");
-                    ui.end_row();
-
-                    ui.label("保存模式");
-                    ui.horizontal(|ui| {
-                        *changed |= ui
-                            .radio_value(&mut draft.save.mode, SaveMode::Silent, "静默保存")
-                            .changed();
-                        *changed |= ui
-                            .radio_value(&mut draft.save.mode, SaveMode::AlwaysAsk, "每次询问")
-                            .changed();
-                    });
-                    ui.end_row();
-
-                    ui.label("保存目录");
-                    *changed |= ui.text_edit_singleline(dir_input).changed();
-                    ui.end_row();
-
-                    ui.label("图片格式");
-                    *changed |= egui::ComboBox::from_id_salt("save_format")
-                        .width(90.0)
-                        .selected_text(format_name(draft.save.format))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut draft.save.format, SaveFormat::Png, "PNG");
-                            ui.selectable_value(&mut draft.save.format, SaveFormat::Jpeg, "JPEG");
-                        })
-                        .response
-                        .changed();
-                    ui.end_row();
-
-                    if draft.save.format == SaveFormat::Jpeg {
-                        ui.label("JPEG 质量");
-                        *changed |=
-                            ui.add(egui::Slider::new(&mut draft.save.jpeg_quality, 1..=100))
-                                .changed();
-                        ui.end_row();
                     }
-
-                    ui.label("");
-                    ui.label(
-                        egui::RichText::new("目录留空 = <程序目录>/screenshots")
-                            .size(12.0)
-                            .color(egui::Color32::GRAY),
-                    );
-                    ui.end_row();
-
-                    // ── 捕获 ──
-                    ui.add_space(4.0);
-                    ui.end_row();
-                    section_title(ui, "捕获");
-                    ui.end_row();
-
-                    ui.label("光标");
-                    *changed |= ui
-                        .checkbox(&mut draft.capture.cursor_visible, "截图包含鼠标光标")
-                        .changed();
-                    ui.end_row();
-
-                    // ── 界面 ──
-                    ui.add_space(4.0);
-                    ui.end_row();
-                    section_title(ui, "界面");
-                    ui.end_row();
-
-                    ui.label("主题");
-                    ui.horizontal(|ui| {
-                        *changed |= ui
-                            .radio_value(&mut draft.ui.theme, Theme::Light, "浅色")
-                            .changed();
-                        *changed |= ui
-                            .radio_value(&mut draft.ui.theme, Theme::Dark, "深色")
-                            .changed();
-                    });
-                    ui.end_row();
-
-                    // ── AI 接口 ──
-                    ui.add_space(4.0);
-                    ui.end_row();
-                    section_title(ui, "AI 接口（OpenAI 兼容）");
-                    ui.end_row();
-
-                    ui.label("API 地址");
-                    *changed |= ui.text_edit_singleline(&mut draft.llm.api_url).changed();
-                    ui.end_row();
-
-                    ui.label("API Key");
-                    *changed |= ui
-                        .add(egui::TextEdit::singleline(&mut draft.llm.api_key).password(true))
-                        .changed();
-                    ui.end_row();
-
-                    ui.label("模型");
-                    *changed |= ui.text_edit_singleline(&mut draft.llm.model).changed();
-                    ui.end_row();
-
-                    ui.label("翻译目标");
-                    *changed |= ui
-                        .text_edit_singleline(&mut draft.llm.translate_target)
-                        .changed();
-                    ui.end_row();
                 });
+                ui.end_row();
+            });
 
-            ui.add_space(8.0);
+            // ── 保存行为 ──
+            section_card(ui, "保存行为", &pal, |ui| {
+                ui.label("保存模式");
+                ui.horizontal(|ui| {
+                    *changed |= ui
+                        .radio_value(&mut draft.save.mode, SaveMode::Silent, "静默保存")
+                        .changed();
+                    *changed |= ui
+                        .radio_value(&mut draft.save.mode, SaveMode::AlwaysAsk, "每次询问")
+                        .changed();
+                });
+                ui.end_row();
+
+                ui.label("保存目录");
+                ui.vertical(|ui| {
+                    *changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(dir_input)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("<程序目录>/screenshots"),
+                        )
+                        .changed();
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("留空时使用程序目录下的 screenshots")
+                            .size(11.5)
+                            .color(pal.secondary),
+                    );
+                });
+                ui.end_row();
+
+                ui.label("图片格式");
+                *changed |= egui::ComboBox::from_id_salt("save_format")
+                    .width(90.0)
+                    .selected_text(format_name(draft.save.format))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut draft.save.format, SaveFormat::Png, "PNG");
+                        ui.selectable_value(&mut draft.save.format, SaveFormat::Jpeg, "JPEG");
+                    })
+                    .response
+                    .changed();
+                ui.end_row();
+
+                if draft.save.format == SaveFormat::Jpeg {
+                    ui.label("JPEG 质量");
+                    *changed |=
+                        ui.add(egui::Slider::new(&mut draft.save.jpeg_quality, 1..=100))
+                            .changed();
+                    ui.end_row();
+                }
+            });
+
+            // ── 捕获 ──
+            section_card(ui, "捕获", &pal, |ui| {
+                ui.label("光标");
+                *changed |= ui
+                    .checkbox(&mut draft.capture.cursor_visible, "截图包含鼠标光标")
+                    .changed();
+                ui.end_row();
+            });
+
+            // ── 界面 ──
+            section_card(ui, "界面", &pal, |ui| {
+                ui.label("主题");
+                ui.horizontal(|ui| {
+                    *changed |= ui
+                        .radio_value(&mut draft.ui.theme, Theme::Light, "浅色")
+                        .changed();
+                    *changed |= ui
+                        .radio_value(&mut draft.ui.theme, Theme::Dark, "深色")
+                        .changed();
+                });
+                ui.end_row();
+            });
+
+            // ── AI 接口 ──
+            section_card(ui, "AI 接口（OpenAI 兼容）", &pal, |ui| {
+                ui.label("API 地址");
+                *changed |= ui.text_edit_singleline(&mut draft.llm.api_url).changed();
+                ui.end_row();
+
+                ui.label("API Key");
+                *changed |= ui
+                    .add(egui::TextEdit::singleline(&mut draft.llm.api_key).password(true))
+                    .changed();
+                ui.end_row();
+
+                ui.label("模型");
+                *changed |= ui.text_edit_singleline(&mut draft.llm.model).changed();
+                ui.end_row();
+
+                ui.label("翻译目标");
+                *changed |= ui
+                    .text_edit_singleline(&mut draft.llm.translate_target)
+                    .changed();
+                ui.end_row();
+            });
+
+            // 状态提示（保存成功/失败等）
+            if let Some((ok, msg)) = status {
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    // iOS 系统绿 / 红
+                    let color = if *ok {
+                        egui::Color32::from_rgb(52, 199, 89)
+                    } else {
+                        egui::Color32::from_rgb(255, 69, 58)
+                    };
+                    ui.colored_label(color, msg);
+                });
+            }
+
+            ui.add_space(20.0);
         });
 }
 
-/// 分组标题（统一样式，跨两列占位）。
-fn section_title(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(16.0).strong());
-    ui.label("");
+/// 「分组标题 + 圆角内容卡片」（Apple 系统设置风格）。
+///
+/// 标题为小号次级色文字、置于卡片外上方并与卡片左缘对齐；
+/// 卡片内为两列 Grid（`rows` 填充行，每行末尾调 `ui.end_row()`）。
+fn section_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    pal: &Palette,
+    rows: impl FnOnce(&mut egui::Ui),
+) {
+    const SIDE_MARGIN: f32 = 24.0;
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(SIDE_MARGIN + 4.0);
+        ui.label(
+            egui::RichText::new(title)
+                .size(12.5)
+                .strong()
+                .color(pal.secondary),
+        );
+    });
+    ui.add_space(5.0);
+
+    egui::Frame::new()
+        .fill(pal.card_bg)
+        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(16))
+        .outer_margin(egui::Margin::symmetric(SIDE_MARGIN as i8, 2))
+        .show(ui, |ui| {
+            egui::Grid::new(egui::Id::new(title))
+                .num_columns(2)
+                .spacing([20.0, 10.0])
+                .min_col_width(96.0)
+                .show(ui, rows);
+        });
 }
 
 /// `SaveFormat` 的展示名。
