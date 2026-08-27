@@ -15,7 +15,7 @@ use anyhow::Context as _;
 
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DrawBorderSettings, DirtyRegionSettings,
@@ -210,6 +210,17 @@ fn spawn_capture_thread(
             CursorCaptureSettings::WithCursor
         } else {
             CursorCaptureSettings::WithoutCursor
+        };
+        // 平台不支持切换光标捕获时（虚拟机等）降级 Default：windows-capture 对
+        // 非 Default 的光标设置会检查 IsCursorCaptureEnabled 属性，虚拟机缺该属性
+        // 会报 CursorConfigUnsupported，导致截图整体失败。真机仍走显式设置。
+        let cursor = if cursor != CursorCaptureSettings::Default
+            && !GraphicsCaptureApi::is_cursor_settings_supported().unwrap_or(true)
+        {
+            tracing::warn!("当前平台不支持切换光标捕获，降级为系统默认光标行为");
+            CursorCaptureSettings::Default
+        } else {
+            cursor
         };
         let settings = Settings::new(
             monitor,
