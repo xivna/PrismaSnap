@@ -330,10 +330,13 @@ impl GuiState {
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
 
-        // 纹理增删（截图纹理、后续标注缩略图等）
-        for (id, deltas) in &full_output.textures_delta.set {
+        // 接管纹理 delta 所有权并消费（egui 的 `TexturesDelta::drop` 有
+        // `debug_assert!(is_empty())`：借用遍历不消费，函数提前 return 时残留
+        // 未消费 delta，debug 版直接 panic）。用 drain 彻底移出 set/free。
+        let mut textures_delta = full_output.textures_delta;
+        for (id, deltas) in textures_delta.set.drain() {
             for delta in deltas {
-                self.renderer.update_texture(&self.device, &self.queue, *id, delta);
+                self.renderer.update_texture(&self.device, &self.queue, id, &delta);
             }
         }
 
@@ -362,10 +365,16 @@ impl GuiState {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                for id in textures_delta.free.drain() {
+                    self.renderer.free_texture(&id);
+                }
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
             other => {
+                for id in textures_delta.free.drain() {
+                    self.renderer.free_texture(&id);
+                }
                 tracing::warn!("get_current_texture: {other:?}");
                 return;
             }
@@ -451,8 +460,8 @@ impl GuiState {
             .submit(user_cmd_bufs.into_iter().chain([encoder.finish()]));
 
         // 销毁纹理须在 submit 之后（可能仍被本帧命令引用）
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
 
         window.pre_present_notify();
