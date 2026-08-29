@@ -22,7 +22,7 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use super::frame::RawFrame;
+use super::frame::{RawFrame, RawFrameFormat};
 use crate::utils::math::Rect;
 
 /// 等待首帧的最长时限。
@@ -40,12 +40,15 @@ struct CaptureContext {
     tx: Sender<FrameResult>,
     /// 来源显示器的 GDI 设备名（如 `\\.\DISPLAY1`），供后续查询 SDR 白点。
     device_name: String,
+    /// 像素格式（与 `Settings` 的 `ColorFormat` 对应）。
+    format: RawFrameFormat,
 }
 
 /// 捕获句柄：收到首帧后提取数据、停止捕获、经 channel 回传。
 struct FrameExtractor {
     tx: Sender<FrameResult>,
     device_name: String,
+    format: RawFrameFormat,
 }
 
 impl GraphicsCaptureApiHandler for FrameExtractor {
@@ -56,6 +59,7 @@ impl GraphicsCaptureApiHandler for FrameExtractor {
         Ok(Self {
             tx: ctx.flags.tx,
             device_name: ctx.flags.device_name,
+            format: ctx.flags.format,
         })
     }
 
@@ -67,6 +71,7 @@ impl GraphicsCaptureApiHandler for FrameExtractor {
         let width = frame.width();
         let height = frame.height();
 
+        tracing::debug!("首帧到达 {width}x{height}，停止捕获会话");
         let result = frame
             .buffer()
             .map_err(|e| e.to_string())
@@ -80,6 +85,7 @@ impl GraphicsCaptureApiHandler for FrameExtractor {
                     height,
                     row_pitch,
                     data,
+                    format: self.format,
                     device_name: self.device_name.clone(),
                 }
             });
@@ -147,25 +153,36 @@ pub fn monitor_rect_at_cursor() -> anyhow::Result<Rect> {
     })
 }
 
-/// 捕获指定显示器的一帧 `Rgba16F` 数据（阻塞调用，内部起独立线程）。
+/// 返回显示器 GDI 设备名（查询 HDR / SDR 白点用）。
+pub fn monitor_device_name(monitor: &Monitor) -> String {
+    monitor
+        .device_name()
+        .unwrap_or_else(|_| String::from("\\\\.\\DISPLAY1"))
+}
+
+/// 捕获指定显示器的一帧（阻塞调用，内部起独立线程）。
 ///
 /// `Capture::start()` 会接管调用它的线程，故在线程内执行；首帧到达后立即
 /// 停止捕获，结果经 channel 传回。
 ///
 /// * `cursor_visible` - 是否在捕获结果中包含系统光标（AGENTS.md 3.1 节：
 ///   光标捕获显式配置，不用 `Default`）。
+/// * `hdr_format` - `true` 用 `Rgba16F`（HDR scRGB）；`false` 用 `Rgba8`
+///   （SDR 原生 8-bit，避免 DWM 为 16F 切合成格式导致闪屏）。
 ///
 /// # Errors
 /// 捕获启动失败、线程提前退出、或超时未收到帧时返回错误。
-pub fn capture_frame(monitor: Monitor, cursor_visible: bool) -> anyhow::Result<RawFrame> {
-    let device_name = monitor
-        .device_name()
-        .unwrap_or_else(|_| String::from("\\\\.\\DISPLAY1"));
+pub fn capture_frame(
+    monitor: Monitor,
+    cursor_visible: bool,
+    hdr_format: bool,
+) -> anyhow::Result<RawFrame> {
+    let device_name = monitor_device_name(&monitor);
 
     let (tx, rx) = channel::<FrameResult>();
     // 预留一个发送端给「start 失败」的错误路径（start 成功时该端随线程退出而 drop）
     let err_tx = tx.clone();
-    let handle = spawn_capture_thread(monitor, device_name, cursor_visible, tx, err_tx);
+    let handle = spawn_capture_thread(monitor, device_name, cursor_visible, hdr_format, tx, err_tx);
 
     // 轮询等待首帧：每 POLL_INTERVAL 检查一次 channel；
     // 若线程已结束仍无消息（start 失败等），提前报错而非傻等超时。
@@ -202,6 +219,7 @@ fn spawn_capture_thread(
     monitor: Monitor,
     device_name: String,
     cursor_visible: bool,
+    hdr_format: bool,
     tx: Sender<FrameResult>,
     err_tx: Sender<FrameResult>,
 ) -> JoinHandle<()> {
@@ -222,20 +240,52 @@ fn spawn_capture_thread(
         } else {
             cursor
         };
-        let settings = Settings::new(
-            monitor,
-            cursor,
-            DrawBorderSettings::Default,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Rgba16F,
-            CaptureContext { tx, device_name },
-        );
+        // 默认 WGC 会在被截显示器四周画一圈彩色边框；会话 start/stop 各闪一次，
+        // SDR 屏上尤其明显。Win11 支持则关掉。
+        let border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
+            DrawBorderSettings::WithoutBorder
+        } else {
+            DrawBorderSettings::Default
+        };
 
-        if let Err(e) = FrameExtractor::start(settings) {
-            // start 失败：flags 已被消费，用预留的发送端把错误传回主线程
-            let _ = err_tx.send(Err(format!("capture start failed: {e}")));
+        // SDR 屏请求 Rgba16F 会让 DWM 切到 scRGB 合成，start/stop 各闪一次；
+        // 改走原生 Rgba8。HDR 仍必须 Rgba16F 才能拿到 >1.0 高光。
+        let (color_format, raw_format) = if hdr_format {
+            (ColorFormat::Rgba16F, RawFrameFormat::Rgba16F)
+        } else {
+            (ColorFormat::Rgba8, RawFrameFormat::Rgba8)
+        };
+
+        let start_with = |border: DrawBorderSettings, tx: Sender<FrameResult>| {
+            let settings = Settings::new(
+                monitor,
+                cursor,
+                border,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                color_format,
+                CaptureContext {
+                    tx,
+                    device_name: device_name.clone(),
+                    format: raw_format,
+                },
+            );
+            FrameExtractor::start(settings)
+        };
+
+        let tx_retry = tx.clone();
+        match start_with(border, tx) {
+            Ok(()) => {}
+            Err(e) if border == DrawBorderSettings::WithoutBorder => {
+                tracing::warn!("WithoutBorder 启动失败: {e}，回退 Default");
+                if let Err(e2) = start_with(DrawBorderSettings::Default, tx_retry) {
+                    let _ = err_tx.send(Err(format!("capture start failed: {e2}")));
+                }
+            }
+            Err(e) => {
+                let _ = err_tx.send(Err(format!("capture start failed: {e}")));
+            }
         }
     })
 }

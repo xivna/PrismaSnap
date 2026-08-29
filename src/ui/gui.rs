@@ -143,17 +143,22 @@ impl GuiState {
     /// * `want_hdr` - 请求 HDR 输出（HDR 屏截图预览用）；surface 不支持
     ///   `Rgba16Float + ExtendedSrgbLinear` 时自动回退 SDR 路径。
     pub fn new(window: &Arc<Window>, want_hdr: bool) -> anyhow::Result<Self> {
-        let instance = wgpu::Instance::default();
+        // Windows 截图覆盖层强制 DX12：默认 Instance 会优先 Vulkan，
+        // 全屏 swapchain 接入 DWM 时更容易闪，且每次截图重建实例约 1s。
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
         let surface = instance
             .create_surface(window.clone())
             .context("创建 surface 失败")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
-        .context("找不到可用 GPU 适配器")?;
+        .context("找不到可用 GPU 适配器（DX12）")?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("prismsnap_device"),
             ..Default::default()
@@ -203,7 +208,8 @@ impl GuiState {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // 截图覆盖层要首帧立刻出画；latency=2 会额外缓冲一帧黑/旧内容
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 
@@ -266,10 +272,16 @@ impl GuiState {
                 bind_group: None,
             };
             hdr.rebuild_bind_group(&device);
-            tracing::info!("覆盖层 HDR 输出已启用: {format:?} + {color_space:?}");
+            tracing::info!(
+                "覆盖层 HDR 输出已启用: {format:?} + {color_space:?} backend={:?}",
+                adapter.get_info().backend
+            );
             Some(hdr)
         } else {
-            tracing::info!("覆盖层走 SDR 输出: {format:?} + {color_space:?}");
+            tracing::info!(
+                "覆盖层走 SDR 输出: {format:?} + {color_space:?} backend={:?}",
+                adapter.get_info().backend
+            );
             None
         };
 
@@ -324,7 +336,10 @@ impl GuiState {
     ///
     /// * `window` - 目标窗口（取输入、回写重绘请求）。
     /// * `draw` - egui UI 绘制闭包（接收 `&mut Ui`）。
-    pub fn render(&mut self, window: &Window, mut draw: impl FnMut(&mut egui::Ui)) {
+    ///
+    /// 返回是否成功 present。swapchain `Outdated`/`Lost` 时会 reconfigure 后重试，
+    /// 仍失败则返回 `false`（调用方可据此决定是否推迟 `set_visible`）。
+    pub fn render(&mut self, window: &Window, mut draw: impl FnMut(&mut egui::Ui)) -> bool {
         let raw_input = self.egui_state.take_egui_input(window);
         let full_output = self.egui_ctx.run_ui(raw_input, &mut draw);
         self.egui_state
@@ -361,22 +376,36 @@ impl GuiState {
             &screen_descriptor,
         );
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                for id in textures_delta.free.drain() {
-                    self.renderer.free_texture(&id);
+        // 隐藏窗口 / 刚 configure 时 DXGI 常返回 Outdated。旧逻辑 reconfigure 后直接
+        // return，首帧没 present，随后 set_visible 会先露出未渲染后台缓冲（闪黑）。
+        let mut acquire_attempts = 0;
+        let frame = loop {
+            acquire_attempts += 1;
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(f)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(f) => break f,
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost
+                    if acquire_attempts < 3 =>
+                {
+                    tracing::debug!(
+                        "get_current_texture Outdated/Lost，第 {acquire_attempts} 次 reconfigure"
+                    );
+                    self.surface.configure(&self.device, &self.config);
                 }
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            other => {
-                for id in textures_delta.free.drain() {
-                    self.renderer.free_texture(&id);
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    for id in textures_delta.free.drain() {
+                        self.renderer.free_texture(&id);
+                    }
+                    tracing::warn!("swapchain 重配后仍 Outdated/Lost，本帧未 present");
+                    return false;
                 }
-                tracing::warn!("get_current_texture: {other:?}");
-                return;
+                other => {
+                    for id in textures_delta.free.drain() {
+                        self.renderer.free_texture(&id);
+                    }
+                    tracing::warn!("get_current_texture: {other:?}");
+                    return false;
+                }
             }
         };
         let view = frame
@@ -466,6 +495,7 @@ impl GuiState {
 
         window.pre_present_notify();
         self.queue.present(frame);
+        true
     }
 
     /// 窗口尺寸变化后重配 surface（HDR 模式下同步重建中间纹理）。

@@ -262,7 +262,7 @@ mod imp {
         println!("\nCapturing primary monitor...\n");
 
         // 捕获（复用正式引擎：独立线程 + channel）
-        let raw = engine::capture_frame(primary, false)?;
+        let raw = engine::capture_frame(primary, false, true)?;
         analyze_and_save(&raw, &params)?;
 
         println!("\nDone. See hdr_probe_result.txt / hdr_probe_out.png next to this exe.");

@@ -120,6 +120,9 @@ impl Overlay {
             // WS_EX_TOOLWINDOW：不闪现任务栏/Alt+Tab
             .with_skip_taskbar(true)
             .with_undecorated_shadow(false)
+            // 不要 DWM 重定向位图（GDI 底色）。否则 set_visible 时 DWM 会先
+            // 闪一帧窗口类背景，再接上 DXGI swapchain。
+            .with_no_redirection_bitmap(true)
             // 先隐藏创建：GPU 初始化 + 首帧渲染期间窗口不可见，
             // 避免露出未渲染的白色默认背景（用户看到黑白闪烁的根源）
             .with_visible(false);
@@ -204,7 +207,9 @@ impl Overlay {
                 ..
             } => self.on_release(),
             WindowEvent::KeyboardInput { event, .. } => self.on_key(event),
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                let _ = self.redraw();
+            }
             _ => {}
         }
     }
@@ -376,7 +381,9 @@ impl Overlay {
     ///
     /// 公开给宿主：打开覆盖层时在窗口显示前先同步渲染首帧，
     /// 避免露出未渲染的默认背景（闪烁）。
-    pub fn redraw(&mut self) {
+    ///
+    /// 返回本帧是否成功 present（swapchain 未就绪时为 `false`）。
+    pub fn redraw(&mut self) -> bool {
         let texture_id = self.texture_id;
         let hdr_mode = self.hdr_mode;
         let img_size = self.image.dimensions();
@@ -393,7 +400,7 @@ impl Overlay {
         // 渲染后拿到实际矩形会主动请求再绘一帧补上
         let cached_bar_rect = self.bar_rect_cache;
         let mut bar_actual: Option<egui::Rect> = None;
-        self.gui.render(window.as_ref(), |ui| {
+        let presented = self.gui.render(window.as_ref(), |ui| {
             super::gui::apply_theme(ui.ctx(), theme);
             draw_frame(
                 ui,
@@ -440,6 +447,7 @@ impl Overlay {
         if let Some(a) = action {
             self.handle_toolbar_action(a);
         }
+        presented
     }
 
     /// 响应工具条动作：切换工具 / 撤销重做 / 复制 / 保存 / 取消。

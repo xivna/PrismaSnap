@@ -112,13 +112,21 @@ mod imp {
                     return;
                 }
             };
-            // 隐藏状态下同步渲染首帧（GPU 初始化已完成），再显示窗口，
-            // 避免露出未渲染的默认背景造成黑白闪烁
-            overlay.redraw();
+            // 隐藏状态下尽量把首帧 present 出去。swapchain Outdated 时 render
+            // 内部会 reconfigure 重试；仍失败则显示后再补一帧。
+            let mut presented = false;
+            for _ in 0..3 {
+                presented = overlay.redraw();
+                if presented {
+                    break;
+                }
+            }
             window.set_visible(true);
             // 覆盖层需要键盘输入（Esc/Enter/Ctrl+C/Ctrl+S），显示后取焦点
             window.focus_window();
-            window.request_redraw();
+            if !presented {
+                window.request_redraw();
+            }
             self.overlay = Some(overlay);
         }
 
@@ -299,7 +307,12 @@ mod imp {
             match event {
                 UserEvent::CaptureDone(Ok(shot)) => {
                     self.capturing = false;
-                    info!("截图完成: {}x{}", shot.img.width(), shot.img.height());
+                    info!(
+                        "截图完成: {}x{} is_hdr={}",
+                        shot.img.width(),
+                        shot.img.height(),
+                        shot.is_hdr
+                    );
                     self.open_overlay(event_loop, shot);
                     // 覆盖层期间持续轮询（egui 重绘 / 光标移动）
                     event_loop.set_control_flow(ControlFlow::Poll);
@@ -333,20 +346,18 @@ mod imp {
     fn capture_shot(config: &Config) -> Result<CapturedShot, String> {
         let monitor_rect = engine::monitor_rect_at_cursor().map_err(|e| e.to_string())?;
         let monitor = engine::monitor_at_cursor().map_err(|e| e.to_string())?;
-        let raw = engine::capture_frame(monitor, config.capture.cursor_visible)
-            .map_err(|e| e.to_string())?;
-        info!("捕获完成: {}x{}", raw.width, raw.height);
-
-        // 色彩转换路径按显示器 HDR 状态分流：
-        // - 非 HDR 屏：Rgba16F 数据即 0~1.0 线性 SDR，直通 gamma 编码 = 原图；
-        // - HDR 屏：scRGB 高光 >1.0，走 SDR 白点归一化 + 增益（对齐 Windows 截图行为）。
-        let is_hdr = match display_info::query_is_hdr(&raw.device_name) {
+        let device_name = engine::monitor_device_name(&monitor);
+        // 捕获前先查 HDR：SDR 走 Rgba8，避免 WGC 16F 触发 DWM 格式切换闪屏。
+        let is_hdr = match display_info::query_is_hdr(&device_name) {
             Ok(h) => h,
             Err(e) => {
                 warn!("HDR 状态查询失败: {e}，按 SDR 屏原图直出");
                 false
             }
         };
+        let raw = engine::capture_frame(monitor, config.capture.cursor_visible, is_hdr)
+            .map_err(|e| e.to_string())?;
+        info!("捕获完成: {}x{} format={:?}", raw.width, raw.height, raw.format);
         let mut sdr_white_scrgb = 1.0f32;
         let img = if is_hdr {
             info!("显示器处于 HDR 模式，走 HDR 色彩转换");
@@ -363,7 +374,10 @@ mod imp {
             frame::frame_to_srgb_image(&raw, sdr_white_scrgb)
         } else {
             info!("显示器处于 SDR 模式，原图直出");
-            frame::frame_to_srgb_image_direct(&raw)
+            match raw.format {
+                frame::RawFrameFormat::Rgba8 => frame::frame_rgba8_to_image(&raw),
+                frame::RawFrameFormat::Rgba16F => frame::frame_to_srgb_image_direct(&raw),
+            }
         };
         Ok(CapturedShot {
             img,

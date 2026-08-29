@@ -11,10 +11,20 @@
 use half::f16;
 use image::RgbaImage;
 
-/// 从捕获线程传回的一帧原始数据（Rgba16F 格式）。
+/// 捕获帧像素格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawFrameFormat {
+    /// scRGB 线性 f16（HDR 路径；每像素 8 字节）。
+    Rgba16F,
+    /// sRGB 编码 8-bit（SDR 路径；每像素 4 字节）。WGC `Rgba8` 已是 gamma
+    /// 编码值，不能再走 linear→sRGB，否则双重 gamma。
+    Rgba8,
+}
+
+/// 从捕获线程传回的一帧原始数据。
 ///
-/// `data` 按行排列，`row_pitch` 可能大于 `width * 8`（对齐），遍历时须按
-/// `row_pitch` 计算行偏移。每像素 4 通道（R/G/B/A），每通道 2 字节小端 f16。
+/// `data` 按行排列，`row_pitch` 可能大于每像素行字节数（对齐），遍历时须按
+/// `row_pitch` 计算行偏移。
 pub struct RawFrame {
     /// 帧宽度（像素）。
     pub width: u32,
@@ -22,8 +32,10 @@ pub struct RawFrame {
     pub height: u32,
     /// 每行字节数（含对齐填充）。
     pub row_pitch: usize,
-    /// 原始像素数据（f16 小端字节流）。
+    /// 原始像素数据（格式见 [`Self::format`]）。
     pub data: Vec<u8>,
+    /// 像素格式。
+    pub format: RawFrameFormat,
     /// 来源显示器的 GDI 设备名（如 `\\.\DISPLAY1`），用于查询 SDR 白点。
     pub device_name: String,
 }
@@ -79,6 +91,28 @@ pub fn frame_to_srgb_image_direct(frame: &RawFrame) -> RgbaImage {
     convert_frame(frame, crate::capture::color::sdr_linear_to_srgb)
 }
 
+/// 把 WGC `Rgba8` 帧拷成图像。数据已是 sRGB 编码，不再做 gamma。
+///
+/// 行距可能带对齐填充，按 `width * 4` 逐行紧凑拷贝。
+pub fn frame_rgba8_to_image(frame: &RawFrame) -> RgbaImage {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let dst_stride = w * 4;
+    let mut buf = vec![0u8; dst_stride * h];
+    for y in 0..h {
+        let src = y * frame.row_pitch;
+        let dst = y * dst_stride;
+        buf[dst..dst + dst_stride].copy_from_slice(&frame.data[src..src + dst_stride]);
+    }
+    match RgbaImage::from_raw(frame.width, frame.height, buf) {
+        Some(img) => img,
+        None => {
+            tracing::error!("Rgba8 帧尺寸不匹配，回退空图");
+            RgbaImage::new(frame.width, frame.height)
+        }
+    }
+}
+
 /// 按逐像素转换函数把 Rgba16F 帧转成 RGBA8 图像（两公开函数共用）。
 fn convert_frame(frame: &RawFrame, convert: impl Fn(f32, f32, f32) -> [u8; 3]) -> RgbaImage {
     let w = frame.width as usize;
@@ -123,6 +157,7 @@ mod tests {
             height: 1,
             row_pitch: 16,
             data,
+            format: RawFrameFormat::Rgba16F,
             device_name: String::from("test"),
         }
     }
@@ -181,6 +216,7 @@ mod tests {
             height: 2,
             row_pitch: 24,
             data,
+            format: RawFrameFormat::Rgba16F,
             device_name: String::from("test"),
         };
         let compact = frame.compact_rgba16f_data();
@@ -194,6 +230,27 @@ mod tests {
             // 行尾补零（而非填充字节 0xFF）
             assert!(compact[y * 256 + 16..(y + 1) * 256].iter().all(|&b| b == 0));
         }
+    }
+
+    #[test]
+    fn frame_rgba8_to_image_strips_pitch_padding() {
+        // 宽 2：有效 8 字节/行，row_pitch=12（4 字节填充）
+        let mut data = vec![0u8; 12 * 2];
+        data[0..8].copy_from_slice(&[10, 20, 30, 255, 40, 50, 60, 255]);
+        data[12..20].copy_from_slice(&[70, 80, 90, 255, 100, 110, 120, 255]);
+        let frame = RawFrame {
+            width: 2,
+            height: 2,
+            row_pitch: 12,
+            data,
+            format: RawFrameFormat::Rgba8,
+            device_name: String::from("test"),
+        };
+        let img = frame_rgba8_to_image(&frame);
+        assert_eq!(img.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [40, 50, 60, 255]);
+        assert_eq!(img.get_pixel(0, 1).0, [70, 80, 90, 255]);
+        assert_eq!(img.get_pixel(1, 1).0, [100, 110, 120, 255]);
     }
 
     #[test]
