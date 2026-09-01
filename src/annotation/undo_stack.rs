@@ -8,43 +8,81 @@
 
 use super::Annotation;
 
-/// 标注撤销/重做栈。
+/// 标注撤销/重做栈（快照模型：任意编辑均可撤销）。
+///
+/// 内部维护快照历史：`history` 栈顶即当前生效序列，`future` 为重做分支。
+/// 单条 push / 原地改动 / 批量改动均以"整表快照"为粒度，语义清晰且
+/// 与拖动等原地编辑兼容（旧实现仅支持 push/pop 会丢失 move 历史）。
 #[derive(Debug, Default)]
 pub struct UndoStack {
-    /// 已提交的标注（绘制顺序）。
-    done: Vec<Annotation>,
-    /// 已撤销、可重做的标注（栈顶 = 最近一次撤销）。
-    undone: Vec<Annotation>,
+    /// 历史快照（栈顶 = 当前生效序列，底为 []）。
+    history: Vec<Vec<Annotation>>,
+    /// 重做分支（栈顶 = 最近一次被撤销的快照）。
+    future: Vec<Vec<Annotation>>,
 }
 
 impl UndoStack {
     /// 创建空栈。
     pub fn new() -> Self {
-        Self::default()
+        Self { history: vec![Vec::new()], future: Vec::new() }
     }
 
-    /// 提交一条标注。提交后重做分支失效（清空 `undone`）。
+    fn current(&self) -> &Vec<Annotation> {
+        self.history.last().expect("history 非空")
+    }
+    fn current_mut(&mut self) -> &mut Vec<Annotation> {
+        self.history.last_mut().expect("history 非空")
+    }
+
+    /// 提交一条标注。提交后重做分支失效（清空 `future`）。
     pub fn push(&mut self, annotation: Annotation) {
-        self.done.push(annotation);
-        self.undone.clear();
+        let mut next = self.current().clone();
+        next.push(annotation);
+        self.history.push(next);
+        self.future.clear();
+    }
+
+    /// 原地替换指定下标的标注（拖动等编辑用），记录为一次可撤销编辑。
+    /// 下标越界返回 false。
+    pub fn replace(&mut self, index: usize, annotation: Annotation) -> bool {
+        if index >= self.current().len() {
+            return false;
+        }
+        let mut next = self.current().clone();
+        next[index] = annotation;
+        self.history.push(next);
+        self.future.clear();
+        true
+    }
+
+    /// 以闭包批量原地编辑当前序列（拖动提交等），记录为一次可撤销编辑。
+    ///
+    /// 闭包返回 true 表示确有改动，才压入历史；返回 false 视为无操作。
+    pub fn edit_current(&mut self, f: impl FnOnce(&mut Vec<Annotation>) -> bool) -> bool {
+        let mut next = self.current().clone();
+        if !f(&mut next) {
+            return false;
+        }
+        self.history.push(next);
+        self.future.clear();
+        true
     }
 
     /// 撤销最近一次提交，成功返回 `true`（栈空返回 `false`）。
     pub fn undo(&mut self) -> bool {
-        match self.done.pop() {
-            Some(a) => {
-                self.undone.push(a);
-                true
-            }
-            None => false,
+        if self.history.len() <= 1 {
+            return false;
         }
+        let cur = self.history.pop().expect("history 非空");
+        self.future.push(cur);
+        true
     }
 
     /// 重做最近一次撤销，成功返回 `true`（无可重做返回 `false`）。
     pub fn redo(&mut self) -> bool {
-        match self.undone.pop() {
-            Some(a) => {
-                self.done.push(a);
+        match self.future.pop() {
+            Some(snap) => {
+                self.history.push(snap);
                 true
             }
             None => false,
@@ -53,17 +91,23 @@ impl UndoStack {
 
     /// 是否可撤销。
     pub fn can_undo(&self) -> bool {
-        !self.done.is_empty()
+        self.history.len() > 1
     }
 
     /// 是否可重做。
     pub fn can_redo(&self) -> bool {
-        !self.undone.is_empty()
+        !self.future.is_empty()
     }
 
     /// 当前生效的标注序列（绘制顺序）。
     pub fn annotations(&self) -> &[Annotation] {
-        &self.done
+        self.current()
+    }
+
+    /// 当前生效序列的可变访问（注意：直接改动不会自动记录历史，
+    /// 拖动等需通过 `replace`/`edit_current` 记录）。
+    pub fn annotations_mut(&mut self) -> &mut Vec<Annotation> {
+        self.current_mut()
     }
 }
 

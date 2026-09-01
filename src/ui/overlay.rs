@@ -81,6 +81,9 @@ pub struct Overlay {
     drag_start: Option<(f32, f32)>,
     /// 当前选区（物理像素，等于图像像素坐标）。
     selection: Option<Rect>,
+    /// 选区整体拖动状态（Preview 模式下点命中选区内部时进入）。
+    selection_drag_start: Option<(f32, f32)>,
+    selection_drag_origin: Option<Rect>,
     /// 显示器物理矩形（选区边界）。
     monitor_rect: Rect,
     /// 当前修饰键状态（判断 Ctrl+C / Ctrl+S）。
@@ -164,6 +167,8 @@ impl Overlay {
             current_cursor: None,
             drag_start: None,
             selection: None,
+            selection_drag_start: None,
+            selection_drag_origin: None,
             monitor_rect: shot.monitor_rect,
             modifiers: ModifiersState::empty(),
             config,
@@ -187,9 +192,16 @@ impl Overlay {
             WindowEvent::ModifiersChanged(state) => self.modifiers = state.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.current_cursor = Some((position.x as f32, position.y as f32));
-                // 拖动中实时更新选区 / 进行中的标注笔画
+                // 拖动中实时更新选区 / 进行中的标注笔画 / 标注整体拖动 / 选区整体拖动
                 if self.drag_start.is_some() {
                     self.update_selection_from_drag();
+                }
+                if self.editor.is_dragging() {
+                    self.editor.update_drag((position.x as f32, position.y as f32));
+                    self.window.request_redraw();
+                }
+                if self.selection_drag_start.is_some() {
+                    self.update_selection_drag();
                 }
                 if self.mode == Mode::Edit && self.editor.is_stroking() {
                     self.editor.update_stroke((position.x as f32, position.y as f32));
@@ -214,7 +226,7 @@ impl Overlay {
         }
     }
 
-    /// 按下左键：`Preview` 重置选区回到 `Selecting`（重新框选）；
+    /// 按下左键：`Preview` 命中标注则拖动标注、空白处重置选区回到 `Selecting`；
     /// `Edit` 开始标注笔画；`Selecting` 开始拖动选区。
     ///
     /// * `egui_consumed` - 事件已被 egui 消费（点在工具条上）时不做画布处理。
@@ -224,9 +236,26 @@ impl Overlay {
         }
         match self.mode {
             Mode::Preview => {
-                self.mode = Mode::Selecting;
-                self.selection = None;
-                self.drag_start = self.current_cursor;
+                if let Some(pt) = self.current_cursor {
+                    if self.editor.begin_drag(pt) {
+                        self.window.request_redraw();
+                        return;
+                    }
+                    // 未命中标注：若点在选区内部则整体拖动选区
+                    if let Some(sel) = self.selection {
+                        if Self::point_in_rect(pt, &sel) {
+                            self.selection_drag_start = Some(pt);
+                            self.selection_drag_origin = Some(sel);
+                            self.editor.select(None);
+                            self.window.request_redraw();
+                            return;
+                        }
+                    }
+                }
+                // 点在选区外：仅清除选中，不重置选区（避免误触取消选区）
+                self.editor.select(None);
+                self.window.request_redraw();
+                return;
             }
             Mode::Edit => {
                 if let Some(cursor) = self.current_cursor {
@@ -238,8 +267,21 @@ impl Overlay {
         self.window.request_redraw();
     }
 
-    /// 释放左键：`Selecting` 选区有效则进入 `Preview`；`Edit` 提交笔画。
+    /// 释放左键：`Selecting` 选区有效则进入 `Preview`；`Edit` 提交笔画；`Preview` 拖动提交。
     fn on_release(&mut self) {
+        // 标注拖动优先（Preview 命中拖动）
+        if self.editor.is_dragging() {
+            self.editor.commit_drag();
+            self.window.request_redraw();
+            return;
+        }
+        // 选区整体拖动
+        if self.selection_drag_start.is_some() {
+            self.selection_drag_start = None;
+            self.selection_drag_origin = None;
+            self.window.request_redraw();
+            return;
+        }
         match self.mode {
             Mode::Edit => {
                 self.editor.commit_stroke();
@@ -270,8 +312,34 @@ impl Overlay {
         }
     }
 
-    /// 键盘动作：Esc 取消、Enter 复制、Ctrl+C 复制、Ctrl+S 保存、
-    /// Ctrl+Z 撤销、Ctrl+Shift+Z 重做（后两者仅编辑态）。
+    /// 选区整体拖动更新（保持尺寸，整体平移并钳制在显示器内）。
+    fn update_selection_drag(&mut self) {
+        if let (Some((sx, sy)), Some((cx, cy)), Some(origin)) =
+            (self.selection_drag_start, self.current_cursor, self.selection_drag_origin)
+        {
+            let dx = (cx - sx) as i32;
+            let dy = (cy - sy) as i32;
+            let moved = Rect {
+                x: origin.x + dx,
+                y: origin.y + dy,
+                width: origin.width,
+                height: origin.height,
+            }
+            .clamp(&self.monitor_rect);
+            self.selection = Some(moved);
+            self.window.request_redraw();
+        }
+    }
+
+    /// 判断点是否在矩形内（含边界，物理像素）。
+    fn point_in_rect(pt: (f32, f32), r: &Rect) -> bool {
+        let x = pt.0 as i32;
+        let y = pt.1 as i32;
+        x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+    }
+
+    /// 键盘动作：Esc 取消（拖动中取消拖动、否则退出）、Enter 复制、Ctrl+C 复制、Ctrl+S 保存、
+    /// Ctrl+Z 撤销、Ctrl+Shift+Z 重做（后两者 Preview/Edit 均可）。
     fn on_key(&mut self, key: &KeyEvent) {
         if key.state != ElementState::Pressed {
             return;
@@ -279,6 +347,16 @@ impl Overlay {
         let has_selection = matches!(self.mode, Mode::Preview | Mode::Edit);
         match key.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => {
+                if self.editor.is_dragging() {
+                    self.editor.cancel_drag();
+                    self.window.request_redraw();
+                    return;
+                }
+                if self.editor.is_stroking() {
+                    self.editor.deactivate();
+                    self.window.request_redraw();
+                    return;
+                }
                 self.exit_requested = true;
             }
             PhysicalKey::Code(KeyCode::Enter) => {
@@ -297,7 +375,7 @@ impl Overlay {
                 self.save_and_exit();
             }
             PhysicalKey::Code(KeyCode::KeyZ)
-                if self.modifiers.control_key() && self.mode == Mode::Edit =>
+                if self.modifiers.control_key() && matches!(self.mode, Mode::Preview | Mode::Edit) =>
             {
                 if self.modifiers.shift_key() {
                     self.editor.redo();
@@ -412,14 +490,16 @@ impl Overlay {
                 monitor_rect,
                 cached_bar_rect,
             );
-            // 编辑态：egui 层绘制标注预览（方案 B 预览端）
-            if mode == Mode::Edit {
+            // Preview / Edit 均绘制已提交标注与选中高亮（拖动态在 Preview，像素化/模糊需原图实现所见即所得）
+            if matches!(mode, Mode::Preview | Mode::Edit) {
                 let ppp = ui.ctx().pixels_per_point();
-                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                let ctx = ui.ctx().clone();
+                let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::new("annotations"),
                 ));
-                editor.draw_annotations(&painter, ppp);
+                let img_ref: Option<&image::RgbaImage> = Some(self.image.as_ref());
+                editor.draw_annotations(&painter, &ctx, ppp, img_ref);
             }
             // 工具条：Preview / Edit 均显示（Selecting 不显示）
             if let Some(sel) = selection.filter(|_| mode != Mode::Selecting) {
@@ -431,6 +511,7 @@ impl Overlay {
                     editor.active_tool(),
                     editor.stroke_color(),
                     editor.stroke_width(),
+                    &editor.mosaic_style(),
                     editor.can_undo(),
                     editor.can_redo(),
                     &mut bar_actual,
@@ -466,10 +547,21 @@ impl Overlay {
             }
             ToolbarAction::SetColor(color) => {
                 self.editor.set_stroke_color(color);
+                // 纯色遮挡共享统一颜色：若当前为纯色样式，同步更新
+                if matches!(self.editor.mosaic_style(), crate::annotation::MosaicStyle::Solid { .. }) {
+                    self.editor.set_mosaic_style(crate::annotation::MosaicStyle::Solid { color });
+                }
                 self.window.request_redraw();
             }
             ToolbarAction::SetStrokeWidth(width) => {
                 self.editor.set_stroke_width(width);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetMosaicStyle(style) => {
+                self.editor.set_mosaic_style(style.clone());
+                if let crate::annotation::MosaicStyle::Solid { color } = &style {
+                    self.editor.set_stroke_color(*color);
+                }
                 self.window.request_redraw();
             }
             ToolbarAction::Undo => {

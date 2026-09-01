@@ -101,11 +101,11 @@ pub enum Annotation {
         /// 荧光笔模式：半透明叠加；否则为不透明画笔。
         highlighter: bool,
     },
-    /// 马赛克 / 像素化区域。
+    /// 遮挡（马赛克/模糊/纯色等，复用同一矩形选区）。
     Mosaic {
         rect: Rect,
-        /// 像素化块边长（物理像素）。
-        block_size: u32,
+        /// 遮挡样式（像素化/模糊/纯色）。
+        style: MosaicStyle,
     },
     /// 文字标注。
     Text {
@@ -114,6 +114,23 @@ pub enum Annotation {
         color: Color,
         font_size: f32,
     },
+}
+
+/// 马赛克/遮挡样式（对应外部评审方案二）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MosaicStyle {
+    /// 像素化（块均值，默认 18）。
+    Pixelate { block_size: u32 },
+    /// 高斯模糊（sigma）。
+    Blur { radius: f32 },
+    /// 纯色遮挡（不透明填充）。
+    Solid { color: Color },
+}
+
+impl Default for MosaicStyle {
+    fn default() -> Self {
+        Self::Pixelate { block_size: 18 }
+    }
 }
 
 impl Annotation {
@@ -127,14 +144,152 @@ impl Annotation {
             Annotation::Text { content, .. } => content.trim().is_empty(),
         }
     }
+
+    /// 物理像素包围盒（含描边外扩，用于命中与拖动边界判断）。
+    pub fn bounds(&self) -> Rect {
+        match self {
+            Annotation::Rect { rect, stroke_width, .. } => {
+                let w = (*stroke_width as i32).max(1);
+                Rect { x: rect.x - w, y: rect.y - w, width: rect.width + 2 * w as u32, height: rect.height + 2 * w as u32 }
+            }
+            Annotation::Arrow { from, to, stroke_width, .. } => {
+                let w = (*stroke_width as i32).max(1);
+                let min_x = from.0.min(to.0) as i32 - w - 8;
+                let min_y = from.1.min(to.1) as i32 - w - 8;
+                let max_x = from.0.max(to.0) as i32 + w + 8;
+                let max_y = from.1.max(to.1) as i32 + w + 8;
+                let width = (max_x - min_x).max(1) as u32;
+                let height = (max_y - min_y).max(1) as u32;
+                Rect { x: min_x, y: min_y, width, height }
+            }
+            Annotation::Brush { points, stroke_width, .. } => {
+                if points.is_empty() {
+                    return Rect { x: 0, y: 0, width: 0, height: 0 };
+                }
+                let w = (*stroke_width as i32).max(1);
+                let mut min_x = points[0].0 as i32;
+                let mut min_y = points[0].1 as i32;
+                let mut max_x = min_x;
+                let mut max_y = min_y;
+                for &(x, y) in points.iter().skip(1) {
+                    min_x = min_x.min(x as i32);
+                    min_y = min_y.min(y as i32);
+                    max_x = max_x.max(x as i32);
+                    max_y = max_y.max(y as i32);
+                }
+                Rect { x: min_x - w, y: min_y - w, width: (max_x - min_x + 2 * w) as u32, height: (max_y - min_y + 2 * w) as u32 }
+            }
+            Annotation::Mosaic { rect, style: _ } => *rect,
+            Annotation::Text { pos, .. } => {
+                // 文字包围盒近似（拖动用，实际排版前固定 100x20 预留）
+                Rect { x: pos.0 as i32 - 2, y: pos.1 as i32 - 2, width: 104, height: 24 }
+            }
+        }
+    }
+
+    /// 命中测试（物理像素点是否落在标注可拖动区域内）。
+    ///
+    /// 内置容差带：矩形/马赛克为包围盒（含描边）；箭头为到线段距离；
+    /// 画笔为到折线各段距离；文字为包围盒。
+    pub fn hit_test(&self, pt: (f32, f32)) -> bool {
+        const TOL: f32 = 6.0;
+        match self {
+            Annotation::Rect { rect, stroke_width, .. } => {
+                let w = (*stroke_width).max(1.0);
+                let outer = Rect { x: rect.x - w as i32 - TOL as i32, y: rect.y - w as i32 - TOL as i32, width: rect.width + 2 * (w as u32 + TOL as u32), height: rect.height + 2 * (w as u32 + TOL as u32) };
+                // 扩大包围盒内即视为命中（拖动友好，含内部）
+                let r = outer;
+                let x = pt.0 as i32;
+                let y = pt.1 as i32;
+                x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+            }
+            Annotation::Mosaic { rect, .. } => {
+                let r = Rect { x: rect.x - TOL as i32, y: rect.y - TOL as i32, width: rect.width + 2 * TOL as u32, height: rect.height + 2 * TOL as u32 };
+                let x = pt.0 as i32;
+                let y = pt.1 as i32;
+                x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+            }
+            Annotation::Text { pos: _, .. } => {
+                let r = self.bounds();
+                let x = pt.0 as i32;
+                let y = pt.1 as i32;
+                x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+            }
+            Annotation::Arrow { from, to, stroke_width, .. } => {
+                let tol = stroke_width.max(1.0) * 0.5 + TOL;
+                point_to_segment_dist(pt, *from, *to) <= tol
+            }
+            Annotation::Brush { points, stroke_width, .. } => {
+                if points.len() < 2 {
+                    return false;
+                }
+                let tol = stroke_width.max(1.0) * 0.5 + TOL;
+                for w in points.windows(2) {
+                    if point_to_segment_dist(pt, w[0], w[1]) <= tol {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// 整体平移（物理像素）。
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        let dx_i = dx as i32;
+        let dy_i = dy as i32;
+        match self {
+            Annotation::Rect { rect, .. } | Annotation::Mosaic { rect, .. } => {
+                rect.x += dx_i;
+                rect.y += dy_i;
+            }
+            Annotation::Arrow { from, to, .. } => {
+                from.0 += dx;
+                from.1 += dy;
+                to.0 += dx;
+                to.1 += dy;
+            }
+            Annotation::Brush { points, .. } => {
+                for p in points.iter_mut() {
+                    p.0 += dx;
+                    p.1 += dy;
+                }
+            }
+            Annotation::Text { pos, .. } => {
+                pos.0 += dx;
+                pos.1 += dy;
+            }
+        }
+    }
 }
 
-/// 标注管理器：已提交标注（撤销栈）+ 进行中的笔画。
+/// 点到线段距离（物理像素）。
+fn point_to_segment_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let abx = b.0 - a.0;
+    let aby = b.1 - a.1;
+    let apx = p.0 - a.0;
+    let apy = p.1 - a.1;
+    let ab2 = abx * abx + aby * aby;
+    if ab2 < 1e-6 {
+        return (apx * apx + apy * apy).sqrt();
+    }
+    let t = ((apx * abx + apy * aby) / ab2).clamp(0.0, 1.0);
+    let cx = a.0 + t * abx;
+    let cy = a.1 + t * aby;
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+
+/// 标注管理器：已提交标注（撤销栈）+ 进行中的笔画 + 选中/拖动态。
 ///
 /// 编辑态画布把鼠标手势（按下/拖动/释放）翻译成
 /// [`begin_stroke`](Self::begin_stroke) / [`update_stroke`](Self::update_stroke) /
 /// [`commit_stroke`](Self::commit_stroke) 调用，标注的具体构建规则集中在这里，
 /// UI 层不关心各工具的手势差异。
+///
+/// 选中/拖动（无工具默认态左键整体移动）：`selected` 指向被选中标注下标，
+/// `drag` 记录本次拖动的起点与原始快照，`CursorMoved` 期间实时改写当前序列
+/// 但仅在 `commit_drag` 时压一次可撤销历史（`update_drag` 内为临时可变修改，
+/// `cancel_drag` 回滚）。
 #[derive(Debug)]
 pub struct AnnotationManager {
     stack: UndoStack,
@@ -146,6 +301,24 @@ pub struct AnnotationManager {
     pub stroke_color: Color,
     /// 当前描边宽度（物理像素，新标注使用）。
     pub stroke_width: f32,
+    /// 当前遮挡样式（马赛克工具新建标注使用）。
+    pub mosaic_style: MosaicStyle,
+    /// 当前选中标注下标（无选中为 None）。
+    selected: Option<usize>,
+    /// 拖动态（按下命中后进入）。
+    drag: Option<DragState>,
+}
+
+/// 单次拖动的临时状态。
+#[derive(Debug, Clone)]
+struct DragState {
+    index: usize,
+    /// 按下时的光标位置（物理像素）。
+    start: (f32, f32),
+    /// 拖动前该标注的原始快照（用于增量平移与取消回滚）。
+    origin: Annotation,
+    /// 拖动起点对应的历史快照长度（用于判断是否已压历史）。
+    _history_len: usize,
 }
 
 impl Default for AnnotationManager {
@@ -156,6 +329,9 @@ impl Default for AnnotationManager {
             stroke_anchor: (0.0, 0.0),
             stroke_color: Color::RED,
             stroke_width: 3.0,
+            mosaic_style: MosaicStyle::default(),
+            selected: None,
+            drag: None,
         }
     }
 }
@@ -187,9 +363,14 @@ impl AnnotationManager {
             }),
             Tool::Mosaic => Some(Annotation::Mosaic {
                 rect: Rect::from_points(at.0 as i32, at.1 as i32, at.0 as i32, at.1 as i32),
-                block_size: 12,
+                style: self.mosaic_style.clone(),
             }),
-            Tool::Text => None,
+            Tool::Text => Some(Annotation::Text {
+                pos: at,
+                content: String::from("文本"),
+                color: self.stroke_color,
+                font_size: 16.0,
+            }),
         };
     }
 
@@ -202,6 +383,7 @@ impl AnnotationManager {
             }
             Some(Annotation::Arrow { to, .. }) => *to = at,
             Some(Annotation::Brush { points, .. }) => points.push(at),
+            Some(Annotation::Text { pos, .. }) => *pos = at,
             _ => {}
         }
     }
@@ -220,14 +402,134 @@ impl AnnotationManager {
         self.in_progress = None;
     }
 
+    /// 设置当前遮挡样式（仅影响后续新建标注，不实时改写已有标注）。
+    pub fn set_mosaic_style(&mut self, style: MosaicStyle) {
+        self.mosaic_style = style;
+    }
+
+    // ── 选中 / 命中 / 拖动（无工具默认态整体移动）─────────────────────
+
+    /// 当前选中下标。
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// 是否正在拖动标注。
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// 命中测试（返回最上层命中标注的下标，顶层为绘制顺序末尾）。
+    pub fn hit_test(&self, pt: (f32, f32)) -> Option<usize> {
+        for (i, a) in self.stack.annotations().iter().enumerate().rev() {
+            if a.hit_test(pt) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// 选中指定下标（越界则清空选中）。
+    pub fn select(&mut self, index: Option<usize>) {
+        if let Some(i) = index {
+            if i < self.stack.annotations().len() {
+                self.selected = Some(i);
+                return;
+            }
+        }
+        self.selected = None;
+    }
+
+    /// 在给定点尝试开始拖动：命中则选中并进入拖动态，返回是否命中。
+    pub fn begin_drag(&mut self, at: (f32, f32)) -> bool {
+        if let Some(i) = self.hit_test(at) {
+            let origin = self.stack.annotations()[i].clone();
+            self.selected = Some(i);
+            self.drag = Some(DragState { index: i, start: at, origin, _history_len: 0 });
+            return true;
+        }
+        self.selected = None;
+        false
+    }
+
+    /// 拖动中更新（实时改写当前序列对应标注的位置，不压历史）。
+    pub fn update_drag(&mut self, at: (f32, f32)) {
+        if let Some(d) = self.drag.clone() {
+            let dx = at.0 - d.start.0;
+            let dy = at.1 - d.start.1;
+            if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
+                *cur = d.origin.clone();
+                cur.translate(dx, dy);
+            }
+        }
+    }
+
+    /// 提交拖动（压入一次可撤销历史）。未在拖动中返回 false。
+    pub fn commit_drag(&mut self) -> bool {
+        if let Some(d) = self.drag.take() {
+            // 当前序列已在 update_drag 中就位（history 顶已被临时改写为拖后态），
+            // 需先恢复为拖前态，再以拖后态为新快照压栈，否则原态丢失导致撤销失效
+            let mutated = self.stack.annotations().to_vec();
+            let origin_vec = {
+                let mut v = mutated.clone();
+                if d.index < v.len() {
+                    v[d.index] = d.origin.clone();
+                }
+                v
+            };
+            if mutated == origin_vec {
+                // 零位移：回滚临时改写
+                if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
+                    *cur = d.origin.clone();
+                }
+                return false;
+            }
+            // 回滚顶快照到原态，再压入新快照 = [原态, 新态]
+            if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
+                *cur = d.origin.clone();
+            }
+            self.stack.edit_current(|next| {
+                *next = mutated.clone();
+                true
+            });
+            self.selected = Some(d.index);
+            return true;
+        }
+        false
+    }
+
+    /// 取消拖动（回滚到起点）。
+    pub fn cancel_drag(&mut self) {
+        if let Some(d) = self.drag.take() {
+            if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
+                *cur = d.origin.clone();
+            }
+            self.selected = Some(d.index);
+        }
+    }
+
     /// 撤销最近一次标注。
     pub fn undo(&mut self) -> bool {
-        self.stack.undo()
+        let ok = self.stack.undo();
+        if ok {
+            // 撤销后选中失效（避免悬空下标）
+            if let Some(sel) = self.selected {
+                if sel >= self.stack.annotations().len() {
+                    self.selected = None;
+                }
+            }
+            self.drag = None;
+        }
+        ok
     }
 
     /// 重做最近一次撤销。
     pub fn redo(&mut self) -> bool {
-        self.stack.redo()
+        let ok = self.stack.redo();
+        if ok {
+            self.drag = None;
+        }
+        ok
     }
 
     pub fn can_undo(&self) -> bool {
@@ -268,9 +570,27 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                 };
                 tools::rect::draw_rect(img, local, *color, *stroke_width);
             }
-            other => tracing::warn!(
-                "标注 {other:?} 的 CPU 导出重绘尚未实现，本条未写入导出图"
-            ),
+            Annotation::Arrow { from, to, color, stroke_width } => {
+                let local_from = (from.0 - origin.0 as f32, from.1 - origin.1 as f32);
+                let local_to = (to.0 - origin.0 as f32, to.1 - origin.1 as f32);
+                tools::arrow::draw_arrow(img, local_from, local_to, *color, *stroke_width);
+            }
+            Annotation::Brush { points, color, stroke_width, highlighter } => {
+                let local_pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x - origin.0 as f32, y - origin.1 as f32)).collect();
+                tools::brush::draw_brush(img, &local_pts, *color, *stroke_width, *highlighter);
+            }
+            Annotation::Mosaic { rect, style } => {
+                let local = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
+                match style {
+                    MosaicStyle::Pixelate { block_size } => tools::mosaic::draw_pixelate(img, local, *block_size),
+                    MosaicStyle::Blur { radius } => tools::mosaic::draw_blur(img, local, *radius),
+                    MosaicStyle::Solid { color } => tools::mosaic::draw_solid(img, local, *color),
+                }
+            }
+            Annotation::Text { pos, content, color, font_size } => {
+                let local_pos = (pos.0 - origin.0 as f32, pos.1 - origin.1 as f32);
+                tools::text::draw_text(img, local_pos, content, *color, *font_size);
+            }
         }
     }
 }
@@ -328,9 +648,13 @@ mod tests {
     fn text_tool_has_no_drag_stroke() {
         let mut mgr = AnnotationManager::default();
         mgr.begin_stroke(Tool::Text, (10.0, 10.0));
-        assert!(mgr.in_progress().is_none());
+        assert!(mgr.in_progress().is_some());
         mgr.commit_stroke();
-        assert!(mgr.annotations().is_empty());
+        assert_eq!(mgr.annotations().len(), 1);
+        match &mgr.annotations()[0] {
+            Annotation::Text { content, .. } => assert_eq!(content, "文本"),
+            other => panic!("应为文字标注: {other:?}"),
+        }
     }
 
     #[test]
@@ -360,5 +684,79 @@ mod tests {
         assert_eq!(at(25, 20), [255, 59, 48]);
         // 内部保持白
         assert_eq!(at(15, 15), [255, 255, 255]);
+    }
+
+    #[test]
+    fn arrow_translate_and_hit() {
+        let mut ann = Annotation::Arrow { from: (10.0, 10.0), to: (30.0, 10.0), color: Color::RED, stroke_width: 2.0 };
+        assert!(ann.hit_test((20.0, 10.0)));
+        assert!(!ann.hit_test((20.0, 30.0)));
+        ann.translate(5.0, 5.0);
+        match ann {
+            Annotation::Arrow { from, to, .. } => {
+                assert_eq!(from, (15.0, 15.0));
+                assert_eq!(to, (35.0, 15.0));
+            }
+            _ => panic!("箭头"),
+        }
+    }
+
+    #[test]
+    fn rect_hit_and_translate() {
+        let mut ann = Annotation::Rect { rect: Rect { x: 10, y: 10, width: 20, height: 10 }, color: Color::RED, stroke_width: 2.0 };
+        assert!(ann.hit_test((15.0, 15.0))); // 内部命中（拖动友好）
+        assert!(!ann.hit_test((0.0, 0.0)));
+        ann.translate(3.0, -2.0);
+        match ann {
+            Annotation::Rect { rect, .. } => assert_eq!(rect, Rect { x: 13, y: 8, width: 20, height: 10 }),
+            _ => panic!("矩形"),
+        }
+    }
+
+    #[test]
+    fn annotation_manager_drag_commit_and_undo() {
+        let mut mgr = AnnotationManager::default();
+        mgr.begin_stroke(Tool::Rect, (10.0, 10.0));
+        mgr.update_stroke((30.0, 20.0));
+        mgr.commit_stroke();
+        assert_eq!(mgr.annotations().len(), 1);
+        // 命中并拖动
+        assert!(mgr.begin_drag((15.0, 15.0)));
+        mgr.update_drag((20.0, 20.0));
+        mgr.commit_drag();
+        match &mgr.annotations()[0] {
+            Annotation::Rect { rect, .. } => assert_eq!(rect, &Rect { x: 15, y: 15, width: 20, height: 10 }),
+            _ => panic!("矩形"),
+        }
+        // 撤销拖动
+        assert!(mgr.undo());
+        match &mgr.annotations()[0] {
+            Annotation::Rect { rect, .. } => assert_eq!(rect, &Rect { x: 10, y: 10, width: 20, height: 10 }),
+            _ => panic!("矩形"),
+        }
+        assert!(mgr.redo());
+    }
+
+    #[test]
+    fn hit_test_returns_topmost() {
+        let mut mgr = AnnotationManager::default();
+        mgr.begin_stroke(Tool::Rect, (0.0, 0.0));
+        mgr.update_stroke((20.0, 20.0));
+        mgr.commit_stroke();
+        mgr.begin_stroke(Tool::Rect, (5.0, 5.0));
+        mgr.update_stroke((30.0, 30.0));
+        mgr.commit_stroke();
+        // (10,10) 命中两矩形，应返回后者（索引 1）
+        assert_eq!(mgr.hit_test((10.0, 10.0)), Some(1));
+    }
+
+    #[test]
+    fn apply_to_image_arrow_translates() {
+        let mut img = image::RgbaImage::from_pixel(50, 50, image::Rgba([255, 255, 255, 255]));
+        let ann = Annotation::Arrow { from: (20.0, 25.0), to: (40.0, 25.0), color: Color::RED, stroke_width: 2.0 };
+        apply_to_image(&mut img, &[ann], (10, 20));
+        // 平移后箭头 (10,5)->(30,5) 轴线在 y=5 附近
+        let p = img.get_pixel(20, 5).0;
+        assert_eq!(p[0..3], [255, 59, 48]);
     }
 }

@@ -15,11 +15,9 @@ use crate::utils::math::Rect;
 
 /// 工具条估算尺寸（egui 点）。
 ///
-/// 两行布局：第一行 10 个文字按钮（5 工具 + 撤销/重做 + 复制/保存/取消，
-/// 每个约 54pt）+ 分隔符与内边距；第二行 6 色块 + 三档线宽（约 30pt）。
-/// 仅用于弹出前的位置计算（需先知尺寸才能定位），
-/// 与实际渲染尺寸的小偏差不影响正确性（水平钳制留了余量）。
-pub const BAR_SIZE: (f32, f32) = (600.0, 80.0);
+/// 两/三行布局：第一行工具按钮；第二行颜色/线宽或遮挡样式；马赛克像素化/模糊时
+/// 额外第三行滑块。按最大高度估算（110pt），保证位置计算不遮挡。
+pub const BAR_SIZE: (f32, f32) = (600.0, 110.0);
 
 /// 工具条与选区间的间距（egui 点）。
 pub const BAR_GAP: f32 = 10.0;
@@ -144,7 +142,7 @@ mod tests {
 
 /// 工具条点击结果（由覆盖层在处理完渲染后统一响应）。
 #[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ToolbarAction {
     /// 激活/切换标注工具。
     ActivateTool(crate::annotation::Tool),
@@ -152,6 +150,8 @@ pub enum ToolbarAction {
     SetColor(Color),
     /// 切换当前描边宽度（对新标注生效）。
     SetStrokeWidth(f32),
+    /// 切换遮挡样式（马赛克工具）。
+    SetMosaicStyle(crate::annotation::MosaicStyle),
     Undo,
     Redo,
     Copy,
@@ -175,6 +175,7 @@ pub fn toolbar_ui(
     active_tool: Option<crate::annotation::Tool>,
     stroke_color: Color,
     stroke_width: f32,
+    mosaic_style: &crate::annotation::MosaicStyle,
     can_undo: bool,
     can_redo: bool,
     actual_rect: &mut Option<egui::Rect>,
@@ -248,41 +249,104 @@ pub fn toolbar_ui(
                                 action = Some(ToolbarAction::Cancel);
                             }
                         });
-                        // 第二行：颜色 + 线宽（对新标注生效）
+                        // 第二行：马赛克显示样式切换+参数，其它工具显示颜色+线宽
                         ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            for &c in &PRESET_COLORS {
-                                let selected = stroke_color == c;
-                                // 统一细描边保证白/黄等浅色块在浅色背景上可见
-                                let stroke = if selected {
-                                    egui::Stroke::new(2.5, ui.visuals().strong_text_color())
-                                } else {
-                                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
-                                };
-                                let btn = egui::Button::new("")
-                                    .fill(egui::Color32::from_rgba_unmultiplied(
-                                        c.r, c.g, c.b, c.a,
-                                    ))
-                                    .stroke(stroke)
-                                    .min_size(egui::vec2(20.0, 20.0))
-                                    .corner_radius(10.0);
-                                if ui.add(btn).clicked() {
-                                    action = Some(ToolbarAction::SetColor(c));
+                        if active_tool == Some(Tool::Mosaic) {
+                            // 样式切换
+                            ui.horizontal(|ui| {
+                                let is_pixel = matches!(mosaic_style, crate::annotation::MosaicStyle::Pixelate { .. });
+                                let is_blur = matches!(mosaic_style, crate::annotation::MosaicStyle::Blur { .. });
+                                let is_solid = matches!(mosaic_style, crate::annotation::MosaicStyle::Solid { .. });
+                                let mut b1 = egui::Button::new("像素化");
+                                if is_pixel { b1 = b1.fill(ui.visuals().selection.bg_fill); }
+                                if ui.add(b1).clicked() {
+                                    action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Pixelate { block_size: 18 }));
                                 }
-                            }
-                            ui.separator();
-                            for &(w, dot) in &WIDTH_STEPS {
-                                let selected = (stroke_width - w).abs() < f32::EPSILON;
-                                let mut btn =
-                                    egui::Button::new(egui::RichText::new("●").size(dot));
-                                if selected {
-                                    btn = btn.fill(ui.visuals().selection.bg_fill);
+                                let mut b2 = egui::Button::new("模糊");
+                                if is_blur { b2 = b2.fill(ui.visuals().selection.bg_fill); }
+                                if ui.add(b2).clicked() {
+                                    action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Blur { radius: 12.0 }));
                                 }
-                                if ui.add(btn).clicked() {
-                                    action = Some(ToolbarAction::SetStrokeWidth(w));
+                                let mut b3 = egui::Button::new("纯色");
+                                if is_solid { b3 = b3.fill(ui.visuals().selection.bg_fill); }
+                                if ui.add(b3).clicked() {
+                                    action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Solid { color: stroke_color }));
                                 }
-                            }
-                        });
+                            });
+                            // 参数行（块大小 / 模糊半径 / 纯色颜色）
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                match mosaic_style {
+                                    crate::annotation::MosaicStyle::Pixelate { block_size } => {
+                                        let mut bs = *block_size as i32;
+                                        let resp = ui.add(egui::Slider::new(&mut bs, 4..=40).text("块大小"));
+                                        if resp.changed() {
+                                            action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Pixelate { block_size: bs as u32 }));
+                                        }
+                                    }
+                                    crate::annotation::MosaicStyle::Blur { radius } => {
+                                        let mut r = *radius;
+                                        let resp = ui.add(egui::Slider::new(&mut r, 2.0..=30.0).text("模糊"));
+                                        if resp.changed() {
+                                            action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Blur { radius: r }));
+                                        }
+                                    }
+                                    crate::annotation::MosaicStyle::Solid { .. } => {
+                                        // 纯色共享统一颜色（与绘制图形同一调色板）
+                                        for &c in &PRESET_COLORS {
+                                            let selected = stroke_color == c;
+                                            let stroke = if selected {
+                                                egui::Stroke::new(2.5, ui.visuals().strong_text_color())
+                                            } else {
+                                                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
+                                            };
+                                            let btn = egui::Button::new("")
+                                                .fill(egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a))
+                                                .stroke(stroke)
+                                                .min_size(egui::vec2(20.0, 20.0))
+                                                .corner_radius(10.0);
+                                            if ui.add(btn).clicked() {
+                                                // 同步更新统一颜色与纯色遮挡颜色
+                                                action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Solid { color: c }));
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                for &c in &PRESET_COLORS {
+                                    let selected = stroke_color == c;
+                                    let stroke = if selected {
+                                        egui::Stroke::new(2.5, ui.visuals().strong_text_color())
+                                    } else {
+                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
+                                    };
+                                    let btn = egui::Button::new("")
+                                        .fill(egui::Color32::from_rgba_unmultiplied(
+                                            c.r, c.g, c.b, c.a,
+                                        ))
+                                        .stroke(stroke)
+                                        .min_size(egui::vec2(20.0, 20.0))
+                                        .corner_radius(10.0);
+                                    if ui.add(btn).clicked() {
+                                        action = Some(ToolbarAction::SetColor(c));
+                                    }
+                                }
+                                ui.separator();
+                                for &(w, dot) in &WIDTH_STEPS {
+                                    let selected = (stroke_width - w).abs() < f32::EPSILON;
+                                    let mut btn =
+                                        egui::Button::new(egui::RichText::new("●").size(dot));
+                                    if selected {
+                                        btn = btn.fill(ui.visuals().selection.bg_fill);
+                                    }
+                                    if ui.add(btn).clicked() {
+                                        action = Some(ToolbarAction::SetStrokeWidth(w));
+                                    }
+                                }
+                            });
+                        }
                     });
                 });
         });

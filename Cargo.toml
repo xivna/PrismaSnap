@@ -27,6 +27,8 @@ toml = "1"
 # 结构化日志（控制台 + 文件输出）
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 文字标注光栅化（ab_glyph + CJK 字体，跨平台 CPU 渲染）
+ab_glyph = "0.2"
 
 # 仅 Windows 平台（屏幕捕获基于 Windows Graphics Capture，无法跨平台编译）。
 # 放在 target-specific 依赖里，保证 WSL2 下 cargo check/test 不编译它。
