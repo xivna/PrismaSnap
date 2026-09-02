@@ -150,6 +150,10 @@ pub enum ToolbarAction {
     SetColor(Color),
     /// 切换当前描边宽度（对新标注生效）。
     SetStrokeWidth(f32),
+    /// 切换文字字号。
+    SetTextFontSize(f32),
+    /// 切换文字是否加粗。
+    SetTextBold(bool),
     /// 切换遮挡样式（马赛克工具）。
     SetMosaicStyle(crate::annotation::MosaicStyle),
     Undo,
@@ -176,6 +180,8 @@ pub fn toolbar_ui(
     stroke_color: Color,
     stroke_width: f32,
     mosaic_style: &crate::annotation::MosaicStyle,
+    text_font_size: f32,
+    text_bold: bool,
     can_undo: bool,
     can_redo: bool,
     actual_rect: &mut Option<egui::Rect>,
@@ -311,6 +317,35 @@ pub fn toolbar_ui(
                                             }
                                         }
                                     }
+                                }
+                            });
+                        } else if active_tool == Some(Tool::Text) {
+                            ui.horizontal(|ui| {
+                                for &c in &PRESET_COLORS {
+                                    let selected = stroke_color == c;
+                                    let stroke = if selected {
+                                        egui::Stroke::new(2.5, ui.visuals().strong_text_color())
+                                    } else {
+                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
+                                    };
+                                    let btn = egui::Button::new("")
+                                        .fill(egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a))
+                                        .stroke(stroke)
+                                        .min_size(egui::vec2(20.0, 20.0))
+                                        .corner_radius(10.0);
+                                    if ui.add(btn).clicked() {
+                                        action = Some(ToolbarAction::SetColor(c));
+                                    }
+                                }
+                                ui.separator();
+                                let mut sz = text_font_size;
+                                let resp = ui.add(egui::Slider::new(&mut sz, 8.0..=120.0).text("字号"));
+                                if resp.changed() {
+                                    action = Some(ToolbarAction::SetTextFontSize(sz));
+                                }
+                                let mut bold = text_bold;
+                                if ui.checkbox(&mut bold, "加粗").changed() {
+                                    action = Some(ToolbarAction::SetTextBold(bold));
                                 }
                             });
                         } else {

@@ -107,12 +107,14 @@ pub enum Annotation {
         /// 遮挡样式（像素化/模糊/纯色）。
         style: MosaicStyle,
     },
-    /// 文字标注。
+    /// 文字标注（矩形文本框，可拖动缩放；`rect` 为物理像素文本框）。
     Text {
-        pos: (f32, f32),
+        rect: Rect,
         content: String,
         color: Color,
         font_size: f32,
+        /// 是否加粗（预览用 egui 粗体，导出用描边模拟或粗体字体）。
+        bold: bool,
     },
 }
 
@@ -180,10 +182,7 @@ impl Annotation {
                 Rect { x: min_x - w, y: min_y - w, width: (max_x - min_x + 2 * w) as u32, height: (max_y - min_y + 2 * w) as u32 }
             }
             Annotation::Mosaic { rect, style: _ } => *rect,
-            Annotation::Text { pos, .. } => {
-                // 文字包围盒近似（拖动用，实际排版前固定 100x20 预留）
-                Rect { x: pos.0 as i32 - 2, y: pos.1 as i32 - 2, width: 104, height: 24 }
-            }
+            Annotation::Text { rect, .. } => *rect,
         }
     }
 
@@ -209,8 +208,8 @@ impl Annotation {
                 let y = pt.1 as i32;
                 x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
             }
-            Annotation::Text { pos: _, .. } => {
-                let r = self.bounds();
+            Annotation::Text { rect, .. } => {
+                let r = Rect { x: rect.x - TOL as i32, y: rect.y - TOL as i32, width: rect.width + 2 * TOL as u32, height: rect.height + 2 * TOL as u32 };
                 let x = pt.0 as i32;
                 let y = pt.1 as i32;
                 x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
@@ -255,9 +254,9 @@ impl Annotation {
                     p.1 += dy;
                 }
             }
-            Annotation::Text { pos, .. } => {
-                pos.0 += dx;
-                pos.1 += dy;
+            Annotation::Text { rect, .. } => {
+                rect.x += dx_i;
+                rect.y += dy_i;
             }
         }
     }
@@ -303,6 +302,10 @@ pub struct AnnotationManager {
     pub stroke_width: f32,
     /// 当前遮挡样式（马赛克工具新建标注使用）。
     pub mosaic_style: MosaicStyle,
+    /// 当前文字字号（物理像素，新建/编辑文字使用）。
+    pub text_font_size: f32,
+    /// 当前文字是否加粗。
+    pub text_bold: bool,
     /// 当前选中标注下标（无选中为 None）。
     selected: Option<usize>,
     /// 拖动态（按下命中后进入）。
@@ -330,6 +333,8 @@ impl Default for AnnotationManager {
             stroke_color: Color::RED,
             stroke_width: 3.0,
             mosaic_style: MosaicStyle::default(),
+            text_font_size: 20.0,
+            text_bold: false,
             selected: None,
             drag: None,
         }
@@ -366,10 +371,11 @@ impl AnnotationManager {
                 style: self.mosaic_style.clone(),
             }),
             Tool::Text => Some(Annotation::Text {
-                pos: at,
+                rect: Rect::from_points(at.0 as i32, at.1 as i32, at.0 as i32, at.1 as i32),
                 content: String::from("文本"),
                 color: self.stroke_color,
-                font_size: 16.0,
+                font_size: self.text_font_size,
+                bold: self.text_bold,
             }),
         };
     }
@@ -378,12 +384,13 @@ impl AnnotationManager {
     pub fn update_stroke(&mut self, at: (f32, f32)) {
         let anchor = self.stroke_anchor;
         match &mut self.in_progress {
-            Some(Annotation::Rect { rect, .. }) | Some(Annotation::Mosaic { rect, .. }) => {
+            Some(Annotation::Rect { rect, .. })
+            | Some(Annotation::Mosaic { rect, .. })
+            | Some(Annotation::Text { rect, .. }) => {
                 *rect = Rect::from_points(anchor.0 as i32, anchor.1 as i32, at.0 as i32, at.1 as i32);
             }
             Some(Annotation::Arrow { to, .. }) => *to = at,
             Some(Annotation::Brush { points, .. }) => points.push(at),
-            Some(Annotation::Text { pos, .. }) => *pos = at,
             _ => {}
         }
     }
@@ -405,6 +412,113 @@ impl AnnotationManager {
     /// 设置当前遮挡样式（仅影响后续新建标注，不实时改写已有标注）。
     pub fn set_mosaic_style(&mut self, style: MosaicStyle) {
         self.mosaic_style = style;
+    }
+
+    /// 设置当前文字字号（仅影响后续新建/编辑后提交的文字）。
+    pub fn set_text_font_size(&mut self, size: f32) {
+        self.text_font_size = size.clamp(8.0, 120.0);
+    }
+
+    /// 设置当前文字是否加粗。
+    pub fn set_text_bold(&mut self, bold: bool) {
+        self.text_bold = bold;
+    }
+
+    /// 直接提交一条文字标注（点击输入确认后调用，绕开 in_progress）。
+    pub fn push_text(&mut self, rect: Rect, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+        // 保证文本框有最小可编辑尺寸
+        let rect = if rect.width < 24 || rect.height < 16 {
+            Rect { x: rect.x, y: rect.y, width: rect.width.max(80), height: rect.height.max(28) }
+        } else {
+            rect
+        };
+        let ann = Annotation::Text {
+            rect,
+            content,
+            color: self.stroke_color,
+            font_size: self.text_font_size,
+            bold: self.text_bold,
+        };
+        self.stack.push(ann);
+        self.selected = Some(self.stack.annotations().len() - 1);
+    }
+
+    /// 便捷：在点位创建默认大小文本框。
+    pub fn push_text_at(&mut self, pos: (f32, f32), content: String) {
+        let rect = Rect { x: pos.0 as i32, y: pos.1 as i32, width: 200, height: 40 };
+        self.push_text(rect, content);
+    }
+
+    /// 更新已提交的文字标注内容/样式（双击编辑后确认调用）。
+    pub fn update_text(&mut self, index: usize, content: String, color: Color, font_size: f32, bold: bool) -> bool {
+        if content.trim().is_empty() {
+            return false;
+        }
+        if index >= self.stack.annotations().len() {
+            return false;
+        }
+        // 非文字标注不改
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) {
+            return false;
+        }
+        self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { content: c, color: col, font_size: fs, bold: b, .. }) = vec.get_mut(index) {
+                *c = content.clone();
+                *col = color;
+                *fs = font_size;
+                *b = bold;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// 更新文字框几何（拖动缩放句柄时调用）。
+    pub fn update_text_rect(&mut self, index: usize, new_rect: Rect) -> bool {
+        if index >= self.stack.annotations().len() {
+            return false;
+        }
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) {
+            return false;
+        }
+        self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { rect, .. }) = vec.get_mut(index) {
+                *rect = new_rect;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// 仅更新文字颜色（选中态实时预览用）。
+    pub fn set_text_color_at(&mut self, index: usize, color: Color) -> bool {
+        if index >= self.stack.annotations().len() { return false; }
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
+        self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { color: c, .. }) = vec.get_mut(index) { *c = color; true } else { false }
+        })
+    }
+    /// 仅更新文字字号。
+    pub fn set_text_font_size_at(&mut self, index: usize, size: f32) -> bool {
+        if index >= self.stack.annotations().len() { return false; }
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
+        let size = size.clamp(8.0, 120.0);
+        self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { font_size: fs, .. }) = vec.get_mut(index) { *fs = size; true } else { false }
+        })
+    }
+    /// 仅更新文字加粗。
+    pub fn set_text_bold_at(&mut self, index: usize, bold: bool) -> bool {
+        if index >= self.stack.annotations().len() { return false; }
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
+        self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { bold: b, .. }) = vec.get_mut(index) { *b = bold; true } else { false }
+        })
     }
 
     // ── 选中 / 命中 / 拖动（无工具默认态整体移动）─────────────────────
@@ -545,6 +659,11 @@ impl AnnotationManager {
         self.stack.annotations()
     }
 
+    /// 可变访问已提交标注（拖动/缩放等原地编辑用，调用方需自行保证历史记录）。
+    pub fn annotations_mut(&mut self) -> &mut Vec<Annotation> {
+        self.stack.annotations_mut()
+    }
+
     /// 进行中的标注（预览时与已提交标注一同绘制）。
     pub fn in_progress(&self) -> Option<&Annotation> {
         self.in_progress.as_ref()
@@ -587,9 +706,9 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                     MosaicStyle::Solid { color } => tools::mosaic::draw_solid(img, local, *color),
                 }
             }
-            Annotation::Text { pos, content, color, font_size } => {
-                let local_pos = (pos.0 - origin.0 as f32, pos.1 - origin.1 as f32);
-                tools::text::draw_text(img, local_pos, content, *color, *font_size);
+            Annotation::Text { rect, content, color, font_size, bold } => {
+                let local_rect = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
+                tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold);
             }
         }
     }
@@ -661,7 +780,7 @@ mod tests {
     fn annotation_degeneracy_rules() {
         assert!(Annotation::Arrow { from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
         assert!(!Annotation::Arrow { from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
-        assert!(Annotation::Text { pos: (0.0, 0.0), content: "  ".into(), color: Color::RED, font_size: 16.0 }.is_degenerate());
+        assert!(Annotation::Text { rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false }.is_degenerate());
     }
 
     #[test]

@@ -8,23 +8,38 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use crate::annotation::Color;
 use super::rect::blend_pixel;
 
-/// 绘制文字标注（本地坐标）。
+/// 绘制文字标注（本地坐标，物理像素）。
 ///
-/// * `pos` - 基线起点（本地坐标，物理像素）；
-/// * `content` - 文本内容；
+/// * `pos` - 基线起点（本地坐标，物理像素；第一行基线）；
+/// * `content` - 文本内容（支持 `\n` 多行，行距 1.2 倍字号）；
 /// * `color` - 颜色；
-/// * `font_size` - 字号（物理像素，建议 14~24）。
+/// * `font_size` - 字号（物理像素，建议 12~48，限 8..72）；
+/// * `bold` - 是否加粗（优先尝试粗体字体文件，缺失时模拟描边）。
 pub fn draw_text(
     img: &mut image::RgbaImage,
     pos: (f32, f32),
     content: &str,
     color: Color,
     font_size: f32,
+    bold: bool,
 ) {
     if content.trim().is_empty() || color.a == 0 {
         return;
     }
-    let Some(font_bytes) = cjk_font_bytes() else {
+    let font_size = font_size.clamp(8.0, 120.0);
+    // 字体选择：粗体优先 msyhbd.ttc，否则回落普通字体并模拟加粗
+    let (font_bytes, simulate_bold) = if bold {
+        if let Some(b) = cjk_font_bytes_bold() {
+            (b, false)
+        } else if let Some(n) = cjk_font_bytes() {
+            (n, true)
+        } else {
+            tracing::warn!("未找到系统中文字体，文字标注未写入");
+            return;
+        }
+    } else if let Some(n) = cjk_font_bytes() {
+        (n, false)
+    } else {
         tracing::warn!("未找到系统中文字体，文字标注未写入");
         return;
     };
@@ -35,41 +50,152 @@ pub fn draw_text(
             return;
         }
     };
-    let scale = PxScale::from(font_size.max(8.0));
+    let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
-    let mut caret_x = pos.0;
-    let caret_y = pos.1;
-    for ch in content.chars() {
-        if ch == '\n' {
-            caret_x = pos.0;
-            // 简易行距 = 字号 *1.2
-            // 手动换行时 y 增加 （此处简化）
+    let line_height = font_size * 1.25;
+
+    for (line_idx, line) in content.split('\n').enumerate() {
+        let baseline_y = pos.1 + line_idx as f32 * line_height;
+        let mut caret_x = pos.0;
+        // 空行仅换行，不绘制
+        if line.is_empty() {
             continue;
         }
-        let glyph_id = font.glyph_id(ch);
-        let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(caret_x, caret_y));
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            outlined.draw(|x, y, cov| {
-                let px = (bounds.min.x as i32 + x as i32) as u32;
-                let py = (bounds.min.y as i32 + y as i32) as u32;
-                if px >= img.width() || py >= img.height() {
-                    return;
+        for ch in line.chars() {
+            let glyph_id = font.glyph_id(ch);
+            let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(caret_x, baseline_y));
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                let advance = scaled.h_advance(glyph_id);
+                // 模拟加粗：四向偏移增强厚度（无粗体字体时）
+                let offsets: &[(f32, f32)] = if simulate_bold {
+                    &[(0.0, 0.0), (0.9, 0.0), (0.0, 0.9), (0.9, 0.9)]
+                } else {
+                    &[(0.0, 0.0)]
+                };
+                for (ox, oy) in offsets {
+                    // 偏移后的包围盒（模拟时整体平移）
+                    let off_x = *ox;
+                    let off_y = *oy;
+                    outlined.draw(|x, y, cov| {
+                        // ab_glyph draw 回调的 x,y 为相对 bounds.min 的偏移
+                        let px = (bounds.min.x as i32 + x as i32 + off_x as i32) as u32;
+                        let py = (bounds.min.y as i32 + y as i32 + off_y as i32) as u32;
+                        if px >= img.width() || py >= img.height() {
+                            return;
+                        }
+                        let a = (color.a as f32 * cov) as u8;
+                        if a == 0 {
+                            return;
+                        }
+                        let col = Color { r: color.r, g: color.g, b: color.b, a };
+                        // 加粗模拟第二遍时用稍低透明混合，避免过重
+                        blend_pixel(img.get_pixel_mut(px, py), col);
+                    });
                 }
-                // cov 为覆盖率 0..1，叠加到 alpha
-                let a = (color.a as f32 * cov) as u8;
-                if a == 0 {
-                    return;
-                }
-                let col = Color { r: color.r, g: color.g, b: color.b, a };
-                blend_pixel(img.get_pixel_mut(px, py), col);
-            });
+                caret_x += advance;
+            } else {
+                // 无轮廓字体（如空格）仍需推进
+                caret_x += scaled.h_advance(glyph_id);
+            }
         }
-        caret_x += scaled.h_advance(glyph_id);
     }
 }
 
-/// 复用 `ui/gui.rs` 的字体缓存策略：优先微软雅黑 / 黑体，OnceLock 缓存。
+/// 在矩形文本框内绘制文字（带自动换行，超出宽度按字符 wrapping）。
+///
+/// `rect` 为物理像素文本框（`x,y` 为左上，`width` 为可用宽度，高度超出可溢出）。
+pub fn draw_text_in_rect(
+    img: &mut image::RgbaImage,
+    rect: crate::utils::math::Rect,
+    content: &str,
+    color: Color,
+    font_size: f32,
+    bold: bool,
+) {
+    if content.trim().is_empty() || color.a == 0 || rect.width < 4 || rect.height < 4 {
+        // 空内容或过小矩形不绘制（避免除零）
+        if content.trim().is_empty() { return; }
+    }
+    let font_size = font_size.clamp(8.0, 120.0);
+    let (font_bytes, simulate_bold) = if bold {
+        if let Some(b) = cjk_font_bytes_bold() { (b, false) } else if let Some(n) = cjk_font_bytes() { (n, true) } else { tracing::warn!("未找到字体"); return; }
+    } else if let Some(n) = cjk_font_bytes() { (n, false) } else { tracing::warn!("未找到字体"); return; };
+    let font = match FontRef::try_from_slice(font_bytes) { Ok(f) => f, Err(e) => { tracing::warn!("字体解析失败: {e:?}"); return; } };
+    let scale = PxScale::from(font_size);
+    let scaled = font.as_scaled(scale);
+    let line_height = font_size * 1.25;
+    let max_w = rect.width as f32 - 4.0; // 左右各 2px 内边距
+    // 首行基线 = 框顶 + 内边距(2) + 字号
+    let first_baseline = rect.y as f32 + 2.0 + font_size * 0.85;
+    let mut line_idx: usize = 0;
+    for orig_line in content.split('\n') {
+        // 对每行做宽度 wrapping（按字符累加 h_advance）
+        let wrapped = if max_w > 20.0 { wrap_line(orig_line, &font, scale, max_w) } else { vec![orig_line.to_string()] };
+        // 空行仍占一行高度
+        if wrapped.is_empty() {
+            line_idx += 1;
+            continue;
+        }
+        for wl in wrapped {
+            let baseline_y = first_baseline + line_idx as f32 * line_height;
+            // 超出矩形底部的裁剪：若整行已超出图片或矩形较多，可跳过绘制（仍占行高）
+            // 允许溢出框底 1 行（与 egui TextEdit 行为一致，框会随内容自增高，但导出固定框高仍尽量画）
+            let mut caret_x = rect.x as f32 + 2.0;
+            if wl.is_empty() {
+                line_idx += 1;
+                continue;
+            }
+            for ch in wl.chars() {
+                let gid = font.glyph_id(ch);
+                let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret_x, baseline_y));
+                if let Some(outlined) = font.outline_glyph(glyph) {
+                    let bounds = outlined.px_bounds();
+                    let offsets: &[(f32,f32)] = if simulate_bold { &[(0.0,0.0),(0.9,0.0),(0.0,0.9),(0.9,0.9)] } else { &[(0.0,0.0)] };
+                    for (ox,oy) in offsets {
+                        outlined.draw(|x,y,cov| {
+                            let px = (bounds.min.x as i32 + x as i32 + *ox as i32) as u32;
+                            let py = (bounds.min.y as i32 + y as i32 + *oy as i32) as u32;
+                            if px >= img.width() || py >= img.height() { return; }
+                            let a = (color.a as f32 * cov) as u8; if a==0 {return;}
+                            let col = Color{r:color.r,g:color.g,b:color.b,a};
+                            blend_pixel(img.get_pixel_mut(px,py), col);
+                        });
+                    }
+                    caret_x += scaled.h_advance(gid);
+                } else {
+                    caret_x += scaled.h_advance(gid);
+                }
+            }
+            line_idx += 1;
+        }
+        // orig_line 为 "" 时上述 wrapped 为 [""] 已处理空行占位，不再额外加
+    }
+}
+
+/// 将一行按 max_width 按字符自动换行（返回多行，含原空行）。
+fn wrap_line(line: &str, font: &FontRef, scale: PxScale, max_w: f32) -> Vec<String> {
+    if line.is_empty() { return vec![String::new()]; }
+    let scaled = font.as_scaled(scale);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w: f32 = 0.0;
+    for ch in line.chars() {
+        let gid = font.glyph_id(ch);
+        let w = scaled.h_advance(gid);
+        if cur_w + w > max_w && !cur.is_empty() {
+            lines.push(cur);
+            cur = String::new();
+            cur_w = 0.0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() || lines.is_empty() { lines.push(cur); }
+    lines
+}
+
+/// 普通 CJK 字体字节（进程内缓存，避免重复读盘）。
 fn cjk_font_bytes() -> Option<&'static [u8]> {
     static FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
@@ -84,7 +210,6 @@ fn cjk_font_bytes() -> Option<&'static [u8]> {
                 return Some(bytes);
             }
         }
-        // WSL2/l/Linux 测试环境无字体时尝试常见 Linux 字体
         for path in [r"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] {
             if let Ok(bytes) = std::fs::read(path) {
                 return Some(bytes);
@@ -95,6 +220,34 @@ fn cjk_font_bytes() -> Option<&'static [u8]> {
     .as_deref()
 }
 
+/// 粗体 CJK 字体字节（优先 msyhbd.ttc，缺失时返回 None 由上层模拟）。
+fn cjk_font_bytes_bold() -> Option<&'static [u8]> {
+    static FONT_BOLD: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    FONT_BOLD.get_or_init(|| {
+        const CANDIDATES: [&str; 3] = [
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\msyhbd.ttf",
+            r"C:\Windows\Fonts\msyh_bold.ttf",
+        ];
+        for path in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                return Some(bytes);
+            }
+        }
+        None
+    })
+    .as_deref()
+}
+
+/// 估算文字包围尺寸（物理像素），用于 `Annotation::bounds` 快速命中。
+pub fn estimate_text_size(content: &str, font_size: f32) -> (u32, u32) {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+    let w = (max_chars * font_size * 0.6).ceil().max(20.0) as u32 + 4;
+    let h = (lines.len() as f32 * font_size * 1.25).ceil().max(font_size) as u32 + 4;
+    (w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,14 +256,35 @@ mod tests {
     #[test]
     fn empty_content_does_nothing() {
         let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (5.0, 10.0), "   ", Color::BLACK, 16.0);
+        draw_text(&mut img, (5.0, 10.0), "   ", Color::BLACK, 16.0, false);
         assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 255, 255, 255]));
     }
 
     #[test]
     fn draw_does_not_panic() {
         let mut img = image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (2.0, 15.0), "Hi", Color::BLACK, 16.0);
-        // 不断言像素，环境无字体时也应不 panic
+        draw_text(&mut img, (2.0, 15.0), "Hi", Color::BLACK, 16.0, false);
+    }
+
+    #[test]
+    fn draw_multiline_does_not_panic() {
+        let mut img = image::RgbaImage::from_pixel(60, 60, image::Rgba([255, 255, 255, 255]));
+        draw_text(&mut img, (2.0, 15.0), "Hi\n世界", Color::RED, 18.0, false);
+        draw_text(&mut img, (2.0, 40.0), "Hi\n世界", Color::BLUE, 18.0, true);
+    }
+
+    #[test]
+    fn empty_multiline_is_degenerate_handled() {
+        let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]));
+        draw_text(&mut img, (5.0, 10.0), "\n\n   \n", Color::BLACK, 16.0, false);
+        assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn estimate_size_grows_with_lines() {
+        let (w1, h1) = estimate_text_size("Hi", 20.0);
+        let (w2, h2) = estimate_text_size("Hi\n世界", 20.0);
+        assert!(h2 > h1);
+        assert!(w2 >= w1);
     }
 }

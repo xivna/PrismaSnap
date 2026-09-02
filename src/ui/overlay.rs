@@ -14,6 +14,7 @@
 //! 仅在 egui 绘制时 ÷ scale_factor 转逻辑坐标（AGENTS.md 3.3 节）。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -22,7 +23,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::annotation;
+use crate::annotation::{self, Annotation};
 use crate::config::{Config, SaveFormat, SaveMode};
 use crate::utils::math::{self, Rect};
 use crate::utils::{clipboard, image_codec, paths, time};
@@ -94,6 +95,8 @@ pub struct Overlay {
     bar_rect_cache: Option<egui::Rect>,
     /// 请求退出（Esc / Enter / 复制 / 保存后置位，宿主负责销毁）。
     pub exit_requested: bool,
+    /// 双击检测：上次点击时间与命中文本索引
+    last_click: Option<(Instant, (f32, f32), usize)>,
 }
 
 impl Overlay {
@@ -174,6 +177,7 @@ impl Overlay {
             config,
             bar_rect_cache: None,
             exit_requested: false,
+            last_click: None,
         })
     }
 
@@ -184,6 +188,29 @@ impl Overlay {
 
     /// 事件入口：先喂 egui 记录输入，再处理业务逻辑与重绘。
     pub fn on_window_event(&mut self, event: &WindowEvent) {
+        // 文字编辑态：Esc 取消、Enter（无 Shift）确认 优先拦截，避免落到退出逻辑
+        if self.editor.is_editing_text() {
+            if let WindowEvent::KeyboardInput { event: key, .. } = event {
+                if key.state == ElementState::Pressed {
+                    match key.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.editor.cancel_text_edit();
+                            self.window.request_redraw();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Enter) => {
+                            // Shift+Enter 交给 egui 插换行，普通 Enter 确认
+                            if !self.modifiers.shift_key() {
+                                self.editor.commit_text_edit();
+                                self.window.request_redraw();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // egui 消费的事件（如工具条按钮点击）不再走覆盖层业务逻辑
         let consumed = self.gui.on_window_event(self.window.as_ref(), event);
         match event {
@@ -192,11 +219,10 @@ impl Overlay {
             WindowEvent::ModifiersChanged(state) => self.modifiers = state.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.current_cursor = Some((position.x as f32, position.y as f32));
-                // 拖动中实时更新选区 / 进行中的标注笔画 / 标注整体拖动 / 选区整体拖动
                 if self.drag_start.is_some() {
                     self.update_selection_from_drag();
                 }
-                if self.editor.is_dragging() {
+                if self.editor.is_dragging() || self.editor.is_resizing_text() {
                     self.editor.update_drag((position.x as f32, position.y as f32));
                     self.window.request_redraw();
                 }
@@ -226,10 +252,19 @@ impl Overlay {
         }
     }
 
+    fn is_double_click(&mut self, pt: (f32,f32), idx: usize) -> bool {
+        let now = Instant::now();
+        let is_double = if let Some((t, last_pt, last_idx)) = self.last_click {
+            last_idx == idx && now.duration_since(t) < Duration::from_millis(350) && (pt.0 - last_pt.0).hypot(pt.1 - last_pt.1) < 8.0
+        } else { false };
+        self.last_click = Some((now, pt, idx));
+        is_double
+    }
+
     /// 按下左键：`Preview` 命中标注则拖动标注、空白处重置选区回到 `Selecting`；
-    /// `Edit` 开始标注笔画；`Selecting` 开始拖动选区。
+    /// `Edit` 开始标注笔画 / 文字编辑；`Selecting` 开始拖动选区。
     ///
-    /// * `egui_consumed` - 事件已被 egui 消费（点在工具条上）时不做画布处理。
+    /// * `egui_consumed` - 事件已被 egui 消费（点在工具条/文字输入框上）时不做画布处理。
     fn on_press(&mut self, egui_consumed: bool) {
         if egui_consumed {
             return;
@@ -237,8 +272,25 @@ impl Overlay {
         match self.mode {
             Mode::Preview => {
                 if let Some(pt) = self.current_cursor {
+                    // 双击文本：未选文字工具时自动切文字工具并进入编辑
+                    if let Some(idx) = self.editor.hit_test(pt) {
+                        if let Some(Annotation::Text{..}) = self.editor.annotations().get(idx) {
+                            if self.is_double_click(pt, idx) {
+                                if self.editor.is_editing_text() { self.editor.commit_text_edit(); }
+                                self.editor.activate(crate::annotation::Tool::Text);
+                                self.mode = Mode::Edit;
+                                self.editor.begin_text_edit_existing(idx);
+                                self.window.request_redraw();
+                                return;
+                            }
+                        } else {
+                            // 非文本命中重置双击状态（避免跨标注误判）
+                            // 保留 last_click 供下次判断，但命中不同 idx 已在 is_double_click 中处理
+                        }
+                    }
                     if self.editor.begin_drag(pt) {
                         self.window.request_redraw();
+                        // 单击已记录双击时间，下次双击可进入编辑
                         return;
                     }
                     // 未命中标注：若点在选区内部则整体拖动选区
@@ -258,6 +310,56 @@ impl Overlay {
                 return;
             }
             Mode::Edit => {
+                // 未选文字工具时双击文本自动切文字工具并编辑
+                if self.editor.active_tool() != Some(crate::annotation::Tool::Text) {
+                    if let Some(pt) = self.current_cursor {
+                        if let Some(idx) = self.editor.hit_test(pt) {
+                            if let Some(Annotation::Text{..}) = self.editor.annotations().get(idx) {
+                                if self.is_double_click(pt, idx) {
+                                    if self.editor.is_editing_text() { self.editor.commit_text_edit(); }
+                                    self.editor.activate(crate::annotation::Tool::Text);
+                                    self.editor.begin_text_edit_existing(idx);
+                                    self.window.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.editor.active_tool() == Some(crate::annotation::Tool::Text) {
+                    if let Some(pt) = self.current_cursor {
+                        if let Some((idx, h)) = self.editor.hit_text_handle(pt) {
+                            if idx == usize::MAX {
+                                self.editor.begin_text_resize(idx, h, pt);
+                                self.window.request_redraw();
+                                return;
+                            }
+                            if self.editor.is_editing_text() { self.editor.commit_text_edit(); }
+                            self.editor.begin_text_resize(idx, h, pt);
+                            self.window.request_redraw();
+                            return;
+                        }
+                        // 单击文本直接进入编辑（文字工具下无需双击）
+                        if let Some(idx) = self.editor.hit_test(pt) {
+                            if let Some(Annotation::Text { .. }) = self.editor.annotations().get(idx) {
+                                if self.editor.is_editing_text() { self.editor.commit_text_edit(); }
+                                self.editor.begin_text_edit_existing(idx);
+                                self.window.request_redraw();
+                                return;
+                            }
+                        }
+                        if self.editor.is_editing_text() {
+                            self.editor.commit_text_edit();
+                            self.window.request_redraw();
+                            return;
+                        }
+                        if let Some(c) = self.current_cursor {
+                            self.editor.begin_stroke(c);
+                            self.window.request_redraw();
+                            return;
+                        }
+                    }
+                }
                 if let Some(cursor) = self.current_cursor {
                     self.editor.begin_stroke(cursor);
                 }
@@ -269,8 +371,7 @@ impl Overlay {
 
     /// 释放左键：`Selecting` 选区有效则进入 `Preview`；`Edit` 提交笔画；`Preview` 拖动提交。
     fn on_release(&mut self) {
-        // 标注拖动优先（Preview 命中拖动）
-        if self.editor.is_dragging() {
+        if self.editor.is_dragging() || self.editor.is_resizing_text() {
             self.editor.commit_drag();
             self.window.request_redraw();
             return;
@@ -342,6 +443,10 @@ impl Overlay {
     /// Ctrl+Z 撤销、Ctrl+Shift+Z 重做（后两者 Preview/Edit 均可）。
     fn on_key(&mut self, key: &KeyEvent) {
         if key.state != ElementState::Pressed {
+            return;
+        }
+        // 文字输入中全局快捷键不生效（Enter/Esc 已在 on_window_event 拦截）
+        if self.editor.is_editing_text() {
             return;
         }
         let has_selection = matches!(self.mode, Mode::Preview | Mode::Edit);
@@ -512,10 +617,50 @@ impl Overlay {
                     editor.stroke_color(),
                     editor.stroke_width(),
                     &editor.mosaic_style(),
+                    editor.text_font_size(),
+                    editor.text_bold(),
                     editor.can_undo(),
                     editor.can_redo(),
                     &mut bar_actual,
                 );
+            }
+            // PS 式内联文本编辑：文本框内直接出现闪动光标，输入即所见
+            if editor.is_editing_text() && mode == Mode::Edit {
+                let ppp = ui.ctx().pixels_per_point();
+                let edit_rect = editor.text_edit_state().unwrap().rect;
+                let anchor = egui::pos2(edit_rect.x as f32 / ppp, edit_rect.y as f32 / ppp);
+                let size = egui::vec2(edit_rect.width as f32 / ppp, edit_rect.height as f32 / ppp);
+                let col = egui::Color32::from_rgba_unmultiplied(editor.stroke_color().r, editor.stroke_color().g, editor.stroke_color().b, editor.stroke_color().a);
+                let font_size_val = editor.text_font_size();
+                let font_id = egui::FontId::proportional(font_size_val / ppp);
+                egui::Area::new(egui::Id::new("text_inline_edit"))
+                    .fixed_pos(anchor)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        ui.set_min_size(size);
+                        ui.set_max_size(size);
+                        egui::Frame::new()
+                            .fill(egui::Color32::TRANSPARENT)
+                            .corner_radius(2.0)
+                            .inner_margin(egui::Margin::symmetric(2, 0))
+                            .show(ui, |ui| {
+                                ui.visuals_mut().override_text_color = Some(col);
+                                if let Some(state) = editor.text_edit_state_mut() {
+                                    let resp = ui.add(
+                                        egui::TextEdit::multiline(&mut state.buffer)
+                                            .hint_text("输入文字…")
+                                            .font(font_id.clone())
+                                            .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
+                                            .desired_width(size.x - 4.0)
+                                            .desired_rows(((size.y / (font_size_val / ppp * 1.25)).ceil() as usize).max(1)),
+                                    );
+                                    let needs_focus = ui.ctx().memory(|m| m.focused() != Some(resp.id));
+                                    if needs_focus {
+                                        ui.ctx().memory_mut(|m| m.request_focus(resp.id));
+                                    }
+                                }
+                            });
+                    });
             }
         });
         // 缓存工具条实际渲染矩形；首帧测量到边界后请求再绘一帧，
@@ -555,6 +700,14 @@ impl Overlay {
             }
             ToolbarAction::SetStrokeWidth(width) => {
                 self.editor.set_stroke_width(width);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetTextFontSize(size) => {
+                self.editor.set_text_font_size(size);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetTextBold(bold) => {
+                self.editor.set_text_bold(bold);
                 self.window.request_redraw();
             }
             ToolbarAction::SetMosaicStyle(style) => {
