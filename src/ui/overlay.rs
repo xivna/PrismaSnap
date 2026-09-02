@@ -599,11 +599,14 @@ impl Overlay {
             if matches!(mode, Mode::Preview | Mode::Edit) {
                 let ppp = ui.ctx().pixels_per_point();
                 let ctx = ui.ctx().clone();
+                // 标注层用 Middle，确保工具条（Tooltip）始终在最上层不被遮挡
                 let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
+                    egui::Order::Middle,
                     egui::Id::new("annotations"),
                 ));
                 let img_ref: Option<&image::RgbaImage> = Some(self.image.as_ref());
+                // 同步选区到编辑器用于钳制与裁剪（防止拖出选区外遮挡工具条）
+                editor.set_selection(selection);
                 editor.draw_annotations(&painter, &ctx, ppp, img_ref);
             }
             // 工具条：Preview / Edit 均显示（Selecting 不显示）

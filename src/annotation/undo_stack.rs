@@ -120,6 +120,7 @@ mod tests {
     /// 构造一条测试用矩形标注（坐标随意，互不相同的宽度便于区分）。
     fn rect_ann(width: u32) -> Annotation {
         Annotation::Rect {
+            id: width as u64 + 100,
             rect: Rect { x: 0, y: 0, width, height: 10 },
             color: Color::RED,
             stroke_width: 2.0,

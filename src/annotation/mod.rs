@@ -78,16 +78,19 @@ impl Tool {
 /// 一条已完成的标注（矢量数据，全图物理像素坐标）。
 ///
 /// 导出时按选区原点平移（`x - sel.x, y - sel.y`），见 [`apply_to_image`]。
+/// 每条标注带稳定 `id: u64`，自增不复用，用于预览缓存 Key（避免数组下标复用导致旧纹理残留）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Annotation {
     /// 矩形选框。
     Rect {
+        id: u64,
         rect: Rect,
         color: Color,
         stroke_width: f32,
     },
     /// 箭头（起点 → 终点）。
     Arrow {
+        id: u64,
         from: (f32, f32),
         to: (f32, f32),
         color: Color,
@@ -95,6 +98,7 @@ pub enum Annotation {
     },
     /// 荧光笔 / 自由划线（折线点列）。
     Brush {
+        id: u64,
         points: Vec<(f32, f32)>,
         color: Color,
         stroke_width: f32,
@@ -103,12 +107,14 @@ pub enum Annotation {
     },
     /// 遮挡（马赛克/模糊/纯色等，复用同一矩形选区）。
     Mosaic {
+        id: u64,
         rect: Rect,
         /// 遮挡样式（像素化/模糊/纯色）。
         style: MosaicStyle,
     },
     /// 文字标注（矩形文本框，可拖动缩放；`rect` 为物理像素文本框）。
     Text {
+        id: u64,
         rect: Rect,
         content: String,
         color: Color,
@@ -116,6 +122,19 @@ pub enum Annotation {
         /// 是否加粗（预览用 egui 粗体，导出用描边模拟或粗体字体）。
         bold: bool,
     },
+}
+
+impl Annotation {
+    /// 稳定 id（不因 delete/undo 复用）。
+    pub fn id(&self) -> u64 {
+        match self {
+            Annotation::Rect { id, .. }
+            | Annotation::Arrow { id, .. }
+            | Annotation::Brush { id, .. }
+            | Annotation::Mosaic { id, .. }
+            | Annotation::Text { id, .. } => *id,
+        }
+    }
 }
 
 /// 马赛克/遮挡样式（对应外部评审方案二）。
@@ -181,7 +200,7 @@ impl Annotation {
                 }
                 Rect { x: min_x - w, y: min_y - w, width: (max_x - min_x + 2 * w) as u32, height: (max_y - min_y + 2 * w) as u32 }
             }
-            Annotation::Mosaic { rect, style: _ } => *rect,
+            Annotation::Mosaic { rect, style: _, .. } => *rect,
             Annotation::Text { rect, .. } => *rect,
         }
     }
@@ -310,6 +329,8 @@ pub struct AnnotationManager {
     selected: Option<usize>,
     /// 拖动态（按下命中后进入）。
     drag: Option<DragState>,
+    /// 自增 id，下一次新建标注分配。
+    next_id: u64,
 }
 
 /// 单次拖动的临时状态。
@@ -337,7 +358,16 @@ impl Default for AnnotationManager {
             text_bold: false,
             selected: None,
             drag: None,
+            next_id: 1,
         }
+    }
+}
+
+impl AnnotationManager {
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        id
     }
 }
 
@@ -348,29 +378,35 @@ impl AnnotationManager {
     /// 这里不产生进行中标注。
     pub fn begin_stroke(&mut self, tool: Tool, at: (f32, f32)) {
         self.stroke_anchor = at;
+        let id = self.alloc_id();
         self.in_progress = match tool {
             Tool::Rect => Some(Annotation::Rect {
+                id,
                 rect: Rect::from_points(at.0 as i32, at.1 as i32, at.0 as i32, at.1 as i32),
                 color: self.stroke_color,
                 stroke_width: self.stroke_width,
             }),
             Tool::Arrow => Some(Annotation::Arrow {
+                id,
                 from: at,
                 to: at,
                 color: self.stroke_color,
                 stroke_width: self.stroke_width,
             }),
             Tool::Brush => Some(Annotation::Brush {
+                id,
                 points: vec![at],
                 color: self.stroke_color,
                 stroke_width: self.stroke_width,
                 highlighter: false,
             }),
             Tool::Mosaic => Some(Annotation::Mosaic {
+                id,
                 rect: Rect::from_points(at.0 as i32, at.1 as i32, at.0 as i32, at.1 as i32),
                 style: self.mosaic_style.clone(),
             }),
             Tool::Text => Some(Annotation::Text {
+                id,
                 rect: Rect::from_points(at.0 as i32, at.1 as i32, at.0 as i32, at.1 as i32),
                 content: String::from("文本"),
                 color: self.stroke_color,
@@ -409,6 +445,11 @@ impl AnnotationManager {
         self.in_progress = None;
     }
 
+    /// 替换进行中标注（用于选区钳制时不走历史）。
+    pub fn replace_in_progress(&mut self, ann: Annotation) {
+        self.in_progress = Some(ann);
+    }
+
     /// 设置当前遮挡样式（仅影响后续新建标注，不实时改写已有标注）。
     pub fn set_mosaic_style(&mut self, style: MosaicStyle) {
         self.mosaic_style = style;
@@ -436,6 +477,7 @@ impl AnnotationManager {
             rect
         };
         let ann = Annotation::Text {
+            id: self.alloc_id(),
             rect,
             content,
             color: self.stroke_color,
@@ -680,7 +722,7 @@ impl AnnotationManager {
 pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], origin: (i32, i32)) {
     for ann in annotations {
         match ann {
-            Annotation::Rect { rect, color, stroke_width } => {
+            Annotation::Rect { rect, color, stroke_width, .. } => {
                 let local = Rect {
                     x: rect.x - origin.0,
                     y: rect.y - origin.1,
@@ -689,16 +731,16 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                 };
                 tools::rect::draw_rect(img, local, *color, *stroke_width);
             }
-            Annotation::Arrow { from, to, color, stroke_width } => {
+            Annotation::Arrow { from, to, color, stroke_width, .. } => {
                 let local_from = (from.0 - origin.0 as f32, from.1 - origin.1 as f32);
                 let local_to = (to.0 - origin.0 as f32, to.1 - origin.1 as f32);
                 tools::arrow::draw_arrow(img, local_from, local_to, *color, *stroke_width);
             }
-            Annotation::Brush { points, color, stroke_width, highlighter } => {
+            Annotation::Brush { points, color, stroke_width, highlighter, .. } => {
                 let local_pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x - origin.0 as f32, y - origin.1 as f32)).collect();
                 tools::brush::draw_brush(img, &local_pts, *color, *stroke_width, *highlighter);
             }
-            Annotation::Mosaic { rect, style } => {
+            Annotation::Mosaic { rect, style, .. } => {
                 let local = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
                 match style {
                     MosaicStyle::Pixelate { block_size } => tools::mosaic::draw_pixelate(img, local, *block_size),
@@ -706,7 +748,7 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                     MosaicStyle::Solid { color } => tools::mosaic::draw_solid(img, local, *color),
                 }
             }
-            Annotation::Text { rect, content, color, font_size, bold } => {
+            Annotation::Text { rect, content, color, font_size, bold, .. } => {
                 let local_rect = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
                 tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold);
             }
@@ -778,9 +820,9 @@ mod tests {
 
     #[test]
     fn annotation_degeneracy_rules() {
-        assert!(Annotation::Arrow { from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
-        assert!(!Annotation::Arrow { from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
-        assert!(Annotation::Text { rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false }.is_degenerate());
+        assert!(Annotation::Arrow { id: 1, from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
+        assert!(!Annotation::Arrow { id: 2, from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
+        assert!(Annotation::Text { id: 1, rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false }.is_degenerate());
     }
 
     #[test]
@@ -789,6 +831,7 @@ mod tests {
         let mut img = image::RgbaImage::from_pixel(50, 50, image::Rgba([255, 255, 255, 255]));
         // 全图坐标 (20, 30) 的矩形，选区原点 (10, 20) → 图内应落在 (10, 10)
         let ann = Annotation::Rect {
+            id: 1,
             rect: Rect { x: 20, y: 30, width: 15, height: 10 },
             color: Color::RED,
             stroke_width: 1.0,
@@ -807,7 +850,7 @@ mod tests {
 
     #[test]
     fn arrow_translate_and_hit() {
-        let mut ann = Annotation::Arrow { from: (10.0, 10.0), to: (30.0, 10.0), color: Color::RED, stroke_width: 2.0 };
+        let mut ann = Annotation::Arrow { id: 1, from: (10.0, 10.0), to: (30.0, 10.0), color: Color::RED, stroke_width: 2.0 };
         assert!(ann.hit_test((20.0, 10.0)));
         assert!(!ann.hit_test((20.0, 30.0)));
         ann.translate(5.0, 5.0);
@@ -822,7 +865,7 @@ mod tests {
 
     #[test]
     fn rect_hit_and_translate() {
-        let mut ann = Annotation::Rect { rect: Rect { x: 10, y: 10, width: 20, height: 10 }, color: Color::RED, stroke_width: 2.0 };
+        let mut ann = Annotation::Rect { id: 1, rect: Rect { x: 10, y: 10, width: 20, height: 10 }, color: Color::RED, stroke_width: 2.0 };
         assert!(ann.hit_test((15.0, 15.0))); // 内部命中（拖动友好）
         assert!(!ann.hit_test((0.0, 0.0)));
         ann.translate(3.0, -2.0);
@@ -872,7 +915,7 @@ mod tests {
     #[test]
     fn apply_to_image_arrow_translates() {
         let mut img = image::RgbaImage::from_pixel(50, 50, image::Rgba([255, 255, 255, 255]));
-        let ann = Annotation::Arrow { from: (20.0, 25.0), to: (40.0, 25.0), color: Color::RED, stroke_width: 2.0 };
+        let ann = Annotation::Arrow { id: 1, from: (20.0, 25.0), to: (40.0, 25.0), color: Color::RED, stroke_width: 2.0 };
         apply_to_image(&mut img, &[ann], (10, 20));
         // 平移后箭头 (10,5)->(30,5) 轴线在 y=5 附近
         let p = img.get_pixel(20, 5).0;

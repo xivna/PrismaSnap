@@ -191,7 +191,7 @@ pub fn toolbar_ui(
     let mut action = None;
     let area_response = egui::Area::new(egui::Id::new("prismsnap_toolbar"))
         .fixed_pos(egui::pos2(pos.0, pos.1))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Tooltip)
         .show(ctx, |ui| {
             // 浮层风格跟随界面主题（设置界面「主题」项即时生效）：
             // 浅色 = 白卡片 + 投影；深色 = 深灰卡片 + 白描边。
