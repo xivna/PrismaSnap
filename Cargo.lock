@@ -407,6 +407,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "colorutils-rs"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "964565f4c740d7a05e259762290f556c4a91aefae1c3e964aa21432270513416"
+dependencies = [
+ "erydanos",
+ "half",
+ "num-traits",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -726,6 +737,15 @@ name = "error-code"
 version = "3.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+
+[[package]]
+name = "erydanos"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cbdc4987ed8e9ece64845393c2d53596b3a4ccbfb3948d799d58f6450e89fb1"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "euclid"
@@ -1414,6 +1434,20 @@ dependencies = [
  "gtk-sys",
  "libloading 0.7.4",
  "once_cell",
+]
+
+[[package]]
+name = "libblur"
+version = "0.13.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b19cfe9c454da6276845220ddf751a651801855d72e8b4689a9541bebb2c315"
+dependencies = [
+ "colorutils-rs",
+ "erydanos",
+ "half",
+ "libc",
+ "num-traits",
+ "rayon",
 ]
 
 [[package]]
@@ -2238,6 +2272,7 @@ dependencies = [
  "global-hotkey",
  "half",
  "image",
+ "libblur",
  "pollster",
  "rfd",
  "serde",

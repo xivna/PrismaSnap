@@ -1,7 +1,10 @@
 //! 标注编辑器模块（仅 Windows 平台编译）。
 
+use std::collections::HashMap;
+
 use crate::annotation::{Annotation, AnnotationManager, Color, Tool};
 use crate::utils::math::Rect;
+use libblur::{stack_blur, FastBlurChannels, ThreadingPolicy};
 
 /// 文字编辑态（矩形文本框，新建/二次编辑）。
 #[derive(Debug, Clone)]
@@ -23,17 +26,25 @@ struct TextResizeState {
     start_rect: Rect,
 }
 
+struct BlurCacheEntry {
+    padded_rect: Rect,
+    radius: f32,
+    blurred: image::RgbaImage,
+    handle: egui::TextureHandle,
+}
+
 /// 标注编辑器状态。
 pub struct Editor {
     mgr: AnnotationManager,
     active_tool: Option<Tool>,
     editing_text: Option<TextEditState>,
     resizing_text: Option<TextResizeState>,
+    blur_cache: HashMap<usize, BlurCacheEntry>,
 }
 
 impl Editor {
     pub fn new() -> Self {
-        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None }
+        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new() }
     }
     pub fn active_tool(&self) -> Option<Tool> { self.active_tool }
     pub fn is_editing(&self) -> bool { self.active_tool.is_some() }
@@ -283,11 +294,71 @@ impl Editor {
     pub fn can_redo(&self) -> bool { self.mgr.can_redo() }
     pub fn annotations(&self) -> &[Annotation] { self.mgr.annotations() }
 
-    pub fn draw_annotations(&self, painter: &egui::Painter, ctx: &egui::Context, ppp: f32, image: Option<&image::RgbaImage>) {
+    pub fn draw_annotations(&mut self, painter: &egui::Painter, ctx: &egui::Context, ppp: f32, image: Option<&image::RgbaImage>) {
         let editing_idx = self.editing_text.as_ref().and_then(|s| s.index);
         for (idx, ann) in self.mgr.annotations().iter().enumerate() {
             if Some(idx) == editing_idx { continue; }
             let selected = self.mgr.selected() == Some(idx);
+            if let Annotation::Mosaic{ rect, style: crate::annotation::MosaicStyle::Blur{ radius } } = ann {
+                if let Some(img) = image {
+                    let r = egui::Rect::from_min_max(egui::pos2(rect.x as f32/ppp, rect.y as f32/ppp), egui::pos2(rect.right() as f32/ppp, rect.bottom() as f32/ppp));
+                    let radius = radius.max(1.0);
+                    let mut done = false;
+                    if let Some(entry) = self.blur_cache.get_mut(&idx) {
+                        if (entry.radius - radius).abs() < 0.01 && rect.x >= entry.padded_rect.x && rect.y >= entry.padded_rect.y && rect.right() <= entry.padded_rect.right() && rect.bottom() <= entry.padded_rect.bottom() {
+                            let dx = (rect.x - entry.padded_rect.x) as u32;
+                            let dy = (rect.y - entry.padded_rect.y) as u32;
+                            let w = rect.width; let h = rect.height;
+                            let cropped = image::imageops::crop_imm(&entry.blurred, dx, dy, w, h).to_image();
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw());
+                            entry.handle.set(color_image, egui::TextureOptions::LINEAR);
+                            painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
+                            painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                            if selected {
+                                let b = ann.bounds();
+                                let br = egui::Rect::from_min_max(egui::pos2(b.x as f32/ppp, b.y as f32/ppp), egui::pos2(b.right() as f32/ppp, b.bottom() as f32/ppp));
+                                painter.rect_stroke(br, 0.0, egui::Stroke::new(1.0/ppp.max(1.0), egui::Color32::from_rgba_unmultiplied(10,132,255,180)), egui::StrokeKind::Outside);
+                            }
+                            done = true;
+                        }
+                    }
+                    if done { continue; }
+                    // 未命中或半径变化：重算 padded 模糊（方案B stack_blur O(1)）
+                    let padded = padded_rect_for_blur(*rect, img);
+                    if padded.width >= 2 && padded.height >= 2 {
+                        let x0 = padded.x as u32; let y0 = padded.y as u32;
+                        let pw = padded.width; let ph = padded.height;
+                        let mut patch = image::imageops::crop_imm(img, x0, y0, pw, ph).to_image();
+                        stack_blur_rgba(&mut patch, radius as u32);
+                        // 缓存整块 padded 模糊
+                        let entry_exists = self.blur_cache.contains_key(&idx);
+                        let dx = (rect.x - padded.x) as u32; let dy = (rect.y - padded.y) as u32;
+                        let cropped = image::imageops::crop_imm(&patch, dx, dy, rect.width, rect.height).to_image();
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied([rect.width as usize, rect.height as usize], cropped.as_raw());
+                        if entry_exists {
+                            if let Some(entry) = self.blur_cache.get_mut(&idx) {
+                                entry.padded_rect = padded;
+                                entry.radius = radius;
+                                entry.blurred = patch;
+                                entry.handle.set(color_image, egui::TextureOptions::LINEAR);
+                                painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
+                            }
+                        } else {
+                            let handle = ctx.load_texture(format!("blur_cache_{}", idx), color_image, egui::TextureOptions::LINEAR);
+                            let tid = handle.id();
+                            self.blur_cache.insert(idx, BlurCacheEntry{ padded_rect: padded, radius, blurred: patch, handle });
+                            painter.image(tid, r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
+                        }
+                        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                        if selected {
+                            let b = ann.bounds();
+                            let br = egui::Rect::from_min_max(egui::pos2(b.x as f32/ppp, b.y as f32/ppp), egui::pos2(b.right() as f32/ppp, b.bottom() as f32/ppp));
+                            painter.rect_stroke(br, 0.0, egui::Stroke::new(1.0/ppp.max(1.0), egui::Color32::from_rgba_unmultiplied(10,132,255,180)), egui::StrokeKind::Outside);
+                        }
+                        continue;
+                    }
+                }
+            }
             draw_annotation(painter, ctx, ann, ppp, selected, image);
         }
         if let Some(state) = &self.editing_text {
@@ -361,7 +432,7 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
                     if let Some(img)=image {
                         let x0=rect.x.clamp(0,img.width() as i32) as u32; let y0=rect.y.clamp(0,img.height() as i32) as u32;
                         let x1=rect.right().clamp(0,img.width() as i32) as u32; let y1=rect.bottom().clamp(0,img.height() as i32) as u32;
-                        if x1>x0 && y1>y0 { let w=x1-x0; let h=y1-y0; let patch=image::imageops::crop_imm(img,x0,y0,w,h).to_image(); let blurred=image::imageops::blur(&patch, radius.max(1.0)); let color_image=egui::ColorImage::from_rgba_unmultiplied([w as usize,h as usize], blurred.as_raw()); let tex=ctx.load_texture(format!("mosaic_blur_{}_{}_{}_{}",rect.x,rect.y,w,h), color_image, egui::TextureOptions::LINEAR); painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); return; }
+                        if x1>x0 && y1>y0 { let w=x1-x0; let h=y1-y0; let mut patch=image::imageops::crop_imm(img,x0,y0,w,h).to_image(); stack_blur_rgba(&mut patch, radius.max(1.0) as u32); let color_image=egui::ColorImage::from_rgba_unmultiplied([w as usize,h as usize], patch.as_raw()); let tex=ctx.load_texture(format!("mosaic_blur_{}_{}_{}_{}",rect.x,rect.y,w,h), color_image, egui::TextureOptions::LINEAR); painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); return; }
                     }
                     painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(70,70,70,230)); painter.text(r.center(), egui::Align2::CENTER_CENTER, "模糊", egui::FontId::proportional(12.0/ppp.max(1.0)), egui::Color32::WHITE); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
                 }
@@ -404,4 +475,38 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
             painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0/ppp.max(1.0), egui::Color32::from_rgba_unmultiplied(10,132,255,180)), egui::StrokeKind::Outside);
         }
     }
+}
+
+fn fast_blur(patch: &image::RgbaImage, radius: f32) -> image::RgbaImage {
+    if radius <= 1.5 {
+        return image::imageops::blur(patch, radius);
+    }
+    let (w, h) = patch.dimensions();
+    let factor = if radius > 16.0 { 4 } else if radius > 8.0 { 2 } else { 1 };
+    if factor == 1 {
+        return image::imageops::blur(patch, radius);
+    }
+    let small_w = (w / factor).max(1);
+    let small_h = (h / factor).max(1);
+    let small = image::imageops::resize(patch, small_w, small_h, image::imageops::FilterType::Triangle);
+    let blurred_small = image::imageops::blur(&small, radius / factor as f32);
+    image::imageops::resize(&blurred_small, w, h, image::imageops::FilterType::Triangle)
+}
+
+fn padded_rect_for_blur(rect: Rect, image: &image::RgbaImage) -> Rect {
+    let pad_w = (rect.width as f32 * 0.3).max(24.0) as i32;
+    let pad_h = (rect.height as f32 * 0.3).max(24.0) as i32;
+    let x0 = (rect.x - pad_w).max(0);
+    let y0 = (rect.y - pad_h).max(0);
+    let x1 = (rect.right() + pad_w).min(image.width() as i32);
+    let y1 = (rect.bottom() + pad_h).min(image.height() as i32);
+    Rect::from_points(x0, y0, x1, y1)
+}
+
+fn stack_blur_rgba(patch: &mut image::RgbaImage, radius: u32) {
+    let w = patch.width();
+    let h = patch.height();
+    let stride = w * 4;
+    // libblur stack_blur 要求 radius 2..254，内部会 clamp
+    stack_blur(patch.as_mut(), stride, w, h, radius, FastBlurChannels::Channels4, ThreadingPolicy::Single);
 }

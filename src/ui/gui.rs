@@ -231,7 +231,7 @@ impl GuiState {
             window.as_ref() as &dyn HasDisplayHandle,
             Some(ppp),
             None,
-            Some(1024),
+            Some(4096),
         );
 
         // egui 请求重绘时转发给 winit（egui-winit 0.36 不再自动转发）

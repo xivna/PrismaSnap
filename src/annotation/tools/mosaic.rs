@@ -1,8 +1,10 @@
 //! 马赛克 / 遮挡标注工具（像素化 / 模糊 / 纯色）。
 //!
 //! - 像素化：分块均值（已验证，匿名性高，极快）
-//! - 模糊：`image::imageops::blur` 高斯近似（中等性能，匿名性最好）
+//! - 模糊：`libblur::stack_blur` O(1) 近似高斯（与预览一致，匿名性最好，`Channels4`）
 //! - 纯色：不透明填充（极快，匿名性最好）
+
+use libblur::{stack_blur, FastBlurChannels, ThreadingPolicy};
 
 use crate::annotation::Color;
 use crate::utils::math::Rect;
@@ -66,7 +68,7 @@ pub fn draw_pixelate(img: &mut image::RgbaImage, rect: Rect, block_size: u32) {
     }
 }
 
-/// 高斯模糊（`image::imageops::blur`，sigma≈半径）。
+/// 高斯模糊（`libblur::stack_blur` O(1) 近似，与预览一致）。
 pub fn draw_blur(img: &mut image::RgbaImage, rect: Rect, radius: f32) {
     let x0 = rect.x.clamp(0, img.width() as i32);
     let y0 = rect.y.clamp(0, img.height() as i32);
@@ -78,12 +80,12 @@ pub fn draw_blur(img: &mut image::RgbaImage, rect: Rect, radius: f32) {
     let w = (x1 - x0) as u32;
     let h = (y1 - y0) as u32;
     let mut patch = image::imageops::crop_imm(img, x0 as u32, y0 as u32, w, h).to_image();
-    // image::imageops::blur 内部对 alpha 也做卷积，适合遮挡
-    let blurred = image::imageops::blur(&patch, radius.max(1.0));
+    // StackBlur 近似高斯，O(1)/px，视觉与高斯几乎一致，Channels4 含 alpha
+    let r = radius.max(1.0) as u32;
+    stack_blur(patch.as_mut(), w * 4, w, h, r.clamp(2, 254), FastBlurChannels::Channels4, ThreadingPolicy::Single);
     for y in 0..h {
         for x in 0..w {
-            *img.get_pixel_mut((x0 as u32) + x, (y0 as u32) + y) = *blurred.get_pixel(x, y);
-            let _ = &mut patch;
+            *img.get_pixel_mut((x0 as u32) + x, (y0 as u32) + y) = *patch.get_pixel(x, y);
         }
     }
 }
