@@ -21,8 +21,20 @@ half = "2"
 # 图像处理与 PNG/JPEG 编解码（纯 Rust，跨平台）。
 # 精简 features：默认会拉 exr/avif/tiff/webp 等大量 codec，只用 png/jpeg 以缩短交叉编译时间。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 异步运行时（Phase 4：LLM/翻译后台任务 + EventLoopProxy 回传，见 AGENTS.md 3.10）。
+# full 特性：net/time/sync/macros 等一次配齐，避免后续逐个补。
+tokio = { version = "1", features = ["full"] }
+# async trait 对象安全（Box<dyn TranslationBackend>，见 AGENTS.md 3.8）。
+async-trait = "0.1"
+# LLM HTTP 客户端（OpenAI 兼容，双后端共用；default-features 关闭省编译量，
+# json 用于宽松解析，rustls-tls 用于云端 https——纯 Rust TLS，C 交叉环境见
+# .cargo/config.toml 与 AGENTS.md 5.1）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 裁剪图 base64 data URL（多模态请求组包）。
+base64 = "0.22"
 # 配置序列化（TOML 配置文件）
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 # 结构化日志（控制台 + 文件输出）
 tracing = "0.1"

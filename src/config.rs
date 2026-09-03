@@ -24,8 +24,12 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// 界面外观。
     pub ui: UiConfig,
-    /// LLM API 配置（Phase 4 使用，先定义结构）。
+    /// LLM API 配置（旧 `[llm]` 段，仅为向后兼容保留读取；新配置走 `translate.text_llm`）。
     pub llm: LlmConfig,
+    /// OCR 引擎配置（见 AGENTS.md 3.8 节）。
+    pub ocr: OcrConfig,
+    /// 翻译管线配置（见 AGENTS.md 3.8 节）。
+    pub translate: TranslateConfig,
 }
 
 impl Default for Config {
@@ -39,6 +43,8 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             ui: UiConfig::default(),
             llm: LlmConfig::default(),
+            ocr: OcrConfig::default(),
+            translate: TranslateConfig::default(),
         }
     }
 }
@@ -117,6 +123,10 @@ pub struct CaptureConfig {
 }
 
 /// LLM API 配置（OpenAI 兼容格式，支持本地 llama.cpp 等）。
+///
+/// 旧 `[llm]` 段结构，仅为向后兼容保留：`Config::load` 会在新字段仍为默认值时
+/// 把这里的值迁移到 `translate.text_llm` / `translate.target_lang`（见
+/// [`Config::migrate_legacy_llm`]）。新代码一律读写 `TranslateConfig`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
@@ -141,6 +151,153 @@ impl Default for LlmConfig {
     }
 }
 
+/// OCR 引擎选择（AGENTS.md 3.8 节；TOML 里蛇形小写，如 `engine = "rapidocr"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrEngineKind {
+    /// 自动：`RapidOcrEngine` 可用（`plugins/ocr/` 模型齐全）则用它，否则退回系统 OCR。
+    #[default]
+    Auto,
+    /// 强制使用系统 OCR（`Windows.Media.Ocr`，内置兜底）。
+    System,
+    /// 强制使用 RapidOCR 插件；模型缺失时 OCR 不可用（调用方按降级链提示）。
+    Rapidocr,
+}
+
+/// OCR 引擎配置。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OcrConfig {
+    /// 引擎选择（默认 `auto`）。
+    pub engine: OcrEngineKind,
+}
+
+/// 翻译工作模式（设置菜单三选一，默认 `auto`，见 AGENTS.md 3.8 节）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslateMode {
+    /// 按 OCR 置信度自动分流（默认）：高置信走纯文本，低置信走裁剪多模态。
+    #[default]
+    Auto,
+    /// 区域裁剪 → 多模态 LLM（识别 + 翻译一体）。
+    CropMultimodal,
+    /// OCR 识别 → 纯文本 LLM 翻译。
+    OcrText,
+}
+
+/// 多模态 LLM 配置模式（设置页"多模态LLM"卡片三选一，默认与基础相同）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultimodalMode {
+    /// 与基础 LLM 相同（默认）：多模态请求复用 `text_llm` 的 URL/Key/Model。
+    #[default]
+    SameAsText,
+    /// 不配置多模态大模型：模式一不可用，Auto 退化为纯模式二。
+    Disabled,
+    /// 自定义：使用本结构体内独立的 URL/Key/Model。
+    Custom,
+}
+
+/// 单个 LLM 后端接入点（OpenAI 兼容，URL 含 `/v1/chat/completions` 路径）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmEndpoint {
+    /// API 完整地址。
+    pub api_url: String,
+    /// API Key（本地服务可留空）。
+    pub api_key: String,
+    /// 模型名。
+    pub model: String,
+}
+
+impl Default for LlmEndpoint {
+    fn default() -> Self {
+        Self {
+            api_url: String::from("http://127.0.0.1:8080/v1/chat/completions"),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+/// 多模态 LLM 配置（设置页新增卡片，基础卡片保持不动，见 AGENTS.md 3.8 节）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultimodalLlmConfig {
+    /// 三选一模式（默认 `same_as_text`）。
+    pub mode: MultimodalMode,
+    /// 自定义 API 地址（仅 `mode = custom` 时生效）。
+    pub api_url: String,
+    /// 自定义 API Key（仅 `mode = custom` 时生效）。
+    pub api_key: String,
+    /// 自定义模型名（仅 `mode = custom` 时生效）。
+    pub model: String,
+}
+
+impl Default for MultimodalLlmConfig {
+    fn default() -> Self {
+        Self {
+            mode: MultimodalMode::SameAsText,
+            api_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+/// 默认翻译目标语言。
+pub const DEFAULT_TARGET_LANG: &str = "简体中文";
+
+/// 默认 Auto 模式置信度阈值（低于此值的区域走裁剪多模态路径）。
+pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.85;
+
+/// 翻译管线配置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranslateConfig {
+    /// 工作模式（默认 `auto`）。
+    pub mode: TranslateMode,
+    /// 翻译目标语言（默认简体中文）。
+    pub target_lang: String,
+    /// Auto 模式置信度阈值（0.5~0.95，默认 0.85）。
+    pub confidence_threshold: f32,
+    /// 文本翻译后端（= 设置页基础 LLM 卡片）。
+    pub text_llm: LlmEndpoint,
+    /// 多模态后端（= 设置页新增多模态卡片）。
+    pub multimodal_llm: MultimodalLlmConfig,
+}
+
+impl Default for TranslateConfig {
+    fn default() -> Self {
+        Self {
+            mode: TranslateMode::Auto,
+            target_lang: String::from(DEFAULT_TARGET_LANG),
+            confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            text_llm: LlmEndpoint::default(),
+            multimodal_llm: MultimodalLlmConfig::default(),
+        }
+    }
+}
+
+impl TranslateConfig {
+    /// 当前生效的多模态后端配置。
+    ///
+    /// - `SameAsText`（默认）：复用 `text_llm`；
+    /// - `Custom`：使用 `multimodal_llm` 自带的 URL/Key/Model；
+    /// - `Disabled`：返回 `None`，调用方应禁用模式一、Auto 按纯模式二跑。
+    pub fn effective_multimodal(&self) -> Option<LlmEndpoint> {
+        match self.multimodal_llm.mode {
+            MultimodalMode::SameAsText => Some(self.text_llm.clone()),
+            MultimodalMode::Custom => Some(LlmEndpoint {
+                api_url: self.multimodal_llm.api_url.clone(),
+                api_key: self.multimodal_llm.api_key.clone(),
+                model: self.multimodal_llm.model.clone(),
+            }),
+            MultimodalMode::Disabled => None,
+        }
+    }
+}
+
 impl Config {
     /// 默认配置文件路径：可执行文件同目录下的 `config.toml`（便携模式）。
     pub fn default_path() -> anyhow::Result<PathBuf> {
@@ -158,8 +315,34 @@ impl Config {
             return Ok(config);
         }
         let text = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&text)?;
+        let mut config: Config = toml::from_str(&text)?;
+        config.migrate_legacy_llm();
         Ok(config)
+    }
+
+    /// 把旧 `[llm]` 段迁移到新 `[translate]` 结构（向后兼容）。
+    ///
+    /// 仅当新字段仍为默认值时才迁移（新配置优先，老用户配置不丢失）；
+    /// 全新默认文件（新旧皆默认）走个过场，不改变任何值。
+    fn migrate_legacy_llm(&mut self) {
+        if self.llm == LlmConfig::default() {
+            return;
+        }
+        let legacy_endpoint = LlmEndpoint {
+            api_url: self.llm.api_url.clone(),
+            api_key: self.llm.api_key.clone(),
+            model: self.llm.model.clone(),
+        };
+        if self.translate.text_llm == LlmEndpoint::default()
+            && legacy_endpoint != LlmEndpoint::default()
+        {
+            self.translate.text_llm = legacy_endpoint;
+        }
+        if self.translate.target_lang == DEFAULT_TARGET_LANG
+            && self.llm.translate_target != DEFAULT_TARGET_LANG
+        {
+            self.translate.target_lang = self.llm.translate_target.clone();
+        }
     }
 
     /// 把配置序列化为 TOML 写入指定路径（原子写：先写临时文件再改名）。
@@ -239,6 +422,110 @@ model = "gpt-4o"
         let path = temp_config_path("atomic");
         Config::default().save(&path).unwrap();
         assert!(!path.with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn translate_defaults_match_spec() {
+        let t = TranslateConfig::default();
+        assert_eq!(t.mode, TranslateMode::Auto);
+        assert_eq!(t.target_lang, "简体中文");
+        assert!((t.confidence_threshold - 0.85).abs() < f32::EPSILON);
+        assert_eq!(t.multimodal_llm.mode, MultimodalMode::SameAsText);
+        assert_eq!(Config::default().ocr.engine, OcrEngineKind::Auto);
+    }
+
+    #[test]
+    fn multimodal_same_as_text_reuses_text_llm() {
+        let mut config = Config::default();
+        config.translate.text_llm.model = String::from("gpt-4o");
+        let effective = config
+            .translate
+            .effective_multimodal()
+            .expect("默认应复用基础配置");
+        assert_eq!(effective.model, "gpt-4o");
+        assert_eq!(effective.api_url, config.translate.text_llm.api_url);
+    }
+
+    #[test]
+    fn multimodal_disabled_returns_none() {
+        let mut config = Config::default();
+        config.translate.multimodal_llm.mode = MultimodalMode::Disabled;
+        assert!(config.translate.effective_multimodal().is_none());
+    }
+
+    #[test]
+    fn multimodal_custom_returns_custom_endpoint() {
+        let mut config = Config::default();
+        config.translate.multimodal_llm.mode = MultimodalMode::Custom;
+        config.translate.multimodal_llm.model = String::from("qwen-vl-max");
+        let effective = config
+            .translate
+            .effective_multimodal()
+            .expect("自定义模式应返回独立配置");
+        assert_eq!(effective.model, "qwen-vl-max");
+    }
+
+    #[test]
+    fn legacy_llm_section_migrates_to_translate() {
+        let path = temp_config_path("legacy_llm");
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+api_url = "http://192.168.1.10:8080/v1/chat/completions"
+model = "qwen2.5"
+translate_target = "English"
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.translate.text_llm.api_url,
+            "http://192.168.1.10:8080/v1/chat/completions"
+        );
+        assert_eq!(loaded.translate.text_llm.model, "qwen2.5");
+        assert_eq!(loaded.translate.target_lang, "English");
+        // 多模态缺省即与基础相同
+        assert_eq!(
+            loaded.translate.multimodal_llm.mode,
+            MultimodalMode::SameAsText
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_style_config_wins_over_legacy() {
+        let path = temp_config_path("new_wins");
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+model = "old-model"
+
+[translate.text_llm]
+model = "new-model"
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.translate.text_llm.model, "new-model");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multimodal_mode_serde_roundtrip() {
+        let path = temp_config_path("mm_mode");
+        let mut config = Config::default();
+        config.translate.multimodal_llm.mode = MultimodalMode::Disabled;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("disabled"), "TOML 应序列化为 snake_case: {text}");
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.translate.multimodal_llm.mode,
+            MultimodalMode::Disabled
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

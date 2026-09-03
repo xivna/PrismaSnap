@@ -173,6 +173,25 @@ pub fn draw_text_in_rect(
     }
 }
 
+/// 测量单行文本宽度（物理像素），供翻译渲染字号自适应等调用方复用同一字体链路。
+///
+/// 与 [`draw_text_in_rect`] 用同一字体选择（粗体优先 `msyhbd`，缺失则模拟加粗约 +0.9px）；
+/// 找不到任何系统字体时回退按"0.6 倍字号每字"估算（WSL2 等无 CJK 环境仍可跑通逻辑）。
+pub fn measure_line_width(line: &str, font_size: f32, bold: bool) -> f32 {
+    let font_size = font_size.clamp(8.0, 120.0);
+    if line.is_empty() {
+        return 0.0;
+    }
+    let (font_bytes, simulate_bold) = if bold {
+        if let Some(b) = cjk_font_bytes_bold() { (b, false) } else if let Some(n) = cjk_font_bytes() { (n, true) } else { return line.chars().count() as f32 * font_size * 0.6; }
+    } else if let Some(n) = cjk_font_bytes() { (n, false) } else { return line.chars().count() as f32 * font_size * 0.6; };
+    let font = match FontRef::try_from_slice(font_bytes) { Ok(f) => f, Err(_) => return line.chars().count() as f32 * font_size * 0.6 };
+    let scale = PxScale::from(font_size);
+    let scaled = font.as_scaled(scale);
+    let w: f32 = line.chars().map(|ch| scaled.h_advance(font.glyph_id(ch))).sum();
+    if simulate_bold { w + 0.9 } else { w }
+}
+
 /// 将一行按 max_width 按字符自动换行（返回多行，含原空行）。
 fn wrap_line(line: &str, font: &FontRef, scale: PxScale, max_w: f32) -> Vec<String> {
     if line.is_empty() { return vec![String::new()]; }
@@ -286,5 +305,15 @@ mod tests {
         let (w2, h2) = estimate_text_size("Hi\n世界", 20.0);
         assert!(h2 > h1);
         assert!(w2 >= w1);
+    }
+
+    #[test]
+    fn measure_width_scales_with_font_size() {
+        let w16 = measure_line_width("Hello世界", 16.0, false);
+        let w32 = measure_line_width("Hello世界", 32.0, false);
+        assert!(w16 > 0.0);
+        // 同一字体链路下 advance 随字号线性缩放（模拟加粗 +0.9px，留容差）
+        assert!((w32 / w16 - 2.0).abs() < 0.15, "w16={w16} w32={w32}");
+        assert_eq!(measure_line_width("", 16.0, false), 0.0);
     }
 }

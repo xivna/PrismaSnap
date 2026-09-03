@@ -7,6 +7,8 @@ pub mod annotation;
 pub mod capture;
 pub mod config;
 pub mod llm;
+pub mod ocr;
+pub mod translate;
 pub mod ui;
 pub mod utils;
 

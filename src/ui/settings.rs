@@ -25,7 +25,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{Config, SaveFormat, SaveMode, Theme};
+use crate::config::{Config, MultimodalMode, OcrEngineKind, SaveFormat, SaveMode, Theme, TranslateMode};
+use crate::ocr::create_engine;
 
 use super::gui::{palette, GuiState, Palette};
 
@@ -450,6 +451,7 @@ fn draw_save(
                     ("静默保存", SaveMode::Silent),
                     ("每次询问", SaveMode::AlwaysAsk),
                 ],
+                56.0,
                 &mut draft.save.mode,
             );
         });
@@ -471,6 +473,7 @@ fn draw_save(
                 ui,
                 pal,
                 &[("PNG", SaveFormat::Png), ("JPEG", SaveFormat::Jpeg)],
+                56.0,
                 &mut draft.save.format,
             );
         });
@@ -506,20 +509,23 @@ fn draw_appearance(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed
                 ui,
                 pal,
                 &[("浅色", Theme::Light), ("深色", Theme::Dark)],
+                56.0,
                 &mut draft.ui.theme,
             );
         });
     });
 }
 
-/// 「AI 接口」分区：URL / Key / 模型 / 翻译目标。
+/// 「AI 接口」分区：基础 LLM（文本翻译后端，布局保持不动）+ 多模态 LLM
+/// （三选一）+ 翻译模式 + OCR 引擎（见 AGENTS.md 3.8 节）。
 fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut bool) {
+    // 卡片一：基础 LLM（即文本翻译后端；行布局保持不动，只改绑定到新配置）。
     card(ui, pal, |ui| {
         setting_row(ui, "API 地址", |ui| {
             *changed |= ui
                 .add_sized(
                     [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.llm.api_url)
+                    egui::TextEdit::singleline(&mut draft.translate.text_llm.api_url)
                         .hint_text("http://127.0.0.1:8080/v1/chat/completions"),
                 )
                 .changed();
@@ -529,7 +535,7 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
             *changed |= ui
                 .add_sized(
                     [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.llm.api_key).password(true),
+                    egui::TextEdit::singleline(&mut draft.translate.text_llm.api_key).password(true),
                 )
                 .changed();
         });
@@ -538,7 +544,7 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
             *changed |= ui
                 .add_sized(
                     [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.llm.model),
+                    egui::TextEdit::singleline(&mut draft.translate.text_llm.model),
                 )
                 .changed();
         });
@@ -547,10 +553,163 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
             *changed |= ui
                 .add_sized(
                     [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.llm.translate_target)
+                    egui::TextEdit::singleline(&mut draft.translate.target_lang)
                         .hint_text("简体中文"),
                 )
                 .changed();
+        });
+    });
+    ui.add_space(12.0);
+
+    // 卡片二：多模态 LLM（三选一，默认与基础相同；自定义时展开独立配置）。
+    card(ui, pal, |ui| {
+        setting_row(ui, "多模态", |ui| {
+            *changed |= segmented(
+                ui,
+                pal,
+                &[
+                    ("与基础相同", MultimodalMode::SameAsText),
+                    ("不配置", MultimodalMode::Disabled),
+                    ("自定义", MultimodalMode::Custom),
+                ],
+                80.0,
+                &mut draft.translate.multimodal_llm.mode,
+            );
+        });
+        if draft.translate.multimodal_llm.mode == MultimodalMode::Custom {
+            row_separator(ui, pal);
+            setting_row(ui, "API 地址", |ui| {
+                *changed |= ui
+                    .add_sized(
+                        [240.0, 24.0],
+                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.api_url)
+                            .hint_text("多模态模型地址"),
+                    )
+                    .changed();
+            });
+            row_separator(ui, pal);
+            setting_row(ui, "API Key", |ui| {
+                *changed |= ui
+                    .add_sized(
+                        [240.0, 24.0],
+                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.api_key)
+                            .password(true),
+                    )
+                    .changed();
+            });
+            row_separator(ui, pal);
+            setting_row(ui, "模型", |ui| {
+                *changed |= ui
+                    .add_sized(
+                        [240.0, 24.0],
+                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.model)
+                            .hint_text("如 qwen-vl-max"),
+                    )
+                    .changed();
+            });
+        }
+    });
+    ui.add_space(12.0);
+
+    // 卡片三：翻译模式（三选一，默认自动；Auto 才显示阈值滑块；
+    // "?" 按钮点出悬浮窗介绍各选项含义）。
+    card(ui, pal, |ui| {
+        setting_row(ui, "翻译模式", |ui| {
+            // 右对齐行内先加 "?"（最右侧），再加分段按钮组（其左侧）。
+            let tip = ui.small_button("?");
+            *changed |= segmented(
+                ui,
+                pal,
+                &[
+                    ("自动", TranslateMode::Auto),
+                    ("OCR 文本", TranslateMode::OcrText),
+                    ("裁剪多模态", TranslateMode::CropMultimodal),
+                ],
+                80.0,
+                &mut draft.translate.mode,
+            );
+            egui::Popup::menu(&tip).show(|ui| {
+                ui.set_width(300.0);
+                ui.label(egui::RichText::new("翻译模式说明").size(12.5).strong());
+                ui.separator();
+                for (i, (name, desc)) in [
+                    ("自动", "按置信度分流，有把握走纯文本，没把握裁剪给多模态（默认）"),
+                    ("OCR 文本", "先识别再整体翻译，快、便宜，适合界面文档等标准字体"),
+                    ("裁剪多模态", "逐框裁剪给多模态识别+翻译，艺术字更准，但贵而慢"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    ui.label(egui::RichText::new(*name).size(12.5).strong());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(*desc).size(12.0).color(pal.secondary),
+                        )
+                        .wrap(),
+                    );
+                }
+            });
+        });
+        if draft.translate.mode == TranslateMode::Auto {
+            row_separator(ui, pal);
+            setting_row(ui, "置信度阈值", |ui| {
+                *changed |= ui
+                    .add_sized(
+                        [160.0, 24.0],
+                        egui::Slider::new(&mut draft.translate.confidence_threshold, 0.5..=0.95)
+                            .show_value(true),
+                    )
+                    .changed();
+            });
+        }
+        // 多模态未配置却选了裁剪模式：行内警告（功能侧同样会降级，见 3.8 节）。
+        if draft.translate.mode == TranslateMode::CropMultimodal
+            && draft.translate.multimodal_llm.mode == MultimodalMode::Disabled
+        {
+            row_separator(ui, pal);
+            setting_row(ui, "提示", |ui| {
+                ui.label(
+                    egui::RichText::new("多模态未配置，该模式不可用")
+                        .size(12.5)
+                        .color(egui::Color32::from_rgb(255, 69, 58)),
+                );
+            });
+        }
+    });
+    ui.add_space(12.0);
+
+    // 卡片四：OCR 引擎（自动优先插件 + 状态行）。
+    card(ui, pal, |ui| {
+        setting_row(ui, "OCR 引擎", |ui| {
+            *changed |= segmented(
+                ui,
+                pal,
+                &[
+                    ("自动", OcrEngineKind::Auto),
+                    ("系统", OcrEngineKind::System),
+                    ("插件", OcrEngineKind::Rapidocr),
+                ],
+                56.0,
+                &mut draft.ocr.engine,
+            );
+        });
+        row_separator(ui, pal);
+        let engine = create_engine(&draft.ocr.engine);
+        let (status, ok) = if engine.is_available() {
+            (format!("当前引擎：{}（可用）", engine.name()), true)
+        } else {
+            (format!("当前引擎：{}（不可用）", engine.name()), false)
+        };
+        setting_row(ui, "OCR 状态", |ui| {
+            let color = if ok {
+                egui::Color32::from_rgb(52, 199, 89)
+            } else {
+                egui::Color32::from_rgb(255, 69, 58)
+            };
+            ui.label(egui::RichText::new(status).size(12.5).color(color));
         });
     });
 }
@@ -590,10 +749,15 @@ fn row_separator(ui: &mut egui::Ui, pal: &Palette) {
 }
 
 /// 分段选择器（macOS 胶囊组），返回是否变更。
+///
+/// `button_width` 为整排统一固定宽度——各选项按内容自适应时，选中加粗与
+/// 长标签（如"与基础相同"）会让整排宽度随状态抖动（2026-09-03 用户实机反馈），
+/// 固定宽度后各态尺寸恒定。
 fn segmented<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
     pal: &Palette,
     options: &[(&str, T)],
+    button_width: f32,
     value: &mut T,
 ) -> bool {
     let mut changed = false;
@@ -617,9 +781,8 @@ fn segmented<T: PartialEq + Copy>(
                         egui::Color32::TRANSPARENT
                     })
                     .stroke(egui::Stroke::NONE)
-                    .corner_radius(6.0)
-                    .min_size(egui::vec2(56.0, 20.0));
-                if ui.add(btn).clicked() {
+                    .corner_radius(6.0);
+                if ui.add_sized(egui::vec2(button_width, 20.0), btn).clicked() {
                     *value = *v;
                     changed = true;
                 }
