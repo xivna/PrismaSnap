@@ -77,6 +77,10 @@ rfd = { version = "0.17", default-features = false, features = ["common-controls
 #   - Win32_System_Threading  CreateMutexW（单实例检测）
 #   - Win32_UI_WindowsAndMessaging  GetCursorPos / PeekMessageW 消息泵
 #   - Win32_System_WinRT      RoInitialize（HDR 相关 WinRT 调用兜底）
+#   - Media_Ocr + Graphics_Imaging + Globalization + Storage_Streams + Foundation
+#                             系统 OCR：OcrEngine::RecognizeAsync（SoftwareBitmap 经
+#                             DataWriter 灌 BGRA 字节）+ OcrWord::BoundingRect 取词框
+#                             （2026-09-03，Phase 4 #3；API 形状已对 0.62.2 文档核实）
 # 版本须与 windows-capture 依赖的 windows 0.62 对齐。
 windows = { version = "0.62", features = [
     "Win32_Devices_Display",
@@ -89,6 +93,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_WinRT",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Globalization",
+    "Storage_Streams",
+    "Foundation",
 ] }
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -90,6 +90,35 @@ impl TextBlock {
     }
 }
 
+/// 词间拼接：CJK 相邻不加空格，其余加空格。
+///
+/// WinRT OCR 按词输出（无行文本），行内空格需按字符集还原；
+/// RapidOCR 识别输出同样可经此归一化（跨平台纯函数，可单测）。
+pub(crate) fn join_words(words: &[String]) -> String {
+    let mut out = String::new();
+    let mut prev_cjk = false;
+    let mut first = true;
+    for w in words {
+        let cur_cjk = w.chars().next().is_some_and(is_cjk);
+        if !first && !(prev_cjk && cur_cjk) {
+            out.push(' ');
+        }
+        out.push_str(w);
+        prev_cjk = w.chars().last().is_some_and(is_cjk);
+        first = false;
+    }
+    out
+}
+
+/// 是否 CJK 字符（中日韩统一表意 + 假名 + 韩文 + 全角标点）。
+fn is_cjk(ch: char) -> bool {
+    matches!(ch,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{20000}'..='\u{2A6DF}'
+        | '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'
+        | '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}'
+        | '\u{FF00}'..='\u{FFEF}')
+}
+
 /// 最终带译文的区域，供渲染层消费（背景擦除 + 译文覆盖，见 AGENTS.md 3.8 节）。
 #[derive(Debug, Clone)]
 pub struct TranslatedRegion {
@@ -216,6 +245,23 @@ mod tests {
     fn plugin_dir_is_under_exe_dir() {
         let dir = ocr_plugin_dir().unwrap();
         assert!(dir.ends_with(std::path::Path::new("plugins/ocr")));
+    }
+
+    #[test]
+    fn cjk_joins_without_space() {
+        assert_eq!(join_words(&["你好".into(), "世界".into()]), "你好世界");
+    }
+
+    #[test]
+    fn latin_joins_with_space() {
+        assert_eq!(join_words(&["Hello".into(), "world".into()]), "Hello world");
+    }
+
+    #[test]
+    fn mixed_boundary_gets_space() {
+        // "中文" + "ABC"：边界中→拉丁，加空格
+        assert_eq!(join_words(&["中文".into(), "ABC".into()]), "中文 ABC");
+        assert_eq!(join_words(&["ABC".into(), "中文".into()]), "ABC 中文");
     }
 
     /// trait 对象安全与线程安全约束的编译期断言（含 mock 实现）。
