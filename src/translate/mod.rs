@@ -213,6 +213,61 @@ impl TranslatePipeline {
     }
 }
 
+/// 译文按原文行数断行（跨平台纯函数，可单测）。
+///
+/// LLM 常把多行原文译成单行字符串，直接渲染就是一条横贯的长行、与原文
+/// 段落脱节。规则保守：**仅当译文为单行且原文有多行时**，按显示宽度贪心
+/// 均分成同样行数；其余情况（译文自带换行/单行原文）原样返回。
+/// 字符显示宽度按 CJK=1、其余=0.55 估算（精确贴合由下游 fit+wrap 保证）。
+pub fn match_source_lines(translated: &str, line_count: usize) -> String {
+    if line_count <= 1 || translated.contains('\n') {
+        return translated.to_string();
+    }
+    let chars: Vec<char> = translated.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return String::new();
+    }
+    let total: f32 = chars.iter().map(|&c| char_units(c)).sum();
+    let per_line = total / line_count as f32;
+    let mut boundaries: Vec<usize> = Vec::new();
+    let mut acc = 0.0;
+    for (i, &ch) in chars.iter().enumerate() {
+        acc += char_units(ch);
+        // 当前行达配额、行数未用完、且剩余字够填满剩余行（每行至少 1 字）才断
+        // （`acc` 断行后清零，故配额为相对当前行起点的 `per_line`）
+        if boundaries.len() + 1 < line_count
+            && acc >= per_line
+            && n - (i + 1) >= line_count - boundaries.len() - 1
+        {
+            boundaries.push(i + 1);
+            acc = 0.0;
+        }
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(line_count);
+    let mut start = 0;
+    for b in boundaries {
+        lines.push(chars[start..b].iter().collect());
+        start = b;
+    }
+    lines.push(chars[start..].iter().collect());
+    lines.join("\n")
+}
+
+/// 字符显示宽度单位（CJK 全角=1，其余半角≈0.55），断行估算用。
+fn char_units(ch: char) -> f32 {
+    if matches!(ch,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{20000}'..='\u{2A6DF}'
+        | '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'
+        | '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}'
+        | '\u{FF00}'..='\u{FFEF}')
+    {
+        1.0
+    } else {
+        0.55
+    }
+}
+
 /// 按全图 bbox（含外扩）在图内裁剪（`origin` 为图相对全图的原点）；完全越界返回 `None`。
 pub fn crop_region(
     image: &image::DynamicImage,
@@ -253,6 +308,8 @@ fn assemble_with_original(
     if translated.trim().is_empty() {
         return None;
     }
+    // 单行译文按原文行数断行（多行原文被 LLM 压成一行时恢复段落结构）
+    let translated = match_source_lines(&translated, block.regions.len());
     // 图内本地框（采样/裁剪用），越界钳制由采样函数处理
     let local = BBox {
         x: (block.bbox.x as i32 - origin.0).max(0) as u32,
@@ -504,8 +561,27 @@ mod tests {
     }
 
     #[test]
-    fn crop_region_clamps_and_rejects_oob() {
-        let img = fixture_image();
+    fn single_line_splits_to_source_line_count() {
+        // 3 行原文被压成单行 → 恢复 3 行，不丢字
+        let out = match_source_lines("按年龄和新加坡各行业薪资二十五岁", 3);
+        assert_eq!(out.lines().count(), 3, "{out:?}");
+        assert_eq!(out.replace('\n', ""), "按年龄和新加坡各行业薪资二十五岁");
+    }
+
+    #[test]
+    fn multiline_translation_is_respected() {
+        assert_eq!(match_source_lines("甲\n乙", 3), "甲\n乙");
+        assert_eq!(match_source_lines("单行", 1), "单行");
+        assert_eq!(match_source_lines("", 3), "");
+    }
+
+    #[test]
+    fn ascii_splits_evenly() {
+        assert_eq!(match_source_lines("abcdefgh", 2), "abcd\nefgh");
+    }
+
+    #[test]
+    fn crop_region_clamps_and_rejects_oob() {        let img = fixture_image();
         // 部分越界 → 钳制后 Some（含 4px 外扩）
         let c = crop_region(&img, &BBox { x: 150, y: 80, width: 100, height: 50 }, (0, 0)).unwrap();
         assert_eq!((c.width(), c.height()), (54, 24));

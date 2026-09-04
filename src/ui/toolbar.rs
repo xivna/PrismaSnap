@@ -161,6 +161,10 @@ pub enum ToolbarAction {
     Copy,
     Save,
     Cancel,
+    /// OCR 全量识别选区文字（结果进可编辑面板）。
+    ExtractText,
+    /// 按配置模式翻译并原位覆盖（见 AGENTS.md 3.8 节）。
+    Translate,
 }
 
 /// 绘制工具条，返回本帧被点击的动作（无点击返回 `None`）。
@@ -169,6 +173,7 @@ pub enum ToolbarAction {
 /// * `active_tool` - 当前激活的标注工具（高亮显示）;
 /// * `stroke_color` / `stroke_width` - 当前颜色与线宽（第二行选中高亮）；
 /// * `can_undo` / `can_redo` - 撤销/重做按钮可用状态；
+/// * `ai_busy` - AI 任务（识别/翻译）进行中时禁用提取/翻译按钮，防重复提交；
 /// * `actual_rect` - 输出本帧工具条的**实际**渲染矩形（egui 逻辑点），
 ///   调用方用于遮罩挖洞（[`crate::ui::overlay`]），与估算尺寸 [`BAR_SIZE`]
 ///   相比这才是真实边界。
@@ -184,6 +189,7 @@ pub fn toolbar_ui(
     text_bold: bool,
     can_undo: bool,
     can_redo: bool,
+    ai_busy: bool,
     actual_rect: &mut Option<egui::Rect>,
 ) -> Option<ToolbarAction> {
     use crate::annotation::Tool;
@@ -253,6 +259,19 @@ pub fn toolbar_ui(
                             }
                             if ui.button("取消").clicked() {
                                 action = Some(ToolbarAction::Cancel);
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(!ai_busy, egui::Button::new("提取文字"))
+                                .clicked()
+                            {
+                                action = Some(ToolbarAction::ExtractText);
+                            }
+                            if ui
+                                .add_enabled(!ai_busy, egui::Button::new("翻译"))
+                                .clicked()
+                            {
+                                action = Some(ToolbarAction::Translate);
                             }
                         });
                         // 第二行：马赛克显示样式切换+参数，其它工具显示颜色+线宽

@@ -5,6 +5,10 @@
 
 pub mod toolbar;
 
+// AI 后台任务（OCR/翻译线程与回传类型，仅 Windows，见 ai.rs）。
+#[cfg(target_os = "windows")]
+pub mod ai;
+
 // 编辑器画布依赖 egui（仅 Windows target 引入），WSL2 下不编译。
 #[cfg(target_os = "windows")]
 pub mod editor;

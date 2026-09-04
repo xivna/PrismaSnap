@@ -24,10 +24,15 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::annotation::{self, Annotation};
+use crate::annotation::tools::text::wrap_text_for_width;
 use crate::config::{Config, SaveFormat, SaveMode};
+use crate::ocr::{TextRegion, TranslatedRegion};
+use crate::translate::merge::merge_regions_into_blocks;
+use crate::translate::render;
 use crate::utils::math::{self, Rect};
 use crate::utils::{clipboard, image_codec, paths, time};
 
+use super::ai::{self, AiDone};
 use super::editor::Editor;
 use super::gui::GuiState;
 use super::toolbar::{self, ToolbarAction};
@@ -41,6 +46,17 @@ enum Mode {
     Preview,
     /// 标注编辑中：选区锁定，画布接受标注笔画，工具条高亮当前工具。
     Edit,
+}
+
+/// AI 任务类型（提取文字 / 翻译共用一次 OCR，结果路由依据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiJob {
+    /// 空闲（无在途任务）。
+    Idle,
+    /// 提取文字（OCR 完成后进可编辑面板）。
+    Extract,
+    /// 翻译（OCR 完成后自动链式进翻译管线）。
+    Translate,
 }
 
 /// 选区最小边长（物理像素），小于此值视为无效拖动。
@@ -97,6 +113,24 @@ pub struct Overlay {
     pub exit_requested: bool,
     /// 双击检测：上次点击时间与命中文本索引
     last_click: Option<(Instant, (f32, f32), usize)>,
+    /// AI 完成回调用（宿主注入：接到 winit `EventLoopProxy`，见 AGENTS.md 3.10）。
+    ai_notify: Option<std::sync::Arc<dyn Fn(AiDone) + Send + Sync>>,
+    /// AI 请求单调序号（选区变化即自增，在途旧结果按号丢弃）。
+    ai_req: u64,
+    /// 当前 AI 任务类型（路由 OCR 完成后的去向）。
+    ai_job: AiJob,
+    /// AI 任务进行中（工具条提取/翻译按钮禁用 + 状态行 Loading）。
+    ai_busy: bool,
+    /// AI 状态行（"识别中…"/"翻译失败：…"，选区变化即清除）。
+    ai_status: Option<String>,
+    /// 提取文字可编辑缓冲（`Some` 即面板可见）。
+    ai_extract: Option<String>,
+    /// 已完成的译文覆盖（全图坐标；预览 egui 绘制 + 导出 CPU 重绘）。
+    ai_translated: Vec<TranslatedRegion>,
+    /// OCR 缓存：产生该结果时的选区（命中才复用，避免重复识别）。
+    ai_cached_sel: Option<Rect>,
+    /// OCR 缓存：全图坐标的识别区域。
+    ai_cached_regions: Vec<TextRegion>,
 }
 
 impl Overlay {
@@ -178,6 +212,15 @@ impl Overlay {
             bar_rect_cache: None,
             exit_requested: false,
             last_click: None,
+            ai_notify: None,
+            ai_req: 0,
+            ai_job: AiJob::Idle,
+            ai_busy: false,
+            ai_status: None,
+            ai_extract: None,
+            ai_translated: Vec::new(),
+            ai_cached_sel: None,
+            ai_cached_regions: Vec::new(),
         })
     }
 
@@ -398,6 +441,7 @@ impl Overlay {
             self.mode = Mode::Preview;
         } else {
             self.selection = None;
+            self.invalidate_ai();
         }
         self.window.request_redraw();
     }
@@ -409,6 +453,7 @@ impl Overlay {
                 Rect::from_points(x0 as i32, y0 as i32, x1 as i32, y1 as i32)
                     .clamp(&self.monitor_rect),
             );
+            self.invalidate_ai();
             self.window.request_redraw();
         }
     }
@@ -428,6 +473,7 @@ impl Overlay {
             }
             .clamp(&self.monitor_rect);
             self.selection = Some(moved);
+            self.invalidate_ai();
             self.window.request_redraw();
         }
     }
@@ -495,8 +541,9 @@ impl Overlay {
 
     /// 裁剪选区图像（物理坐标 = 图像像素坐标，直接裁剪）。
     ///
-    /// 裁剪后把已提交标注 CPU 重绘上去（方案 B 导出端，见
-    /// [`annotation::apply_to_image`]；骨架阶段为接通管线，逐工具落地）。
+    /// 先把译文覆盖 CPU 重绘上去（[`render::render_translated_region`]），再把
+    /// 已提交标注 CPU 重绘上去（方案 B 导出端，见 [`annotation::apply_to_image`]），
+    /// 顺序与预览一致（译文在下、标注在上）。
     fn crop_selection(&self) -> Option<image::RgbaImage> {
         let sel = self.selection?;
         let mut img = image::imageops::crop_imm(
@@ -507,6 +554,9 @@ impl Overlay {
             sel.height,
         )
         .to_image();
+        for r in &self.ai_translated {
+            render::render_translated_region(&mut img, r, false, (sel.x, sel.y));
+        }
         annotation::apply_to_image(&mut img, self.editor.annotations(), (sel.x, sel.y));
         Some(img)
     }
@@ -575,8 +625,14 @@ impl Overlay {
         let monitor_rect = self.monitor_rect;
         // 工具条点击动作在渲染闭包外统一处理（需 &mut self）
         let mut action: Option<ToolbarAction> = None;
+        // 提取面板按钮同样闭包外执行（剪贴板/状态需 &mut self）
+        let mut panel_action: Option<AiPanelAction> = None;
         let theme = self.config.ui.theme;
         let editor = &mut self.editor;
+        let ai_busy = self.ai_busy;
+        let ai_translated = &self.ai_translated;
+        let ai_status = &self.ai_status;
+        let ai_extract = &mut self.ai_extract;
         let window = self.window.clone();
         // 工具条矩形（egui 逻辑点）：遮罩挖洞用，保证工具条浮在原始画面上
         // 而非压暗区内（2026-08-22 用户反馈）。首帧无缓存时暂不挖洞，
@@ -607,6 +663,8 @@ impl Overlay {
                 let img_ref: Option<&image::RgbaImage> = Some(self.image.as_ref());
                 // 同步选区到编辑器用于钳制与裁剪（防止拖出选区外遮挡工具条）
                 editor.set_selection(selection);
+                // 译文覆盖预览（用户标注之下；导出时同顺序重绘，保证一致）
+                Self::draw_translated_preview(&painter, ppp, ai_translated);
                 editor.draw_annotations(&painter, &ctx, ppp, img_ref);
             }
             // 工具条：Preview / Edit 均显示（Selecting 不显示）
@@ -624,8 +682,84 @@ impl Overlay {
                     editor.text_bold(),
                     editor.can_undo(),
                     editor.can_redo(),
+                    ai_busy,
                     &mut bar_actual,
                 );
+            }
+            // AI 状态行（Loading/错误/完成提示，浮在选区左上外侧，空间不足压进选区内）
+            if let Some(status) = ai_status {
+                if let Some(sel) = selection {
+                    let ppp = ui.ctx().pixels_per_point();
+                    let sx = sel.x as f32 / ppp;
+                    let top = monitor_rect.y as f32 / ppp;
+                    let mut sy = sel.y as f32 / ppp - 30.0;
+                    if sy < top {
+                        sy = sel.y as f32 / ppp + 4.0;
+                    }
+                    egui::Area::new(egui::Id::new("ai_status"))
+                        .fixed_pos(egui::pos2(sx, sy))
+                        .order(egui::Order::Tooltip)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_black_alpha(200))
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(status.as_str())
+                                            .color(egui::Color32::WHITE)
+                                            .size(13.0),
+                                    );
+                                });
+                        });
+                }
+            }
+            // 提取文字面板（可编辑 + 一键复制 + 关闭，浮在选区左上内侧）
+            if let Some(buf) = ai_extract {
+                if let Some(sel) = selection {
+                    let ppp = ui.ctx().pixels_per_point();
+                    let pos =
+                        egui::pos2(sel.x as f32 / ppp + 6.0, sel.y as f32 / ppp + 28.0);
+                    egui::Area::new(egui::Id::new("ai_extract"))
+                        .fixed_pos(pos)
+                        .order(egui::Order::Tooltip)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(ui.visuals().window_fill())
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().window_stroke().color,
+                                ))
+                                .corner_radius(10.0)
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_min_size(egui::vec2(360.0, 200.0));
+                                    ui.set_max_size(egui::vec2(360.0, 280.0));
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("提取文字")
+                                                .strong()
+                                                .size(14.0),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::multiline(buf)
+                                                .desired_width(340.0)
+                                                .desired_rows(8),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            if ui.button("一键复制").clicked() {
+                                                panel_action =
+                                                    Some(AiPanelAction::CopyText);
+                                            }
+                                            if ui.button("关闭").clicked() {
+                                                panel_action =
+                                                    Some(AiPanelAction::Close);
+                                            }
+                                        });
+                                    });
+                                });
+                        });
+                }
             }
             // PS 式内联文本编辑：文本框内直接出现闪动光标，输入即所见
             if editor.is_editing_text() && mode == Mode::Edit {
@@ -675,6 +809,9 @@ impl Overlay {
         }
         if let Some(a) = action {
             self.handle_toolbar_action(a);
+        }
+        if let Some(pa) = panel_action {
+            self.handle_ai_panel_action(pa);
         }
         presented
     }
@@ -731,8 +868,278 @@ impl Overlay {
             ToolbarAction::Copy => self.copy_and_exit(),
             ToolbarAction::Save => self.save_and_exit(),
             ToolbarAction::Cancel => self.exit_requested = true,
+            ToolbarAction::ExtractText => self.start_extract(),
+            ToolbarAction::Translate => self.start_translate(),
         }
     }
+
+    /// 注入 AI 完成回传（宿主在打开覆盖层时设置，接到 winit `EventLoopProxy`）。
+    pub fn set_ai_notify(&mut self, notify: impl Fn(AiDone) + Send + Sync + 'static) {
+        self.ai_notify = Some(std::sync::Arc::new(notify));
+    }
+
+    /// AI 后台任务完成（宿主经 `UserEvent` 转交；过期请求直接丢弃）。
+    pub fn on_ai_done(&mut self, done: AiDone) {
+        match done {
+            AiDone::Ocr { req_id, regions } => {
+                if req_id != self.ai_req {
+                    return;
+                }
+                match regions {
+                    Ok(rs) => {
+                        self.ai_cached_sel = self.selection;
+                        self.ai_cached_regions = rs;
+                        if self.ai_job == AiJob::Translate {
+                            self.spawn_translate();
+                        } else {
+                            self.ai_busy = false;
+                            self.ai_job = AiJob::Idle;
+                            self.finish_extract();
+                        }
+                    }
+                    Err(e) => {
+                        self.ai_busy = false;
+                        self.ai_job = AiJob::Idle;
+                        self.ai_status = Some(format!("识别失败：{e}"));
+                        tracing::warn!("OCR 失败: {e}");
+                    }
+                }
+            }
+            AiDone::Translate { req_id, regions } => {
+                if req_id != self.ai_req {
+                    return;
+                }
+                self.ai_busy = false;
+                self.ai_job = AiJob::Idle;
+                match regions {
+                    Ok(rs) => {
+                        let n = rs.len();
+                        self.ai_translated = rs;
+                        self.ai_status = Some(if n == 0 {
+                            String::from("翻译结果为空，未覆盖")
+                        } else {
+                            format!("已覆盖 {n} 处译文")
+                        });
+                    }
+                    Err(e) => {
+                        self.ai_status = Some(format!("翻译失败：{e}"));
+                        tracing::warn!("翻译失败: {e}");
+                    }
+                }
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// 选区变化时清掉 AI 态（译文覆盖会对不齐、缓存不可复用，在途结果作废）。
+    fn invalidate_ai(&mut self) {
+        self.ai_req += 1;
+        self.ai_job = AiJob::Idle;
+        self.ai_busy = false;
+        self.ai_status = None;
+        self.ai_extract = None;
+        self.ai_translated.clear();
+        self.ai_cached_sel = None;
+        self.ai_cached_regions.clear();
+    }
+
+    /// 当前选区命中的 OCR 缓存（选区一致才复用，避免重复识别）。
+    fn cached_regions(&self) -> Option<Vec<TextRegion>> {
+        match (self.selection, self.ai_cached_sel) {
+            (Some(a), Some(b)) if a == b => Some(self.ai_cached_regions.clone()),
+            _ => None,
+        }
+    }
+
+    /// 选区裁剪图（sRGB，供 OCR/翻译采样与裁剪用）。
+    fn selection_dyn_image(&self, sel: &Rect) -> image::DynamicImage {
+        image::DynamicImage::ImageRgba8(
+            image::imageops::crop_imm(
+                self.image.as_ref(),
+                sel.x as u32,
+                sel.y as u32,
+                sel.width,
+                sel.height,
+            )
+            .to_image(),
+        )
+    }
+
+    /// 起 OCR 后台任务（调用方已填好 `ai_job` 路由与状态行）。
+    fn spawn_ocr(&mut self, sel: &Rect, status: &str) {
+        let Some(notify) = self.ai_notify.clone() else {
+            self.ai_busy = false;
+            self.ai_job = AiJob::Idle;
+            self.ai_status = Some(String::from("AI 链路未就绪"));
+            return;
+        };
+        self.ai_req += 1;
+        self.ai_busy = true;
+        self.ai_status = Some(status.to_string());
+        ai::spawn_ocr_job(
+            self.selection_dyn_image(sel),
+            (sel.x, sel.y),
+            self.config.ocr.engine,
+            self.ai_req,
+            move |done| notify(done),
+        );
+    }
+
+    /// 工具条「提取文字」：缓存命中直接成面板，否则起 OCR。
+    fn start_extract(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.ai_job = AiJob::Extract;
+        self.ai_status = None;
+        self.ai_extract = None;
+        if let Some(rs) = self.cached_regions() {
+            self.ai_cached_regions = rs;
+            self.finish_extract();
+        } else {
+            self.spawn_ocr(&sel, "正在识别文字…");
+        }
+        self.window.request_redraw();
+    }
+
+    /// OCR 区域拼成可编辑文本，进面板（空结果只给状态行，不弹空面板）。
+    fn finish_extract(&mut self) {
+        let mut parts = Vec::new();
+        for b in merge_regions_into_blocks(self.ai_cached_regions.clone()) {
+            if let Some(t) = b.merged_text.as_ref() {
+                if !t.trim().is_empty() {
+                    parts.push(t.clone());
+                }
+            }
+        }
+        if parts.is_empty() {
+            self.ai_status = Some(String::from("未识别到文字"));
+        } else {
+            self.ai_extract = Some(parts.join("\n\n"));
+        }
+    }
+
+    /// 工具条「翻译」：缓存命中直接进管线，否则先 OCR、完成后自动链式翻译。
+    fn start_translate(&mut self) {
+        let Some(sel) = self.selection else { return };
+        self.ai_job = AiJob::Translate;
+        self.ai_status = None;
+        if self.cached_regions().is_some() {
+            self.spawn_translate();
+        } else {
+            self.spawn_ocr(&sel, "正在识别文字（稍后自动翻译）…");
+        }
+        self.window.request_redraw();
+    }
+
+    /// 组装语义块并起翻译后台任务（空文本块全部跳过，无内容只给状态行）。
+    fn spawn_translate(&mut self) {
+        let Some(sel) = self.selection else { return };
+        let blocks: Vec<_> =
+            merge_regions_into_blocks(self.ai_cached_regions.clone())
+                .into_iter()
+                .filter(|b| {
+                    b.merged_text.as_ref().is_some_and(|t| !t.trim().is_empty())
+                })
+                .collect();
+        if blocks.is_empty() {
+            self.ai_busy = false;
+            self.ai_job = AiJob::Idle;
+            self.ai_status = Some(String::from("未识别到文字，无需翻译"));
+            return;
+        }
+        let Some(notify) = self.ai_notify.clone() else {
+            self.ai_busy = false;
+            self.ai_job = AiJob::Idle;
+            self.ai_status = Some(String::from("AI 链路未就绪"));
+            return;
+        };
+        self.ai_req += 1;
+        self.ai_busy = true;
+        self.ai_status = Some(String::from("正在翻译…"));
+        ai::spawn_translate_job(
+            self.selection_dyn_image(&sel),
+            blocks,
+            (sel.x, sel.y),
+            self.config.translate.clone(),
+            self.ai_req,
+            move |done| notify(done),
+        );
+    }
+
+    /// 提取文字面板按钮（复制/关闭，渲染闭包外统一处理）。
+    fn handle_ai_panel_action(&mut self, action: AiPanelAction) {
+        match action {
+            AiPanelAction::CopyText => {
+                if let Some(text) = &self.ai_extract {
+                    if let Err(e) = clipboard::copy_text(text) {
+                        self.ai_status = Some(format!("复制失败：{e:#}"));
+                    } else {
+                        self.ai_status = Some(String::from("已复制提取的文字"));
+                    }
+                }
+                self.window.request_redraw();
+            }
+            AiPanelAction::Close => {
+                self.ai_extract = None;
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// 译文覆盖预览（egui 层：背景色块 + 译文，导出走 CPU 重绘见 [`Self::crop_selection`]）。
+    ///
+    /// 坐标与选区同一约定：全图物理像素 ÷ ppp（见 [`to_pts`]）；排版与导出
+    /// `draw_text_in_rect` 对齐（左上 2px 内边距、行高 1.25 倍）。
+    fn draw_translated_preview(
+        painter: &egui::Painter,
+        ppp: f32,
+        regions: &[TranslatedRegion],
+    ) {
+        for r in regions {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(r.bbox.x as f32 / ppp, r.bbox.y as f32 / ppp),
+                egui::pos2(
+                    (r.bbox.x + r.bbox.width) as f32 / ppp,
+                    (r.bbox.y + r.bbox.height) as f32 / ppp,
+                ),
+            );
+            if rect.width() < 2.0 || rect.height() < 2.0 {
+                continue;
+            }
+            let bg =
+                egui::Color32::from_rgb(r.bg_color[0], r.bg_color[1], r.bg_color[2]);
+            let fg = egui::Color32::from_rgb(
+                r.text_color[0],
+                r.text_color[1],
+                r.text_color[2],
+            );
+            painter.rect_filled(rect, 0.0, bg);
+            // 与导出同 sizing：物理像素下 fit 缩小 + 同字体链路换行，再换算回 pt 绘制
+            let avail_px = rect.width() * ppp - 4.0;
+            let size_px =
+                render::fit_font_size(r.est_font_size as f32, &r.translated, avail_px, false);
+            let size = size_px / ppp;
+            let mut y = rect.min.y + 2.0;
+            for line in wrap_text_for_width(&r.translated, size_px, avail_px, false) {
+                if y > rect.max.y {
+                    break;
+                }
+                painter.text(
+                    egui::pos2(rect.min.x + 2.0, y),
+                    egui::Align2::LEFT_TOP,
+                    line,
+                    egui::FontId::proportional(size),
+                    fg,
+                );
+                y += size * 1.25;
+            }
+        }
+    }
+}
+
+/// 提取文字面板的按钮动作（渲染闭包内收集、闭包外执行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiPanelAction {    CopyText,
+    Close,
 }
 
 /// 物理矩形 → egui 逻辑矩形。

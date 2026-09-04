@@ -42,6 +42,7 @@ mod imp {
     use prismsnap::capture::{display_info, engine, frame};
     use prismsnap::config::Config;
     use prismsnap::hotkey::HotkeyManager;
+    use prismsnap::ui::ai::AiDone;
     use prismsnap::ui::overlay::{CapturedShot, Overlay};
     use prismsnap::ui::settings::Settings;
     use prismsnap::ui::tray::{Tray, TrayAction};
@@ -50,6 +51,8 @@ mod imp {
     /// winit 自定义事件：捕获线程完成截图后经 `EventLoopProxy` 唤醒主循环。
     enum UserEvent {
         CaptureDone(Result<CapturedShot, String>),
+        /// AI 后台任务（OCR/翻译）完成，附带请求序号供覆盖层丢弃过期结果。
+        Ai(AiDone),
     }
 
     /// 应用状态：托盘 + 热键 + 覆盖层窗口 + 设置窗口。
@@ -112,6 +115,13 @@ mod imp {
                     return;
                 }
             };
+            // AI 后台任务经 EventLoopProxy 回主循环（AGENTS.md 3.10 节路线 A）
+            {
+                let proxy = self.proxy.clone();
+                overlay.set_ai_notify(move |done| {
+                    let _ = proxy.send_event(UserEvent::Ai(done));
+                });
+            }
             // 隐藏状态下尽量把首帧 present 出去。swapchain Outdated 时 render
             // 内部会 reconfigure 重试；仍失败则显示后再补一帧。
             let mut presented = false;
@@ -320,6 +330,12 @@ mod imp {
                 UserEvent::CaptureDone(Err(e)) => {
                     self.capturing = false;
                     error!("截图失败: {e}");
+                }
+                UserEvent::Ai(done) => {
+                    // 覆盖层已退出时结果无处投递，直接丢弃
+                    if let Some(overlay) = &mut self.overlay {
+                        overlay.on_ai_done(done);
+                    }
                 }
             }
         }

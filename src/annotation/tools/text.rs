@@ -192,6 +192,65 @@ pub fn measure_line_width(line: &str, font_size: f32, bold: bool) -> f32 {
     if simulate_bold { w + 0.9 } else { w }
 }
 
+/// 将一段文本按 `max_width` 自动换行（物理像素，与 [`draw_text_in_rect`] 同字体链路）。
+///
+/// 按 `\n` 分段、每段独立 wrapping 后拼回；空段保留为空行。找不到系统字体时
+/// 按"0.6 倍字号每字"估算断行（WSL2 等无 CJK 环境仍可跑通逻辑）。
+/// 预览层（egui）与导出层（CPU）共用，保证所见即所得。
+pub fn wrap_text_for_width(
+    content: &str,
+    font_size: f32,
+    max_width: f32,
+    bold: bool,
+) -> Vec<String> {
+    let font_size = font_size.clamp(8.0, 120.0);
+    if max_width <= 0.0 {
+        return content.split('\n').map(str::to_string).collect();
+    }
+    let (font_bytes, _) = if bold {
+        if let Some(b) = cjk_font_bytes_bold() {
+            (Some(b), false)
+        } else if let Some(n) = cjk_font_bytes() {
+            (Some(n), true)
+        } else {
+            (None, true)
+        }
+    } else if let Some(n) = cjk_font_bytes() {
+        (Some(n), false)
+    } else {
+        (None, false)
+    };
+    let Some(bytes) = font_bytes else {
+        // 无字体回退：按字符数估算断行
+        let per_char = (font_size * 0.6).max(1.0);
+        let per_line = ((max_width / per_char).floor() as usize).max(1);
+        let mut out = Vec::new();
+        for para in content.split('\n') {
+            if para.is_empty() {
+                out.push(String::new());
+                continue;
+            }
+            let chars: Vec<char> = para.chars().collect();
+            for chunk in chars.chunks(per_line) {
+                out.push(chunk.iter().collect());
+            }
+        }
+        return out;
+    };
+    let font = match FontRef::try_from_slice(bytes) {
+        Ok(f) => f,
+        Err(_) => {
+            return content.split('\n').map(str::to_string).collect();
+        }
+    };
+    let scale = PxScale::from(font_size);
+    let mut out = Vec::new();
+    for para in content.split('\n') {
+        out.extend(wrap_line(para, &font, scale, max_width));
+    }
+    out
+}
+
 /// 将一行按 max_width 按字符自动换行（返回多行，含原空行）。
 fn wrap_line(line: &str, font: &FontRef, scale: PxScale, max_w: f32) -> Vec<String> {
     if line.is_empty() { return vec![String::new()]; }
@@ -315,5 +374,35 @@ mod tests {
         // 同一字体链路下 advance 随字号线性缩放（模拟加粗 +0.9px，留容差）
         assert!((w32 / w16 - 2.0).abs() < 0.15, "w16={w16} w32={w32}");
         assert_eq!(measure_line_width("", 16.0, false), 0.0);
+    }
+
+    #[test]
+    fn wrap_short_line_is_unchanged() {
+        assert_eq!(wrap_text_for_width("你好世界", 20.0, 400.0, false), vec!["你好世界"]);
+        // 空段保留为空行
+        assert_eq!(wrap_text_for_width("甲\n\n乙", 20.0, 400.0, false), vec!["甲", "", "乙"]);
+    }
+
+    #[test]
+    fn wrap_long_line_breaks_and_roundtrips() {
+        // WSL2 回退字体（DejaVu）缺 CJK 字形，断行用 ASCII 长行验证逻辑；
+        // CJK 路径与导出 `draw_text_in_rect` 共用 `wrap_line`，Windows 实机覆盖。
+        let long = "Top 10% salaries in Singapore by age and industry from 25 to 45";
+        let lines = wrap_text_for_width(long, 20.0, 100.0, false);
+        assert!(lines.len() > 1, "应断成多行：{lines:?}");
+        // 断行不丢字
+        assert_eq!(lines.concat(), long);
+        // 每行实测宽度都不超限（含浮点容差）
+        for l in &lines {
+            assert!(
+                measure_line_width(l, 20.0, false) <= 100.0 + 1.0,
+                "行超宽：{l}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_nonpositive_width_keeps_paragraphs() {
+        assert_eq!(wrap_text_for_width("甲\n乙", 20.0, 0.0, false), vec!["甲", "乙"]);
     }
 }
