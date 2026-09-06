@@ -210,7 +210,11 @@ pub fn shift_bbox(bbox: BBox, origin: (i32, i32)) -> Rect {
 ///
 /// - `region.bg_color` / `text_color` 由管线组装层事先采样填好，本函数只消费；
 /// - `bold` 由组装层按笔画粗细定（当前恒 false，笔画分析后续补）；
-/// - 越界 bbox 自动钳制，不 panic。
+/// - 越界 bbox 自动钳制，不 panic；
+/// - **绝不溢出**：先在 bbox+[`ERASE_PAD`] 大小的临时图里重绘（绘制超出部分
+///   被临时图边界裁掉），再整体拷回——`draw_text_in_rect` 内部允许溢出框底、
+///   且二次断行与 `fit` 估算可能差一行，直接画在目标图上就是实机"有时超出"
+///   的根因（预览侧见 `draw_translated_preview` 的裁剪）。
 pub fn render_translated_region(
     img: &mut RgbaImage,
     region: &TranslatedRegion,
@@ -224,11 +228,26 @@ pub fn render_translated_region(
         width: region.bbox.width,
         height: region.bbox.height,
     };
-    erase_background(img, local, region.bg_color);
-    let rect = shift_bbox(region.bbox, origin);
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    // 擦除范围（含外扩，钳制在图内）：临时图与拷回范围完全一致
+    let ex0 = (local.x as i32 - ERASE_PAD).clamp(0, w);
+    let ey0 = (local.y as i32 - ERASE_PAD).clamp(0, h);
+    let ex1 = (local.x as i32 + local.width as i32 + ERASE_PAD).clamp(0, w);
+    let ey1 = (local.y as i32 + local.height as i32 + ERASE_PAD).clamp(0, h);
+    if ex1 <= ex0 || ey1 <= ey0 {
+        return;
+    }
+    let tw = (ex1 - ex0) as u32;
+    let th = (ey1 - ey0) as u32;
+    let bg = image::Rgba([region.bg_color[0], region.bg_color[1], region.bg_color[2], 255]);
+    let mut tmp = RgbaImage::from_pixel(tw, th, bg);
+    // bbox 在临时图里的位置（擦除原点 → bbox 左上）
+    let bx = local.x as i32 - ex0;
+    let by = local.y as i32 - ey0;
+    let rect = Rect { x: bx, y: by, width: local.width, height: local.height };
     let avail_w = rect.width as f32 - 4.0; // 与 draw_text_in_rect 内边距对齐
     let avail_h = rect.height as f32 - 4.0;
-    // 宽高双约束排版（与预览同函数），排好的行原样喂绘制（内部不再二次断行）
+    // 宽高双约束排版（与预览同函数），排好的行原样喂绘制
     let (size, lines) = fit_font_size_box(
         region.est_font_size as f32,
         &region.translated,
@@ -242,7 +261,14 @@ pub fn render_translated_region(
         b: region.text_color[2],
         a: 255,
     };
-    draw_text_in_rect(img, rect, &lines.join("\n"), color, size, bold);
+    draw_text_in_rect(&mut tmp, rect, &lines.join("\n"), color, size, bold);
+    // 整体拷回（不透明覆盖 = 擦除语义；超出 bbox 的绘制已被临时图裁掉）
+    for y in 0..th {
+        for x in 0..tw {
+            *img.get_pixel_mut((ex0 + x as i32) as u32, (ey0 + y as i32) as u32) =
+                *tmp.get_pixel(x, y);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +351,35 @@ mod tests {
         // 极小框：触底 8，不再缩
         let (size, _) = fit_font_size_box(20.0, "很长很长很长很长很长很长很长的译文", 10.0, 10.0, false);
         assert!(size >= MIN_FONT_SIZE, "size={size}");
+    }
+
+    #[test]
+    fn render_never_spills_outside_erase_rect() {
+        // 长译文 + 矮框：旧实现里 draw 的二次断行/溢出 1 行会把笔画画到框外，
+        // 新实现经临时图钳制，擦除范围外必须保持原样。
+        let mut img = RgbaImage::from_pixel(120, 60, image::Rgba([200, 200, 200, 255]));
+        let region = TranslatedRegion {
+            bbox: BBox { x: 10, y: 20, width: 100, height: 12 },
+            original: String::from("Hello world foo bar"),
+            translated: String::from("这是一段很长很长很长很长很长的译文内容内容内容"),
+            est_font_size: 20,
+            bg_color: [255, 255, 255],
+            text_color: [0, 0, 0],
+        };
+        render_translated_region(&mut img, &region, false, (0, 0));
+        // 擦除范围 = bbox ± ERASE_PAD，即 x 9..111、y 19..33；之外必须仍是原灰
+        for y in 0..60 {
+            for x in 0..120 {
+                let inside = x >= 9 && x < 111 && y >= 19 && y < 33;
+                if !inside {
+                    assert_eq!(
+                        img.get_pixel(x, y).0,
+                        [200, 200, 200, 255],
+                        "框外像素被污染 ({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

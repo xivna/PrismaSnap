@@ -10,6 +10,8 @@
 #[cfg(target_os = "windows")]
 pub mod system;
 pub mod rapid;
+/// 插件模型下载（官方源自动下载 + 手动下载帮助，跨平台可单测）。
+pub mod download;
 
 pub use rapid::RapidOcrEngine;
 #[cfg(target_os = "windows")]

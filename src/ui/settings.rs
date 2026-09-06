@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 
 use anyhow::Context;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -30,6 +31,11 @@ use crate::config::{
     TranslateMode, TranslatePrompts,
 };
 use crate::ocr::create_engine;
+use crate::ocr::download::{
+    self, DlEvent, FileState, JobControl, MODELSCOPE_PAGE_URL, ORT_RELEASES_URL,
+    RAPIDOCR_REPO_URL,
+};
+use crate::ocr::ocr_plugin_dir;
 
 use super::gui::{palette, GuiState, Palette};
 
@@ -104,6 +110,162 @@ pub struct Settings {
     pub close_requested: bool,
     /// 状态栏消息 `(是否成功, 文本)`，`None` 表示无提示。
     status: Option<(bool, String)>,
+    /// OCR 插件模型下载会话状态（不进配置，关闭设置窗口即丢弃；下载线程
+    /// 的 `JoinHandle` 不保留——线程结束即退出，结束事件经 channel 回收）。
+    model_dl: ModelDownloadUi,
+}
+
+/// 单文件下载任务的 UI 侧句柄（`None` 表示该行无在途/暂停任务）。
+struct FileJob {
+    /// 事件接收端（线程结束/暂停即失效，由 `poll` 回收）。
+    rx: Receiver<DlEvent>,
+    /// 暂停/取消开关（按钮写，线程读）。
+    ctl: Arc<JobControl>,
+    /// 最新进度 `(已下字节, 总字节)`。
+    progress: Option<(u64, Option<u64>)>,
+    /// 线程是否还在跑（`false` = 已暂停，线程已退出、`.part` 保留）。
+    live: bool,
+}
+
+/// OCR 插件模型下载的会话状态（设置页 AI 分区"插件模型"卡片用）。
+struct ModelDownloadUi {
+    /// 是否展开手动下载帮助窗口。
+    show_help: bool,
+    /// 四文件任务槽（下标与 `download::model_files()` 一致）。
+    jobs: [Option<FileJob>; 4],
+    /// 全局结果消息 `(是否成功, 文本)`（失败含手动下载指引）。
+    result: Option<(bool, String)>,
+    /// 帮助窗口内的复制反馈（刚复制的 URL）。
+    copied: Option<String>,
+}
+
+impl Default for ModelDownloadUi {
+    fn default() -> Self {
+        Self {
+            show_help: false,
+            jobs: [None, None, None, None],
+            result: None,
+            copied: None,
+        }
+    }
+}
+
+impl ModelDownloadUi {
+    /// 是否有在跑的下载线程（进度动画用）。
+    fn any_live(&self) -> bool {
+        self.jobs.iter().flatten().any(|j| j.live)
+    }
+
+    /// 是否有任务槽被占用（含暂停）。
+    fn any_job(&self) -> bool {
+        self.jobs.iter().any(|j| j.is_some())
+    }
+
+    /// 起某文件的后台下载线程（幂等：该行已有任务时直接返回）。
+    fn start(&mut self, index: usize) {
+        if index >= 4 || self.jobs[index].is_some() {
+            return;
+        }
+        let dir = match ocr_plugin_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                self.result = Some((false, format!("插件目录解析失败：{e:#}")));
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctl = Arc::new(JobControl::default());
+        let ctl2 = ctl.clone();
+        std::thread::spawn(move || download::run_file_job(dir, index, tx, ctl2));
+        self.jobs[index] = Some(FileJob { rx, ctl, progress: None, live: true });
+        self.result = None;
+    }
+
+    /// 暂停某行（线程刷盘退出、保留 `.part`；`Paused` 事件到后 `live=false`）。
+    fn pause(&mut self, index: usize) {
+        if let Some(job) = self.jobs[index].as_ref() {
+            job.ctl.pause.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 继续某行（暂停的线程已退出，重起一个按 `.part` 大小续传）。
+    fn resume(&mut self, index: usize) {
+        if !matches!(self.jobs[index].as_ref(), Some(job) if !job.live) {
+            return;
+        }
+        self.jobs[index] = None;
+        self.start(index);
+    }
+
+    /// 取消某行（在跑：置旗由线程删 `.part`；已暂停：直接删 `.part`；行回初始态）。
+    fn cancel(&mut self, index: usize) {
+        let live = matches!(self.jobs[index].as_ref(), Some(job) if job.live);
+        if live {
+            if let Some(job) = self.jobs[index].as_ref() {
+                job.ctl.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        // 已暂停（线程不在了）：直接删半截文件，行回到初始"下载"
+        if self.jobs[index].is_some() {
+            if let Ok(dir) = ocr_plugin_dir() {
+                let part = dir.join(format!("{}.part", download::model_files()[index].local));
+                let _ = std::fs::remove_file(&part);
+                // DLL 的 zip 半截固定名，同样清理
+                if index == 3 {
+                    let _ = std::fs::remove_file(dir.join("ort_package.zip.part"));
+                }
+            }
+            self.jobs[index] = None;
+        }
+    }
+
+    /// 取消全部任务（标题行"取消"：在跑的置旗，已暂停的直接清 `.part`）。
+    fn cancel_all(&mut self) {
+        for i in 0..4 {
+            self.cancel(i);
+        }
+    }
+
+    /// 排空各任务事件（设置页每帧调用；`JobEnd` 到后回收任务槽）。
+    fn poll(&mut self) {
+        for i in 0..4 {
+            let mut job_end: Option<(bool, String, bool)> = None;
+            if let Some(job) = self.jobs[i].as_mut() {
+                while let Ok(ev) = job.rx.try_recv() {
+                    match ev {
+                        DlEvent::Progress { done, total, .. } => {
+                            job.progress = Some((done, total));
+                        }
+                        DlEvent::FileDone { .. } => {}
+                        DlEvent::Paused { done, .. } => {
+                            job.live = false;
+                            job.progress = Some((done, None));
+                        }
+                        DlEvent::JobEnd { ok, msg, cancelled, .. } => {
+                            job_end = Some((ok, msg, cancelled));
+                        }
+                    }
+                }
+            }
+            if let Some((ok, msg, cancelled)) = job_end {
+                self.jobs[i] = None;
+                if cancelled {
+                    continue;
+                }
+                if !ok {
+                    self.result = Some((false, msg));
+                    continue;
+                }
+                // 成功：四齐了才报全局完成（单文件完成由状态行变绿体现）
+                if let Ok(dir) = ocr_plugin_dir() {
+                    if download::all_ready(&dir) {
+                        self.result = Some((true, String::from("全部下载完成，插件已就绪")));
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Settings {
@@ -141,6 +303,7 @@ impl Settings {
             pending_save: false,
             close_requested: false,
             status: None,
+            model_dl: ModelDownloadUi::default(),
         })
     }
 
@@ -239,7 +402,10 @@ impl Settings {
 
     /// 渲染一帧设置界面。
     pub fn redraw(&mut self) {
+        // 先排空模型下载线程事件（进度/结束），再进绘制闭包
+        self.model_dl.poll();
         // clone 到局部变量，避免闭包与 self.gui 的双重可变借用
+        // （model_dl 含 channel，用 mem::replace 整块搬出、用完搬回）
         let mut draft = self.draft.clone();
         let mut dir_input = self.dir_input.clone();
         let mut active_section = self.active_section;
@@ -247,6 +413,7 @@ impl Settings {
         let mut start_recording = false;
         let recording = self.recording_hotkey;
         let status = self.status.clone();
+        let mut mdl = std::mem::replace(&mut self.model_dl, ModelDownloadUi::default());
 
         self.gui.render(self.window.as_ref(), |ui| {
             // 主题实时预览：改选项立即生效（正式写盘仍走 pending_save）
@@ -260,6 +427,7 @@ impl Settings {
                 status.as_ref(),
                 &mut changed,
                 &mut start_recording,
+                &mut mdl,
             );
         });
 
@@ -267,11 +435,16 @@ impl Settings {
         self.draft = draft;
         self.dir_input = dir_input;
         self.active_section = active_section;
+        self.model_dl = mdl;
         if start_recording {
             self.recording_hotkey = true;
         }
         if changed {
             self.pending_save = true;
+        }
+        // 下载进行中时持续重绘，进度百分比才动
+        if self.model_dl.any_live() {
+            self.window.request_redraw();
         }
     }
 }
@@ -298,6 +471,7 @@ fn draw_settings_ui(
     status: Option<&(bool, String)>,
     changed: &mut bool,
     start_recording: &mut bool,
+    mdl: &mut ModelDownloadUi,
 ) {
     let pal = palette(matches!(draft.ui.theme, Theme::Dark));
 
@@ -346,7 +520,7 @@ fn draw_settings_ui(
                 Section::Save => draw_save(ui, &pal, draft, dir_input, changed),
                 Section::Capture => draw_capture(ui, &pal, draft, changed),
                 Section::Appearance => draw_appearance(ui, &pal, draft, changed),
-                Section::Ai => draw_ai(ui, &pal, draft, changed),
+                Section::Ai => draw_ai(ui, &pal, draft, changed, mdl),
             }
 
             // 状态提示（保存成功/失败等）
@@ -540,7 +714,13 @@ fn draw_appearance(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed
 
 /// 「AI 接口」分区：基础 LLM（文本翻译后端，布局保持不动）+ 多模态 LLM
 /// （三选一）+ 翻译模式 + OCR 引擎（见 AGENTS.md 3.8 节）。
-fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut bool) {
+fn draw_ai(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    draft: &mut Config,
+    changed: &mut bool,
+    mdl: &mut ModelDownloadUi,
+) {
     // 卡片一：基础 LLM（即文本翻译后端；行布局保持不动，只改绑定到新配置）。
     card(ui, pal, |ui| {
         setting_row(ui, "API 地址", |ui| {
@@ -736,7 +916,11 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
     });
     ui.add_space(12.0);
 
-    // 卡片五：提示词模板（纯文本/多模态单图/多模态批量；留空用内置默认）。
+    // 卡片五：OCR 插件模型（四件套下载：官方源自动下载 + 手动下载帮助）。
+    draw_model_card(ui, pal, mdl);
+    ui.add_space(12.0);
+
+    // 卡片六：提示词模板（纯文本/多模态单图/多模态批量；留空用内置默认）。
     card(ui, pal, |ui| {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("提示词模板").size(13.0));
@@ -766,6 +950,201 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
         }
         ui.add_space(4.0);
     });
+}
+
+/// 卡片五：OCR 插件模型（四件套：每行独立下载/暂停/继续/取消 + 顶部取消全部）。
+///
+/// 文件状态每次绘制现查（`download::file_states`），下好放进 `plugins/ocr/`
+/// 后本页自动变绿；引擎行（卡片四）同样按帧计算，无需重启、无需"重新检测"
+///（唯一例外：之前放错 DLL 并触发过识别/翻译的，需重启——运行时只初始化一次）。
+fn draw_model_card(ui: &mut egui::Ui, pal: &Palette, mdl: &mut ModelDownloadUi) {
+    card(ui, pal, |ui| {
+        // 标题行：左"OCR插件下载"，右 取消（有任务才显示）+ 来源 + 帮助
+        setting_row(ui, "OCR插件下载", |ui| {
+            ui.horizontal(|ui| {
+                if mdl.any_job() && ui.small_button("取消").clicked() {
+                    mdl.cancel_all();
+                }
+                ui.label(
+                    egui::RichText::new("官方自动下载").size(12.0).color(pal.secondary),
+                );
+                if ui.small_button("手动下载帮助").clicked() {
+                    mdl.show_help = true;
+                    mdl.copied = None;
+                }
+            });
+        });
+        row_separator(ui, pal);
+        // 四文件行：本地名 + 说明 | 右侧：已就绪 / 下载 / 暂停+取消 / 继续+取消
+        let dir = ocr_plugin_dir().unwrap_or_else(|_| PathBuf::from("plugins/ocr"));
+        let files = download::model_files();
+        let states = download::file_states(&dir);
+        for (i, f) in files.iter().enumerate() {
+            let row = format!("{}（{}）", f.local, f.desc);
+            setting_row(ui, &row, |ui| {
+                ui.horizontal(|ui| {
+                    let is_ready = states[i] == FileState::Ready;
+                    match mdl.jobs[i].as_ref() {
+                        // 无任务：就绪显示绿字，否则"下载"按钮
+                        None => {
+                            if is_ready {
+                                ui.label(
+                                    egui::RichText::new(FileState::Ready.label())
+                                        .size(12.5)
+                                        .color(egui::Color32::from_rgb(52, 199, 89)),
+                                );
+                            } else if ui.small_button("下载").clicked() {
+                                mdl.start(i);
+                            }
+                        }
+                        Some(job) if job.live => {
+                            // 在跑：进度 + 暂停 + 取消（点下载后按钮即换成这俩）
+                            ui.label(
+                                egui::RichText::new(progress_text(job.progress))
+                                    .size(12.5)
+                                    .color(egui::Color32::from_rgb(0, 122, 255)),
+                            );
+                            if ui.small_button("暂停").clicked() {
+                                mdl.pause(i);
+                            }
+                            if ui.small_button("取消").clicked() {
+                                mdl.cancel(i);
+                            }
+                        }
+                        Some(job) => {
+                            // 已暂停：继续 + 取消（取消删 .part，行回初始"下载"）
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "已暂停 {}",
+                                    job.progress.map(|(d, _)| human_bytes(d)).unwrap_or_default()
+                                ))
+                                .size(12.5)
+                                .color(pal.secondary),
+                            );
+                            if ui.small_button("继续").clicked() {
+                                mdl.resume(i);
+                            }
+                            if ui.small_button("取消").clicked() {
+                                mdl.cancel(i);
+                            }
+                        }
+                    }
+                });
+            });
+            if i + 1 < files.len() {
+                row_separator(ui, pal);
+            }
+        }
+        // 全局结果消息（失败含手动下载指引；成功只在四齐时报一次）
+        if let Some((ok, msg)) = mdl.result.clone() {
+            row_separator(ui, pal);
+            setting_row(ui, "结果", |ui| {
+                let color = if ok {
+                    egui::Color32::from_rgb(52, 199, 89)
+                } else {
+                    egui::Color32::from_rgb(255, 69, 58)
+                };
+                ui.label(egui::RichText::new(msg).size(12.0).color(color));
+            });
+        }
+        ui.add_space(4.0);
+    });
+    // 帮助窗口（可拖动 egui::Window，标题栏拖移；主题跟随设置页）
+    if mdl.show_help {
+        draw_model_help(ui.ctx(), mdl);
+    }
+}
+
+/// 下载进度文字（有总长显示百分比，否则显示已下字节）。
+fn progress_text(progress: Option<(u64, Option<u64>)>) -> String {
+    match progress {
+        Some((done, Some(total))) if total > 0 => format!(
+            "下载中 {}%",
+            (done as f64 / total as f64 * 100.0).floor() as u64
+        ),
+        Some((done, _)) => format!("下载中 {}", human_bytes(done)),
+        None => String::from("准备中…"),
+    }
+}
+
+/// 手动下载帮助：项目地址 + 四文件直链（可复制）+ 改名对照 + 校验说明。
+fn draw_model_help(ctx: &egui::Context, mdl: &mut ModelDownloadUi) {
+    let mut open = mdl.show_help;
+    egui::Window::new("手动下载帮助")
+        .open(&mut open)
+        .resizable(true)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("项目地址").size(13.0).strong());
+            for (name, url) in [
+                ("RapidOCR（模型来源）", RAPIDOCR_REPO_URL),
+                ("模型托管页（可网页下载）", MODELSCOPE_PAGE_URL),
+                ("ONNX Runtime 发布页（DLL，选 v1.28.1 win-x64）", ORT_RELEASES_URL),
+            ] {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(name).size(12.5));
+                    if ui.small_button("复制链接").clicked() {
+                        if crate::utils::clipboard::copy_text(url).is_ok() {
+                            mdl.copied = Some(url.to_string());
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new(url).size(11.5).color(egui::Color32::GRAY));
+                ui.add_space(2.0);
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("四文件直链（下好后改名放入 plugins/ocr/）").size(13.0).strong());
+            for f in download::model_files() {
+                ui.add_space(4.0);
+                let target = if f.url.is_some() {
+                    format!("{} ← {}", f.local, f.origin)
+                } else {
+                    format!("{} ← {}（zip 包，解出 DLL）", f.local, f.origin)
+                };
+                ui.label(egui::RichText::new(target).size(12.5).strong());
+                let url = f.url.or(f.zip_url).unwrap_or("");
+                if ui.small_button("复制直链").clicked()
+                    && crate::utils::clipboard::copy_text(url).is_ok()
+                {
+                    mdl.copied = Some(url.to_string());
+                }
+                if let Some(h) = f.sha256 {
+                    ui.label(
+                        egui::RichText::new(format!("SHA256: {h}"))
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new(
+                    "步骤：① 按上表下载 4 个文件并改名；② 放入程序目录 plugins/ocr/；\n\
+                     ③ 回到本页，文件行自动变绿即就绪（字典须与识别模型配套，错配会被拦截并提示）。\n\
+                     注意：如之前放错过 DLL 并点过识别/翻译，需重启程序（运行时只初始化一次）。",
+                )
+                .size(12.0),
+            );
+            if let Some(c) = mdl.copied.clone() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("已复制：{c}"))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(52, 199, 89)),
+                );
+            }
+        });
+    mdl.show_help = open;
+}
+
+/// 字节数转人类可读（下载进度用）。
+fn human_bytes(n: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if n as f64 >= MB {
+        format!("{:.1}MB", n as f64 / MB)
+    } else {
+        format!("{}KB", n / 1024)
+    }
 }
 
 /// 圆角卡片容器（内容区固定左右留白 + 最大宽度）。

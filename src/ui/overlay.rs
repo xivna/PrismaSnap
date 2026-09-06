@@ -4,7 +4,7 @@
 //! 同一窗口内 `Selecting`（截图 + 半透明遮罩 + 拖动选区）→
 //! `Preview`（遮罩加深 + 选区高亮 + 工具条）→ `Edit`（标注编辑）三种
 //! 模式切换，不做销毁重建。Esc 取消、Enter / Ctrl+C 复制、Ctrl+S 保存，
-//! 编辑态另支持 Ctrl+Z 撤销 / Ctrl+Shift+Z 重做。
+    //! 编辑态另支持 Ctrl+Z 撤销 / Ctrl+Shift+Z / Ctrl+Y 重做。
 //!
 //! 窗口层级：`WS_EX_TOPMOST`（with_window_level）+
 //! `WS_EX_TOOLWINDOW`（with_skip_taskbar）；`WS_EX_NOACTIVATE` 暂不启用——
@@ -485,7 +485,7 @@ impl Overlay {
     }
 
     /// 键盘动作：Esc 取消（拖动中取消拖动、否则退出）、Enter 复制、Ctrl+C 复制、Ctrl+S 保存、
-    /// Ctrl+Z 撤销、Ctrl+Shift+Z 重做（后两者 Preview/Edit 均可）。
+    /// Ctrl+Z 撤销、Ctrl+Shift+Z / Ctrl+Y 重做（后两者 Preview/Edit 均可）。
     fn on_key(&mut self, key: &KeyEvent) {
         if key.state != ElementState::Pressed {
             return;
@@ -532,6 +532,14 @@ impl Overlay {
                 } else {
                     self.editor.undo();
                 }
+                self.window.request_redraw();
+            }
+            // Ctrl+Y 重做（与 Ctrl+Shift+Z 同义：部分键盘/输入法下 Shift+Z 难按，
+            // 且符合 Office/PS 用户习惯；Ctrl+Shift+Z 保留）。
+            PhysicalKey::Code(KeyCode::KeyY)
+                if self.modifiers.control_key() && matches!(self.mode, Mode::Preview | Mode::Edit) =>
+            {
+                self.editor.redo();
                 self.window.request_redraw();
             }
             _ => {}
@@ -626,6 +634,8 @@ impl Overlay {
         let mut action: Option<ToolbarAction> = None;
         // 状态行取消按钮同样闭包外执行
         let mut status_cancel = false;
+        // 「复制译文」按钮同样闭包外执行（翻译成功后才出现，见下）
+        let mut copy_translated = false;
         let theme = self.config.ui.theme;
         let editor = &mut self.editor;
         let ai_busy = self.ai_busy;
@@ -686,9 +696,13 @@ impl Overlay {
                 );
             }
             // AI 状态行（等待态：转圈 + 分阶段文案 + 已耗时 + 取消；
-            // 错误提示纯文本。浮在尺寸标签之上（两者都在选区左上外侧，
+            // 错误提示纯文本；翻译成功后附「复制译文」按钮（译文只是像素，
+            // 不可选中，按钮复制全部译文）。浮在尺寸标签之上（两者都在选区左上外侧，
             // 差 28px 错开互不遮挡）；顶部没地儿才压进选区内）
-            if let Some(status) = ai_status {
+            // 翻译成功时 `ai_status` 为 None（不挡译文），但复制按钮仍要出现，
+            // 故条件为"有状态文本，或有可复制的译文"。
+            let can_copy = !ai_busy && !ai_translated.is_empty();
+            if ai_status.is_some() || can_copy {
                 if let Some(sel) = selection {
                     let ppp = ui.ctx().pixels_per_point();
                     let sx = sel.x as f32 / ppp;
@@ -710,22 +724,27 @@ impl Overlay {
                                         if ai_busy {
                                             ui.add(egui::Spinner::new().size(14.0));
                                         }
-                                        let mut text = status.clone();
-                                        if ai_busy {
-                                            if let Some(t0) = ai_start {
-                                                let secs = Instant::now()
-                                                    .duration_since(t0)
-                                                    .as_secs();
-                                                text.push_str(&format!("（{}s）", secs));
+                                        if let Some(status) = ai_status {
+                                            let mut text = status.clone();
+                                            if ai_busy {
+                                                if let Some(t0) = ai_start {
+                                                    let secs = Instant::now()
+                                                        .duration_since(t0)
+                                                        .as_secs();
+                                                    text.push_str(&format!("（{}s）", secs));
+                                                }
                                             }
+                                            ui.label(
+                                                egui::RichText::new(text)
+                                                    .color(egui::Color32::WHITE)
+                                                    .size(13.0),
+                                            );
                                         }
-                                        ui.label(
-                                            egui::RichText::new(text)
-                                                .color(egui::Color32::WHITE)
-                                                .size(13.0),
-                                        );
                                         if ai_busy && ui.small_button("取消").clicked() {
                                             status_cancel = true;
+                                        }
+                                        if can_copy && ui.small_button("复制译文").clicked() {
+                                            copy_translated = true;
                                         }
                                     });
                                 });
@@ -784,7 +803,31 @@ impl Overlay {
         if status_cancel {
             self.cancel_ai();
         }
+        if copy_translated {
+            self.copy_translated_text();
+        }
         presented
+    }
+
+    /// 复制全部译文到剪贴板（译文只渲染成像素、不可选中，此按钮是复制出口）。
+    ///
+    /// 成功后状态行提示"已复制译文"（译文覆盖保留，可继续保存）；
+    /// 失败只给状态行，不退出。
+    fn copy_translated_text(&mut self) {
+        let parts: Vec<&str> = self
+            .ai_translated
+            .iter()
+            .map(|r| r.translated.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        match clipboard::copy_text(&parts.join("\n")) {
+            Ok(()) => self.ai_status = Some(String::from("已复制译文")),
+            Err(e) => self.ai_status = Some(format!("复制失败：{e:#}")),
+        }
+        self.window.request_redraw();
     }
 
     /// 响应工具条动作：切换工具 / 撤销重做 / 复制 / 保存 / 取消。
@@ -1106,7 +1149,10 @@ impl Overlay {
                 r.text_color[2],
             );
             painter.rect_filled(rect, 0.0, bg);
-            // 与导出同排版：物理像素下宽高双约束 + 同字体链路换行，再换算回 pt 绘制
+            // 与导出同排版：物理像素下宽高双约束 + 同字体链路换行，再换算回 pt 绘制。
+            // egui 字体度量与 ab_glyph 不完全一致（尤其拉丁字符），行宽可能超框，
+            // 故文字层按背景矩形裁剪——译文绝不画到框外（导出侧见临时图钳制）。
+            let clipped = painter.with_clip_rect(rect);
             let avail_px = rect.width() * ppp - 4.0;
             let avail_py = rect.height() * ppp - 4.0;
             let (size_px, lines) = render::fit_font_size_box(
@@ -1122,7 +1168,7 @@ impl Overlay {
                 if y > rect.max.y {
                     break;
                 }
-                painter.text(
+                clipped.text(
                     egui::pos2(rect.min.x + 2.0, y),
                     egui::Align2::LEFT_TOP,
                     line,

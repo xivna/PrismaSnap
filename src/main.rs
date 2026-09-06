@@ -55,6 +55,32 @@ mod imp {
         Ai(AiDone),
     }
 
+    /// 读取当前前台窗口句柄（截图触发时调用；失败返回 `None`，不影响流程）。
+    fn foreground_window() -> Option<isize> {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        // SAFETY：纯查询调用，无资源管理；返回空句柄视为无前台窗口。
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_invalid() {
+            None
+        } else {
+            Some(hwnd.0 as isize)
+        }
+    }
+
+    /// 把焦点归还给截图前的窗口（best-effort：系统可能因前台锁拒绝）。
+    fn restore_foreground_window(hwnd_raw: isize) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+        // SAFETY：句柄来自本进程稍早时刻的 GetForegroundWindow；窗口已关闭时
+        // 调用失败，仅记日志，不影响退出流程。
+        let ok = unsafe { SetForegroundWindow(HWND(hwnd_raw as *mut _)) };
+        if ok.as_bool() {
+            info!("已恢复截图前窗口焦点");
+        } else {
+            warn!("恢复截图前窗口焦点被系统拒绝（前台锁），保持当前焦点");
+        }
+    }
+
     /// 应用状态：托盘 + 热键 + 覆盖层窗口 + 设置窗口。
     struct App {
         config: Arc<Config>,
@@ -77,6 +103,9 @@ mod imp {
         hotkey_suspended: bool,
         /// 捕获进行中（防止热键连按重复触发）。
         capturing: bool,
+        /// 截图触发前的前台窗口句柄（`GetForegroundWindow` 原始值，截图结束
+        /// 后 `SetForegroundWindow` 归还焦点，见 AGENTS.md 3.9 节遗留项）。
+        prev_foreground: Option<isize>,
     }
 
     impl App {
@@ -87,6 +116,9 @@ mod imp {
             }
             self.capturing = true;
             info!("触发截图");
+            // 记住当前前台窗口：覆盖层需要键盘焦点（Esc/Enter），截图期间焦点
+            // 会转移；结束后在 close_overlay 里归还（失败只记日志，不影响流程）。
+            self.prev_foreground = foreground_window();
             // 隐藏设置窗口，避免遮挡与抢焦点（截图结束恢复）
             if let Some(settings) = &self.settings {
                 settings.hide();
@@ -144,6 +176,10 @@ mod imp {
         fn close_overlay(&mut self, event_loop: &ActiveEventLoop) {
             info!("关闭覆盖层");
             self.overlay = None;
+            // 归还焦点给截图前的窗口（best-effort：系统前台锁可能拒绝，只记日志）
+            if let Some(hwnd) = self.prev_foreground.take() {
+                restore_foreground_window(hwnd);
+            }
             // 截图期间被隐藏的设置窗口恢复显示
             if let Some(settings) = &self.settings {
                 settings.show();
@@ -496,6 +532,7 @@ mod imp {
             settings: None,
             hotkey_suspended: false,
             capturing: false,
+            prev_foreground: None,
         };
         info!("进入事件循环（热键 {} 截图，托盘菜单退出）", app.config.hotkey);
         event_loop.run_app(&mut app).context("事件循环异常退出")?;

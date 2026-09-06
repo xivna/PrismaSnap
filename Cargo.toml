@@ -29,9 +29,15 @@ async-trait = "0.1"
 # LLM HTTP 客户端（OpenAI 兼容，双后端共用；default-features 关闭省编译量，
 # json 用于宽松解析，rustls-tls 用于云端 https——纯 Rust TLS，C 交叉环境见
 # .cargo/config.toml 与 AGENTS.md 5.1）。
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 # 裁剪图 base64 data URL（多模态请求组包）。
 base64 = "0.22"
+# SHA256 文件校验（OCR 插件模型下载验哈希，纯 Rust 跨平台）。
+sha2 = "0.10"
+# zip 包解压（onnxruntime.dll 藏在微软 ORT 发布包 zip 内，按条目后缀定位解出；
+# 只开 deflate：微软发布包为标准 deflate，且避开 bzip2/lzma/zstd 的 C 依赖
+# （zstd-sys 在 clang 交叉下链接挂 SSE 符号，见 PROGRESS 五十四）。纯 Rust 可单测。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # 配置序列化（TOML 配置文件）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

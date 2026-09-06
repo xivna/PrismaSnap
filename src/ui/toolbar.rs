@@ -6,8 +6,10 @@
 //! - **位置计算**（[`toolbar_pos_pts`]）：纯逻辑，跨平台，含单元测试。
 //!   优先放选区下方居中，下方空间不足翻到上方，上下都不够放选区内底部；
 //!   水平方向钳制在屏幕内（遮挡规避）。
-//! - **egui 绘制**（`toolbar_ui`，仅 Windows）：文字按钮占位（图标素材
-//!   用户准备中），点击结果以 [`ToolbarAction`] 返回给调用方处理。
+//! - **egui 绘制**（`toolbar_ui`，仅 Windows）：图标按钮（`assets/icons/` 200px
+//!   PNG，`include_bytes!` 编进 exe，便携无外部依赖；深色图标配浅色底衬，
+//!   深浅主题都看得见），悬停 tooltip 显示中文名；点击结果以 [`ToolbarAction`]
+//!   返回给调用方处理。
 
 #[cfg(target_os = "windows")]
 use crate::annotation::Color;
@@ -246,6 +248,90 @@ mod tests {
 
 // ── egui 绘制（仅 Windows，依赖 egui）────────────────────────────────────
 
+// 图标资源（200×200 RGBA PNG；`include_bytes!` 编进 exe，便携包无外部文件依赖）。
+// 命名与按钮一一对应（见 `icon_button`）。
+#[cfg(target_os = "windows")]
+const ICON_RECT: &[u8] = include_bytes!("../../assets/icons/rect.png");
+#[cfg(target_os = "windows")]
+const ICON_ARROW: &[u8] = include_bytes!("../../assets/icons/arrow.png");
+#[cfg(target_os = "windows")]
+const ICON_BRUSH: &[u8] = include_bytes!("../../assets/icons/brush.png");
+#[cfg(target_os = "windows")]
+const ICON_MOSAIC: &[u8] = include_bytes!("../../assets/icons/mosaic.png");
+#[cfg(target_os = "windows")]
+const ICON_TEXT: &[u8] = include_bytes!("../../assets/icons/text.png");
+#[cfg(target_os = "windows")]
+const ICON_UNDO: &[u8] = include_bytes!("../../assets/icons/undo.png");
+#[cfg(target_os = "windows")]
+const ICON_REDO: &[u8] = include_bytes!("../../assets/icons/redo.png");
+#[cfg(target_os = "windows")]
+const ICON_COPY: &[u8] = include_bytes!("../../assets/icons/copy.png");
+#[cfg(target_os = "windows")]
+const ICON_SAVE: &[u8] = include_bytes!("../../assets/icons/save.png");
+#[cfg(target_os = "windows")]
+const ICON_CANCEL: &[u8] = include_bytes!("../../assets/icons/cancel.png");
+#[cfg(target_os = "windows")]
+const ICON_EXTRACT: &[u8] = include_bytes!("../../assets/icons/extract.png");
+#[cfg(target_os = "windows")]
+const ICON_TRANSLATE: &[u8] = include_bytes!("../../assets/icons/translate.png");
+
+/// 图标显示尺寸（egui 点；200px 源图缩下来，HiDPI 也清晰）。
+#[cfg(target_os = "windows")]
+const ICON_SIZE: f32 = 18.0;
+
+/// 图标按钮底衬（浅色圆角芯片：图标本身是深色线条，深浅主题下都看得见；
+/// 选中态改用主题选中色）。
+#[cfg(target_os = "windows")]
+const ICON_CHIP: egui::Color32 = egui::Color32::from_rgb(240, 240, 243);
+
+/// 取图标纹理（`egui::Context` 数据区缓存，多帧复用不重复解码）。
+#[cfg(target_os = "windows")]
+fn icon_texture(
+    ctx: &egui::Context,
+    key: &'static str,
+    bytes: &'static [u8],
+) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("toolbar_icon", key));
+    if let Some(handle) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(handle);
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let handle = ctx.load_texture(key, color, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, handle.clone()));
+    Some(handle)
+}
+
+/// 图标按钮（图标缺失/解码失败时回退文字按钮，保证功能不断）。
+///
+/// * `selected` - 选中态（当前激活工具）用主题选中色打底；
+/// * `enabled` - 禁用态（撤销/重做无历史、AI 忙时）；
+/// * 返回 `(是否被点, 响应)`——调用方照旧处理点击，tooltip 已内置。
+#[cfg(target_os = "windows")]
+fn icon_button(
+    ui: &mut egui::Ui,
+    tooltip: &str,
+    key: &'static str,
+    bytes: &'static [u8],
+    selected: bool,
+    enabled: bool,
+) -> egui::Response {
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else {
+        ICON_CHIP
+    };
+    let Some(handle) = icon_texture(ui.ctx(), key, bytes) else {
+        return ui.add_enabled(enabled, egui::Button::new(tooltip).fill(fill));
+    };
+    let img = egui::Image::new(&handle).fit_to_exact_size(egui::vec2(ICON_SIZE, ICON_SIZE));
+    let btn = egui::Button::image(img)
+        .fill(fill)
+        .min_size(egui::vec2(ICON_SIZE + 12.0, ICON_SIZE + 8.0));
+    ui.add_enabled(enabled, btn).on_hover_text(tooltip)
+}
+
 /// 工具条点击结果（由覆盖层在处理完渲染后统一响应）。
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, PartialEq)]
@@ -340,42 +426,75 @@ pub fn toolbar_ui(
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            for tool in Tool::ALL {
-                                let mut btn = egui::Button::new(tool.label());
-                                if active_tool == Some(tool) {
-                                    btn = btn.fill(ui.visuals().selection.bg_fill);
-                                }
-                                if ui.add(btn).clicked() {
+                            // 标注工具（图标按钮，悬停看中文名；激活态主题色打底）
+                            const TOOL_ICONS: [(crate::annotation::Tool, &str, &[u8]); 5] = [
+                                (Tool::Rect, "矩形", ICON_RECT),
+                                (Tool::Arrow, "箭头", ICON_ARROW),
+                                (Tool::Brush, "画笔", ICON_BRUSH),
+                                (Tool::Mosaic, "马赛克", ICON_MOSAIC),
+                                (Tool::Text, "文字", ICON_TEXT),
+                            ];
+                            for (tool, name, bytes) in TOOL_ICONS {
+                                let key = match tool {
+                                    Tool::Rect => "rect",
+                                    Tool::Arrow => "arrow",
+                                    Tool::Brush => "brush",
+                                    Tool::Mosaic => "mosaic",
+                                    Tool::Text => "text",
+                                };
+                                if icon_button(ui, name, key, bytes, active_tool == Some(tool), true)
+                                    .clicked()
+                                {
                                     action = Some(ToolbarAction::ActivateTool(tool));
                                 }
                             }
                             ui.separator();
-                            if ui.add_enabled(can_undo, egui::Button::new("撤销")).clicked() {
+                            if icon_button(ui, "撤销", "undo", ICON_UNDO, false, can_undo)
+                                .clicked()
+                            {
                                 action = Some(ToolbarAction::Undo);
                             }
-                            if ui.add_enabled(can_redo, egui::Button::new("重做")).clicked() {
+                            if icon_button(ui, "重做", "redo", ICON_REDO, false, can_redo)
+                                .clicked()
+                            {
                                 action = Some(ToolbarAction::Redo);
                             }
                             ui.separator();
-                            if ui.button("复制").clicked() {
+                            if icon_button(ui, "复制", "copy", ICON_COPY, false, true).clicked()
+                            {
                                 action = Some(ToolbarAction::Copy);
                             }
-                            if ui.button("保存").clicked() {
+                            if icon_button(ui, "保存", "save", ICON_SAVE, false, true).clicked()
+                            {
                                 action = Some(ToolbarAction::Save);
                             }
-                            if ui.button("取消").clicked() {
+                            if icon_button(ui, "取消", "cancel", ICON_CANCEL, false, true)
+                                .clicked()
+                            {
                                 action = Some(ToolbarAction::Cancel);
                             }
                             ui.separator();
-                            if ui
-                                .add_enabled(!ai_busy, egui::Button::new("提取文字"))
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                "提取文字",
+                                "extract",
+                                ICON_EXTRACT,
+                                false,
+                                !ai_busy,
+                            )
+                            .clicked()
                             {
                                 action = Some(ToolbarAction::ExtractText);
                             }
-                            if ui
-                                .add_enabled(!ai_busy, egui::Button::new("翻译"))
-                                .clicked()
+                            if icon_button(
+                                ui,
+                                "翻译",
+                                "translate",
+                                ICON_TRANSLATE,
+                                false,
+                                !ai_busy,
+                            )
+                            .clicked()
                             {
                                 action = Some(ToolbarAction::Translate);
                             }

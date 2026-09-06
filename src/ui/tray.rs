@@ -86,10 +86,28 @@ impl Tray {
     }
 }
 
-/// 程序内生成 32x32 棱镜图标：深蓝渐变底 + 白色三角。
+/// 托盘图标：`assets/icons/托盘图标.png`（200px RGBA，编进 exe，便携无外部依赖）。
 ///
-/// 简单几何图形，避免外部资源文件；正式版本替换为 assets/icons 的图标。
+/// 读入后缩到 32×32（托盘标准尺寸；200px 源图缩下来边缘干净）。解码失败时
+/// 回退程序内生成的棱镜占位图，保证托盘一定能立起来。
 fn make_prism_icon() -> anyhow::Result<Icon> {
+    const SIZE: u32 = 32;
+    const TRAY_PNG: &[u8] = include_bytes!("../../assets/icons/托盘图标.png");
+    if let Ok(img) = image::load_from_memory(TRAY_PNG) {
+        let small = img.resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3);
+        let rgba = small.to_rgba8().into_raw();
+        if let Ok(icon) = Icon::from_rgba(rgba, SIZE, SIZE) {
+            return Ok(icon);
+        }
+        tracing::warn!("托盘图标尺寸转换失败，用占位图");
+    } else {
+        tracing::warn!("托盘图标解码失败，用占位图");
+    }
+    make_fallback_icon()
+}
+
+/// 程序内生成 32x32 棱镜占位图：深蓝渐变底 + 白色三角（图标缺失时的兜底）。
+fn make_fallback_icon() -> anyhow::Result<Icon> {
     const SIZE: usize = 32;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
