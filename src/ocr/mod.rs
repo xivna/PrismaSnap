@@ -88,6 +88,31 @@ impl TextBlock {
         let sum: f32 = self.regions.iter().map(|r| r.confidence).sum();
         sum / self.regions.len() as f32
     }
+
+    /// 视觉行数：子区域按 y 分行计数（同行容差与检测排序一致，
+    /// 见 `rapid::same_line_band` 思想：`max(10, 半行高)` 上限 40px）。
+    ///
+    /// 合并会把同行相邻框并进一个块（`merge::should_merge` 间距≈0 即合），
+    /// 此时 `regions.len()` 是框数不是行数——断行必须按本函数，
+    /// 否则单行原文会被当成多行拆散、字号也被多行高度压小
+    /// （2026-09-06 实机：单行英文译后异常小）。
+    pub fn visual_line_count(&self) -> usize {
+        let mut sorted: Vec<&TextRegion> = self.regions.iter().collect();
+        sorted.sort_by_key(|r| (r.bbox.y, r.bbox.x));
+        let mut lines = 0usize;
+        let mut first_y = 0u32;
+        let mut band = 0u32;
+        let mut first_in_band = true;
+        for r in sorted {
+            if first_in_band || r.bbox.y.saturating_sub(first_y) > band {
+                lines += 1;
+                first_y = r.bbox.y;
+                band = (r.bbox.height / 2).clamp(10, 40);
+                first_in_band = false;
+            }
+        }
+        lines.max(1).min(self.regions.len().max(1))
+    }
 }
 
 /// 词间拼接：CJK 相邻不加空格，其余加空格。
@@ -223,6 +248,31 @@ mod tests {
             merged_text: Some(String::from("行0行1")),
         };
         assert!((block.confidence() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn visual_lines_count_bands_not_boxes() {
+        // 同行两框（y 差 3）→ 1 行；下方再来一行（y 差 30）→ 2 行
+        let block = TextBlock {
+            bbox: BBox { x: 0, y: 0, width: 200, height: 60 },
+            regions: vec![
+                region(0, 0, 0, 90, 16, 0.9),
+                region(1, 100, 3, 90, 16, 0.9),
+                region(2, 0, 35, 200, 16, 0.9),
+            ],
+            merged_text: Some(String::from("ab\nc")),
+        };
+        assert_eq!(block.visual_line_count(), 2);
+    }
+
+    #[test]
+    fn visual_lines_single_box_is_one() {
+        let block = TextBlock {
+            bbox: BBox { x: 0, y: 0, width: 100, height: 20 },
+            regions: vec![region(0, 0, 0, 100, 20, 0.9)],
+            merged_text: Some(String::from("Hi")),
+        };
+        assert_eq!(block.visual_line_count(), 1);
     }
 
     #[test]

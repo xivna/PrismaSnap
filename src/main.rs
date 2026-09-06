@@ -42,8 +42,8 @@ mod imp {
     use prismsnap::capture::{display_info, engine, frame};
     use prismsnap::config::Config;
     use prismsnap::hotkey::HotkeyManager;
-    use prismsnap::ui::ai::AiDone;
-    use prismsnap::ui::overlay::{CapturedShot, Overlay};
+        use prismsnap::ui::ai::AiDone;
+        use prismsnap::ui::overlay::{CapturedShot, Overlay};
     use prismsnap::ui::settings::Settings;
     use prismsnap::ui::tray::{Tray, TrayAction};
     use prismsnap::utils::{logging, paths, single_instance};
@@ -427,8 +427,10 @@ mod imp {
             }
         };
 
-        // 2. 日志（文件句柄须持有到进程退出）
-        let _log_file = logging::init(&paths::exe_dir()?.join("logs"))?;
+        // 2. 日志（文件句柄须持有到进程退出；级别读自配置，改后重启生效）
+        let config_path_early = Config::default_path()?;
+        let log_level = Config::load_log_level(&config_path_early);
+        let _log_file = logging::init(&paths::exe_dir()?.join("logs"), &log_level)?;
         info!("PrismaSnap 启动");
 
         // panic 兜底：把崩溃栈写进日志（发布版无控制台，不设 hook 什么都看不到）
@@ -437,8 +439,8 @@ mod imp {
             eprintln!("panic: {info}");
         }));
 
-        // 3. 配置
-        let config_path = Config::default_path()?;
+        // 3. 配置（路径前面读日志级别时已算过，直接复用）
+        let config_path = config_path_early;
         let config = match Config::load(&config_path) {
             Ok(c) => c,
             Err(e) => {

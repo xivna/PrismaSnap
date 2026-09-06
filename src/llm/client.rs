@@ -178,6 +178,14 @@ pub fn encode_crop(image: &image::DynamicImage) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// 日志截断（按字符数，避免长回包刷屏；中文按字符计）。
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect::<String>() + "…"
+}
+
 /// JPEG 字节包成 `data:image/jpeg;base64,...` URL（OpenAI 图片输入格式）。
 pub fn data_url(jpeg: &[u8]) -> String {
     format!(
@@ -189,12 +197,16 @@ pub fn data_url(jpeg: &[u8]) -> String {
 /// 纯文本翻译后端（模式二）。
 pub struct TextBackend {
     client: LlmClient,
+    prompts: crate::config::TranslatePrompts,
 }
 
 impl TextBackend {
-    /// 由文本 LLM 配置构造。
-    pub fn new(endpoint: LlmEndpoint) -> anyhow::Result<Self> {
-        Ok(Self { client: LlmClient::new(endpoint)? })
+    /// 由文本 LLM 配置 + 提示词模板构造。
+    pub fn new(
+        endpoint: LlmEndpoint,
+        prompts: crate::config::TranslatePrompts,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { client: LlmClient::new(endpoint)?, prompts })
     }
 }
 
@@ -210,12 +222,20 @@ impl TranslationBackend for TextBackend {
         }
         let inputs: Vec<(usize, &str)> =
             texts.iter().enumerate().map(|(i, t)| (i + 1, t.as_str())).collect();
-        let prompt = backend::build_text_prompt(&inputs, target_lang);
+        let prompt = backend::build_text_prompt(&inputs, target_lang, &self.prompts);
+        tracing::debug!("纯文本翻译请求：{} 条，目标 {}", texts.len(), target_lang);
         let body = self
             .client
             .chat_text("你是一个只输出 JSON 的专业翻译助手。", &prompt)
             .await?;
-        Ok(align_by_id(texts, &backend::parse_text_response(&body)))
+        tracing::debug!("纯文本翻译回包（{} 字节）：{}", body.len(), truncate(&body, 800));
+        let items = backend::parse_text_response(&body);
+        let out = align_by_id(texts, &items);
+        let empty = out.iter().filter(|t| t.trim().is_empty()).count();
+        if !out.is_empty() && empty == out.len() {
+            tracing::warn!("纯文本翻译全空：输入 {texts:?}，回包 {body:?}");
+        }
+        Ok(out)
     }
 
     async fn recognize_and_translate_image(
@@ -244,12 +264,16 @@ fn align_by_id(texts: &[String], items: &[TextTranslation]) -> Vec<String> {
 /// 多模态识别 + 翻译后端（模式一）。
 pub struct MultimodalBackend {
     client: LlmClient,
+    prompts: crate::config::TranslatePrompts,
 }
 
 impl MultimodalBackend {
-    /// 由多模态 LLM 配置构造。
-    pub fn new(endpoint: LlmEndpoint) -> anyhow::Result<Self> {
-        Ok(Self { client: LlmClient::new(endpoint)? })
+    /// 由多模态 LLM 配置 + 提示词模板构造。
+    pub fn new(
+        endpoint: LlmEndpoint,
+        prompts: crate::config::TranslatePrompts,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { client: LlmClient::new(endpoint)?, prompts })
     }
 }
 
@@ -272,16 +296,24 @@ impl TranslationBackend for MultimodalBackend {
             return Ok(vec![]);
         }
         if crops.len() == 1 {
-            let prompt = backend::build_multimodal_prompt(target_lang);
+            let prompt = backend::build_multimodal_prompt(target_lang, &self.prompts);
+            tracing::debug!("多模态单图翻译请求，目标 {}", target_lang);
             let body = self.client.chat_vision(&prompt, crops).await?;
+            tracing::debug!("多模态单图回包（{} 字节）：{}", body.len(), truncate(&body, 800));
             let single = backend::parse_multimodal_single(&body).unwrap_or(ImageTranslation {
                 original: String::new(),
                 translation: String::new(),
             });
+            if single.translation.trim().is_empty() {
+                tracing::warn!("多模态单图译文为空，回包 {body:?}");
+            }
             return Ok(vec![(single.original, single.translation)]);
         }
-        let prompt = backend::build_multimodal_batch_prompt(target_lang, crops.len());
+        let prompt =
+            backend::build_multimodal_batch_prompt(target_lang, crops.len(), &self.prompts);
+        tracing::debug!("多模态批量翻译请求：{} 图，目标 {}", crops.len(), target_lang);
         let body = self.client.chat_vision(&prompt, crops).await?;
+        tracing::debug!("多模态批量回包（{} 字节）：{}", body.len(), truncate(&body, 800));
         let items = backend::parse_multimodal_batch(&body);
         // 按下标对齐；解析丢条时尾部补空对（管线跳过不覆盖）。
         let mut out = Vec::with_capacity(crops.len());

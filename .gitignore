@@ -12,3 +12,6 @@ config.toml
 
 # 临时验收截图（根目录，不入库）
 /*.png
+
+# OCR 插件（模型 + onnxruntime.dll，>5M，随便携包分发，不入库，见 AGENTS.md 3.8）
+/plugins/

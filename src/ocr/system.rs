@@ -27,6 +27,10 @@ use crate::ocr::BBox;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemOcrEngine;
 
+/// 行框补白比例（行高的 15%，四向；对齐 Rapid unclip 外扩的思想，
+/// 但固定比例更可预测，见 `recognize_impl`；本文件仅 Windows 编译）。
+const BOX_PAD_RATIO: f32 = 0.15;
+
 /// 引擎可用性缓存（WinRT 引擎创建开销小但无状态变化时没必要反复查；
 /// 语言包是系统级安装，运行时不变，进程内缓存合理）。
 static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -86,10 +90,21 @@ impl SystemOcrEngine {
             if x1 <= x0 || y1 <= y0 {
                 continue;
             }
-            let height = y1 - y0;
+            // WinRT 词框是紧油墨框（无 Rapid 那样的 unclip 外扩），直接用会
+            // 让字号反推偏小、排版余量不足。按行高 15% 四向补白（钳制在图内），
+            // 补完的高度再反推字号（2026-09-06 实机：系统 OCR 小字）。
+            let (img_w, img_h) = (image.width(), image.height());
+            let pad = ((y1 - y0) as f32 * BOX_PAD_RATIO).round() as u32;
+            let (px0, py0) = (x0.saturating_sub(pad), y0.saturating_sub(pad));
+            let (px1, py1) =
+                ((x1 + pad).min(img_w), (y1 + pad).min(img_h));
+            if px1 <= px0 || py1 <= py0 {
+                continue;
+            }
+            let height = py1 - py0;
             out.push(TextRegion {
                 id: out.len(),
-                bbox: BBox { x: x0, y: y0, width: x1 - x0, height },
+                bbox: BBox { x: px0, y: py0, width: px1 - px0, height },
                 text: Some(join_words(&texts)),
                 confidence: 1.0,
                 angle: 0.0,

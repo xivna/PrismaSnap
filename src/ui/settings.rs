@@ -25,7 +25,10 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{Config, MultimodalMode, OcrEngineKind, SaveFormat, SaveMode, Theme, TranslateMode};
+use crate::config::{
+    Config, LogLevel, MultimodalMode, OcrEngineKind, SaveFormat, SaveMode, Theme,
+    TranslateMode, TranslatePrompts,
+};
 use crate::ocr::create_engine;
 
 use super::gui::{palette, GuiState, Palette};
@@ -337,7 +340,9 @@ fn draw_settings_ui(
             ui.add_space(16.0);
 
             match *active_section {
-                Section::General => draw_general(ui, &pal, draft, recording, start_recording),
+                Section::General => {
+                    draw_general(ui, &pal, draft, recording, start_recording, changed)
+                }
                 Section::Save => draw_save(ui, &pal, draft, dir_input, changed),
                 Section::Capture => draw_capture(ui, &pal, draft, changed),
                 Section::Appearance => draw_appearance(ui, &pal, draft, changed),
@@ -414,6 +419,7 @@ fn draw_general(
     draft: &mut Config,
     recording: bool,
     start_recording: &mut bool,
+    changed: &mut bool,
 ) {
     card(ui, pal, |ui| {
         setting_row(ui, "截图热键", |ui| {
@@ -430,6 +436,22 @@ fn draw_general(
                     *start_recording = true;
                 }
             }
+        });
+        row_separator(ui, pal);
+        setting_row(ui, "日志级别（需重启）", |ui| {
+            *changed |= segmented(
+                ui,
+                pal,
+                &[
+                    ("错误", LogLevel::Error),
+                    ("警告", LogLevel::Warn),
+                    ("信息", LogLevel::Info),
+                    ("调试", LogLevel::Debug),
+                    ("详细", LogLevel::Trace),
+                ],
+                52.0,
+                &mut draft.logging.level,
+            );
         });
     });
 }
@@ -711,6 +733,38 @@ fn draw_ai(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut b
             };
             ui.label(egui::RichText::new(status).size(12.5).color(color));
         });
+    });
+    ui.add_space(12.0);
+
+    // 卡片五：提示词模板（纯文本/多模态单图/多模态批量；留空用内置默认）。
+    card(ui, pal, |ui| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("提示词模板").size(13.0));
+        ui.label(
+            egui::RichText::new("占位符：{target} 目标语言，{items} 输入条目（纯文本），{count} 图片数（批量）。留空即用内置默认。")
+                .size(12.0)
+                .color(pal.secondary),
+        );
+        ui.add_space(4.0);
+        for (label, field) in [
+            ("纯文本", &mut draft.translate.prompts.text),
+            ("多模态单图", &mut draft.translate.prompts.multimodal_single),
+            ("多模态批量", &mut draft.translate.prompts.multimodal_batch),
+        ] {
+            ui.label(egui::RichText::new(label).size(12.5).strong());
+            *changed |= ui
+                .add_sized(
+                    [ui.available_width(), 84.0],
+                    egui::TextEdit::multiline(field).font(egui::FontId::monospace(12.0)),
+                )
+                .changed();
+            ui.add_space(4.0);
+        }
+        if primary_button(ui, pal, "恢复默认提示词").clicked() {
+            draft.translate.prompts = TranslatePrompts::default();
+            *changed = true;
+        }
+        ui.add_space(4.0);
     });
 }
 

@@ -98,10 +98,11 @@ fn run_translate(
     origin: (i32, i32),
     cfg: &TranslateConfig,
 ) -> anyhow::Result<Vec<TranslatedRegion>> {
-    let text = TextBackend::new(cfg.text_llm.clone())?;
+    let text = TextBackend::new(cfg.text_llm.clone(), cfg.prompts.clone())?;
+    let prompts = cfg.prompts.clone();
     let multimodal: Option<Box<dyn TranslationBackend>> = cfg
         .effective_multimodal()
-        .map(MultimodalBackend::new)
+        .map(|ep| MultimodalBackend::new(ep, prompts))
         .transpose()?
         .map(|m| Box::new(m) as Box<dyn TranslationBackend>);
     let pipeline = TranslatePipeline {

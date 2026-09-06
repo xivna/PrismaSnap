@@ -14,7 +14,9 @@ use std::collections::HashMap;
 
 use image::RgbaImage;
 
-use crate::annotation::tools::text::{draw_text_in_rect, measure_line_width};
+use crate::annotation::tools::text::{
+    draw_text_in_rect, measure_line_width, wrap_text_for_width,
+};
 use crate::annotation::Color;
 use crate::ocr::{BBox, TranslatedRegion};
 use crate::utils::math::Rect;
@@ -151,6 +153,49 @@ pub fn fit_font_size(initial: f32, translated: &str, max_width: f32, bold: bool)
     (initial * (max_width / widest)).clamp(MIN_FONT_SIZE, initial)
 }
 
+/// 字号与换行联合自适应：宽高双约束，返回 `(字号, 排好版的行)`。
+///
+/// 只按宽度缩（如 `fit_font_size`）时，多行译文总高度会溢出框底（2026-09-06
+/// 实机：两行英文译成两行中文，字号不变、高度超框）。本函数先宽度试缩，
+/// 再按换行后总高度迭代再缩，直到塞进框或触底 [`MIN_FONT_SIZE`]。
+/// 高度按 `(行数 - 1) × 字号 × 1.25 + 字号 + 上下各 2px` 计——末行之后
+/// 无需行距，单行只需 1em + 内边距（此前统一 `行数 × 1.25` 把单行也多压了
+/// 0.25 行，是英文短行译后偏小的另一半原因）。预览与导出共用本函数，
+/// 保证"所见即所得"且绝不溢出框（触底仍超是极小框的接受项）。
+pub fn fit_font_size_box(
+    initial: f32,
+    translated: &str,
+    max_w: f32,
+    max_h: f32,
+    bold: bool,
+) -> (f32, Vec<String>) {
+    let split_only = || {
+        translated.split('\n').map(str::to_string).collect::<Vec<_>>()
+    };
+    if max_w <= 0.0 || max_h <= 0.0 {
+        return (initial.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE), split_only());
+    }
+    let mut size = fit_font_size(initial, translated, max_w, bold);
+    for _ in 0..8 {
+        let lines = wrap_text_for_width(translated, size, max_w, bold);
+        let need_h = text_block_height(lines.len(), size);
+        if need_h <= max_h || size <= MIN_FONT_SIZE {
+            return (size, lines);
+        }
+        size = (size * (max_h / need_h) * 0.98).clamp(MIN_FONT_SIZE, size);
+    }
+    (size, wrap_text_for_width(translated, size, max_w, bold))
+}
+
+/// 排好版的多行文本总高度（物理像素）：行距只计在行与行之间，
+/// 末行之后无行距，另加上下各 2px 内边距（与两端绘制对齐）。
+fn text_block_height(line_count: usize, size: f32) -> f32 {
+    if line_count == 0 {
+        return 4.0;
+    }
+    (line_count - 1) as f32 * size * 1.25 + size + 4.0
+}
+
 /// 全图 bbox 按选区原点平移为图内本地矩形（与 `apply_to_image` 同约定）。
 pub fn shift_bbox(bbox: BBox, origin: (i32, i32)) -> Rect {
     Rect {
@@ -182,14 +227,22 @@ pub fn render_translated_region(
     erase_background(img, local, region.bg_color);
     let rect = shift_bbox(region.bbox, origin);
     let avail_w = rect.width as f32 - 4.0; // 与 draw_text_in_rect 内边距对齐
-    let size = fit_font_size(region.est_font_size as f32, &region.translated, avail_w, bold);
+    let avail_h = rect.height as f32 - 4.0;
+    // 宽高双约束排版（与预览同函数），排好的行原样喂绘制（内部不再二次断行）
+    let (size, lines) = fit_font_size_box(
+        region.est_font_size as f32,
+        &region.translated,
+        avail_w,
+        avail_h,
+        bold,
+    );
     let color = Color {
         r: region.text_color[0],
         g: region.text_color[1],
         b: region.text_color[2],
         a: 255,
     };
-    draw_text_in_rect(img, rect, &region.translated, color, size, bold);
+    draw_text_in_rect(img, rect, &lines.join("\n"), color, size, bold);
 }
 
 #[cfg(test)]
@@ -248,6 +301,30 @@ mod tests {
         // 空译文/零宽度保守处理
         assert_eq!(fit_font_size(20.0, "", 60.0, false), 20.0);
         assert_eq!(fit_font_size(20.0, "Hi", 0.0, false), 20.0);
+    }
+
+    #[test]
+    fn box_fit_shrinks_for_height() {
+        // 宽度充裕但高度只够一行：单行短译文也得缩（此前只看宽度会溢出框底）
+        let (size, lines) = fit_font_size_box(20.0, "Hi", 500.0, 20.0, false);
+        assert_eq!(lines, vec![String::from("Hi")]);
+        assert!(size < 20.0, "size={size}");
+        assert!((lines.len() - 1) as f32 * size * 1.25 + size + 4.0 <= 20.0 + 1e-3);
+    }
+
+    #[test]
+    fn box_fit_keeps_fitting_text() {
+        // 宽高都够：保持初值
+        let (size, lines) = fit_font_size_box(20.0, "Hi", 500.0, 200.0, false);
+        assert!((size - 20.0).abs() < f32::EPSILON);
+        assert_eq!(lines, vec![String::from("Hi")]);
+    }
+
+    #[test]
+    fn box_fit_never_below_min() {
+        // 极小框：触底 8，不再缩
+        let (size, _) = fit_font_size_box(20.0, "很长很长很长很长很长很长很长的译文", 10.0, 10.0, false);
+        assert!(size >= MIN_FONT_SIZE, "size={size}");
     }
 
     #[test]

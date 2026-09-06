@@ -70,6 +70,12 @@ global-hotkey = "0.8"
 # 原生文件对话框（保存位置的"始终询问"模式，底层 Win32 IFileDialog）。
 # default-features 关掉 Linux 的 xdg-portal/wayland；common-controls-v6 启用现代对话框样式。
 rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
+# RapidOCR 推理（仅 Windows，插件式；`load-dynamic` 不链接 onnxruntime，
+# 运行时经 `ort::init_from` 从 `plugins/ocr/onnxruntime.dll` 加载；
+# `ndarray` 为组 batch 输入用。版本与 DLL 配对：ort 2.0.0-rc.13 ↔ ORT 1.28，
+# 用 `=` 精确锁定，升级时 DLL 必须同步换，见 AGENTS.md 3.8 节）。
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.17"
 # Win32/WinRT 绑定：
 #   - Win32_Devices_Display   CCD API：DisplayConfigGetDeviceInfo 查询 SDR 白点（无 CoreWindow 依赖）
 #   - Win32_Foundation        GetLastError / ERROR_ALREADY_EXISTS（单实例检测）

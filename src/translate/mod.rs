@@ -161,6 +161,7 @@ impl TranslatePipeline {
             .iter()
             .map(|&i| blocks[i].merged_text.clone().unwrap_or_default())
             .collect();
+        tracing::debug!("模式二：{} 块送纯文本翻译: {texts:?}", texts.len());
         let translated = self.text.translate_text(&texts, &self.target_lang).await?;
         let mut out = Vec::new();
         for (k, &i) in idx.iter().enumerate() {
@@ -191,6 +192,7 @@ impl TranslatePipeline {
         if crops.is_empty() {
             return Ok(vec![]);
         }
+        tracing::debug!("模式一：{} 张裁剪图送多模态", crops.len());
         let pairs = mm.recognize_and_translate_image(&crops, &self.target_lang).await?;
         let mut out = Vec::new();
         for (k, &i) in kept.iter().enumerate() {
@@ -308,8 +310,9 @@ fn assemble_with_original(
     if translated.trim().is_empty() {
         return None;
     }
-    // 单行译文按原文行数断行（多行原文被 LLM 压成一行时恢复段落结构）
-    let translated = match_source_lines(&translated, block.regions.len());
+    // 单行译文按原文视觉行数断行（多行原文被 LLM 压成一行时恢复段落结构；
+    // 注意用视觉行数而非框数：同行多框只算一行，否则单行会被硬拆、字号也被压小）
+    let translated = match_source_lines(&translated, block.visual_line_count());
     // 图内本地框（采样/裁剪用），越界钳制由采样函数处理
     let local = BBox {
         x: (block.bbox.x as i32 - origin.0).max(0) as u32,

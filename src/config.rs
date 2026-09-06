@@ -30,6 +30,8 @@ pub struct Config {
     pub ocr: OcrConfig,
     /// 翻译管线配置（见 AGENTS.md 3.8 节）。
     pub translate: TranslateConfig,
+    /// 日志配置（级别改后重启生效）。
+    pub logging: LoggingConfig,
 }
 
 impl Default for Config {
@@ -45,8 +47,47 @@ impl Default for Config {
             llm: LlmConfig::default(),
             ocr: OcrConfig::default(),
             translate: TranslateConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
+}
+
+/// 日志级别（设置页通用区，改后重启生效；TOML 里小写，如 `level = "debug"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// 只记错误。
+    Error,
+    /// 错误 + 警告。
+    Warn,
+    /// 默认：错误 + 警告 + 关键流程。
+    #[default]
+    Info,
+    /// 再加 LLM 原始回包、管线分支等诊断细节（出问题定位用）。
+    Debug,
+    /// 最啰嗦（含框架底层）。
+    Trace,
+}
+
+impl LogLevel {
+    /// 转 tracing 过滤字符串（`RUST_LOG` 环境变量仍优先，见 `logging::init`）。
+    pub fn as_filter(&self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+/// 日志配置。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// 日志级别（默认 `info`）。
+    pub level: LogLevel,
 }
 
 /// 界面外观配置。
@@ -265,6 +306,8 @@ pub struct TranslateConfig {
     pub text_llm: LlmEndpoint,
     /// 多模态后端（= 设置页新增多模态卡片）。
     pub multimodal_llm: MultimodalLlmConfig,
+    /// 提示词模板（= 设置页提示词卡片；留空即用内置默认）。
+    pub prompts: TranslatePrompts,
 }
 
 impl Default for TranslateConfig {
@@ -275,6 +318,86 @@ impl Default for TranslateConfig {
             confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
             text_llm: LlmEndpoint::default(),
             multimodal_llm: MultimodalLlmConfig::default(),
+            prompts: TranslatePrompts::default(),
+        }
+    }
+}
+
+/// LLM 提示词模板（设置页可自定义；任一条留空即用内置默认）。
+///
+/// 占位符：`{target}` = 目标语言；`{items}` = 输入 JSON 数组（仅纯文本模板）；
+/// `{count}` = 图片数量（仅多模态批量模板）。未知占位符原样保留。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranslatePrompts {
+    /// 纯文本翻译模板（含 `{target}`、`{items}`）。
+    pub text: String,
+    /// 多模态单图模板（含 `{target}`）。
+    pub multimodal_single: String,
+    /// 多模态批量模板（含 `{target}`、`{count}`）。
+    pub multimodal_batch: String,
+}
+
+/// 内置纯文本提示词模板（与此前硬编码一致，含占位符）。
+pub const DEFAULT_TEXT_PROMPT: &str = "你是专业翻译。请将下面 JSON 数组中每一项的 \"text\" 字段翻译为{target}，\n\
+并保持 \"id\" 不变、条目数量不变、顺序不变，不要合并或拆分条目。\n\
+严格按以下 JSON 格式输出，不要输出任何解释性文字：\n\
+[{\"id\": 1, \"translation\": \"...\"}, {\"id\": 2, \"translation\": \"...\"}]\n\
+\n\
+输入：\n\
+[{items}]";
+/// 内置多模态单图提示词模板。
+pub const DEFAULT_MULTIMODAL_SINGLE_PROMPT: &str = "你是专业的图像文字识别与翻译助手。这是一张截图局部区域的图片，\n\
+其中包含一行或多行文字。请完成：\n\
+1. 按阅读顺序识别图片中的所有文字；\n\
+2. 将识别结果翻译为{target}；\n\
+3. 严格按以下 JSON 格式输出，不要输出任何多余内容：\n\
+{\"original\": \"识别出的原文\", \"translation\": \"对应译文\"}\n\
+若图片中没有可识别的文字，输出 {\"original\": \"\", \"translation\": \"\"}";
+/// 内置多模态批量提示词模板。
+pub const DEFAULT_MULTIMODAL_BATCH_PROMPT: &str = "你是专业的图像文字识别与翻译助手。下面有 {count} 张截图局部区域的图片，\n\
+每张包含一行或多行文字。请对每张图完成：\n\
+1. 按阅读顺序识别图片中的所有文字；\n\
+2. 将识别结果翻译为{target}；\n\
+3. 严格按输入图片顺序返回一个 JSON 数组，每项带序号，不要输出任何多余内容：\n\
+[{\"index\": 0, \"original\": \"原文\", \"translation\": \"译文\"}, ...]\n\
+若某张图没有可识别的文字，该项输出 {\"index\": N, \"original\": \"\", \"translation\": \"\"}";
+
+impl Default for TranslatePrompts {
+    fn default() -> Self {
+        Self {
+            text: String::from(DEFAULT_TEXT_PROMPT),
+            multimodal_single: String::from(DEFAULT_MULTIMODAL_SINGLE_PROMPT),
+            multimodal_batch: String::from(DEFAULT_MULTIMODAL_BATCH_PROMPT),
+        }
+    }
+}
+
+impl TranslatePrompts {
+    /// 取生效模板（空字符串回退内置默认，保证总有可用提示词）。
+    pub fn effective_text(&self) -> &str {
+        if self.text.trim().is_empty() {
+            DEFAULT_TEXT_PROMPT
+        } else {
+            &self.text
+        }
+    }
+
+    /// 取生效模板（空字符串回退内置默认）。
+    pub fn effective_multimodal_single(&self) -> &str {
+        if self.multimodal_single.trim().is_empty() {
+            DEFAULT_MULTIMODAL_SINGLE_PROMPT
+        } else {
+            &self.multimodal_single
+        }
+    }
+
+    /// 取生效模板（空字符串回退内置默认）。
+    pub fn effective_multimodal_batch(&self) -> &str {
+        if self.multimodal_batch.trim().is_empty() {
+            DEFAULT_MULTIMODAL_BATCH_PROMPT
+        } else {
+            &self.multimodal_batch
         }
     }
 }
@@ -302,6 +425,16 @@ impl Config {
     /// 默认配置文件路径：可执行文件同目录下的 `config.toml`（便携模式）。
     pub fn default_path() -> anyhow::Result<PathBuf> {
         Ok(paths::exe_dir()?.join("config.toml"))
+    }
+
+    /// 只读日志级别（日志系统初始化之前调用；文件缺失/损坏一律回默认，
+    /// 不报错——此时日志还没建，报错也没处记）。
+    pub fn load_log_level(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<Config>(&text).ok())
+            .map(|c| c.logging.level.as_filter().to_string())
+            .unwrap_or_else(|| String::from("info"))
     }
 
     /// 从指定路径加载配置。
@@ -511,6 +644,40 @@ model = "new-model"
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.translate.text_llm.model, "new-model");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prompts_default_and_empty_fallback() {
+        let p = TranslatePrompts::default();
+        assert!(p.effective_text().contains("{target}"));
+        assert!(p.effective_text().contains("{items}"));
+        assert!(p.effective_multimodal_single().contains("{target}"));
+        assert!(p.effective_multimodal_batch().contains("{count}"));
+        // 空模板回退默认
+        let mut empty = TranslatePrompts {
+            text: String::from("   "),
+            multimodal_single: String::new(),
+            multimodal_batch: String::new(),
+        };
+        assert_eq!(empty.effective_text(), DEFAULT_TEXT_PROMPT);
+        assert_eq!(
+            empty.effective_multimodal_single(),
+            DEFAULT_MULTIMODAL_SINGLE_PROMPT
+        );
+        assert_eq!(
+            empty.effective_multimodal_batch(),
+            DEFAULT_MULTIMODAL_BATCH_PROMPT
+        );
+        // 非空原样返回
+        empty.text = String::from("译{target}");
+        assert_eq!(empty.effective_text(), "译{target}");
+    }
+
+    #[test]
+    fn log_level_filter_strings() {
+        assert_eq!(LogLevel::Info.as_filter(), "info");
+        assert_eq!(LogLevel::Debug.as_filter(), "debug");
+        assert_eq!(Config::default().logging.level, LogLevel::Info);
     }
 
     #[test]

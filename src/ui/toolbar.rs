@@ -26,6 +26,74 @@ pub const BAR_GAP: f32 = 10.0;
 /// 保证洞的圆角与工具条卡片完全重合（见 `overlay::dim_outside_selection`）。
 pub const CORNER_RADIUS: f32 = 10.0;
 
+/// 提取文字面板估算尺寸（egui 点：360 内容宽 + 边距，标题栏 + 8 行文本 + 按钮）。
+pub const AI_PANEL_SIZE: (f32, f32) = (372.0, 310.0);
+
+/// 提取面板与选区间的间距（egui 点）。
+pub const PANEL_GAP: f32 = 8.0;
+
+/// 计算提取文字面板左上角位置（egui 逻辑点）。
+///
+/// * `sel` - 选区（物理像素）；
+/// * `screen` - 显示器物理矩形；
+/// * `bar` - 工具条矩形 `(x0, y0, x1, y1)`（egui 点，遮罩挖洞用的同一份缓存），
+///   候选位置与其重叠即跳过，保证面板不盖工具条；
+/// * `ppp` - 当前 DPI 缩放。
+///
+/// 优先级：选区右侧 → 左侧 → 下方 → 上方（均须屏内放下且不压工具条）；
+/// 都放不下时兜底选区左上内偏移（ historical 行为，钳制屏内）。
+/// 右/左候选与选区顶部对齐——面板纵向是文字流，不挡选区正文。
+pub fn ai_panel_pos_pts(
+    sel: &Rect,
+    screen: &Rect,
+    bar: Option<(f32, f32, f32, f32)>,
+    ppp: f32,
+) -> (f32, f32) {
+    let (pw, ph) = AI_PANEL_SIZE;
+    let sx0 = sel.x as f32 / ppp;
+    let sy0 = sel.y as f32 / ppp;
+    let sx1 = sel.right() as f32 / ppp;
+    let sy1 = sel.bottom() as f32 / ppp;
+    let scx0 = screen.x as f32 / ppp;
+    let scy0 = screen.y as f32 / ppp;
+    let scx1 = screen.right() as f32 / ppp;
+    let scy1 = screen.bottom() as f32 / ppp;
+
+    let overlaps_bar = |x: f32, y: f32| match bar {
+        None => false,
+        Some((bx0, by0, bx1, by1)) => x < bx1 && bx0 < x + pw && y < by1 && by0 < y + ph,
+    };
+    let fits = |x: f32, y: f32| x >= scx0 && y >= scy0 && x + pw <= scx1 && y + ph <= scy1;
+
+    // 右侧（与选区顶对齐）
+    let (rx, ry) = (sx1 + PANEL_GAP, sy0);
+    if fits(rx, ry) && !overlaps_bar(rx, ry) {
+        return (rx, ry);
+    }
+    // 左侧
+    let (lx, ly) = (sx0 - PANEL_GAP - pw, sy0);
+    if fits(lx, ly) && !overlaps_bar(lx, ly) {
+        return (lx, ly);
+    }
+    // 下方（左对齐选区，x 钳制屏内）
+    let bx = sx0.clamp(scx0, (scx1 - pw).max(scx0));
+    let by = sy1 + PANEL_GAP;
+    if fits(bx, by) && !overlaps_bar(bx, by) {
+        return (bx, by);
+    }
+    // 上方
+    let ax = bx;
+    let ay = sy0 - PANEL_GAP - ph;
+    if fits(ax, ay) && !overlaps_bar(ax, ay) {
+        return (ax, ay);
+    }
+    // 兜底：选区左上内偏移（历史行为），钳制屏内
+    (
+        (sx0 + 6.0).clamp(scx0, (scx1 - pw).max(scx0)),
+        (sy0 + 28.0).clamp(scy0, (scy1 - ph).max(scy0)),
+    )
+}
+
 /// 预设标注颜色（展示顺序，取自 [`Color`] 常量）。
 #[cfg(target_os = "windows")]
 const PRESET_COLORS: [Color; 6] = [
@@ -135,6 +203,44 @@ mod tests {
         assert_eq!(y, (450.0 + 300.0) / 1.5 + BAR_GAP);
         // 选区中心点 = (750+300)/1.5 = 700，x = 700 - 300 = 400
         assert_eq!(x, 400.0);
+    }
+
+    #[test]
+    fn panel_prefers_right_of_selection() {
+        // 右侧有空 → 选区右 + gap，顶部对齐
+        let sel = Rect { x: 500, y: 300, width: 400, height: 200 };
+        assert_eq!(
+            ai_panel_pos_pts(&sel, &SCREEN, None, PPP),
+            (900.0 + PANEL_GAP, 300.0)
+        );
+    }
+
+    #[test]
+    fn panel_dodges_toolbar_to_left() {
+        // 工具条压住右侧候选 → 改走左侧
+        let sel = Rect { x: 500, y: 300, width: 400, height: 200 };
+        let bar = Some((900.0, 290.0, 1500.0, 400.0));
+        assert_eq!(
+            ai_panel_pos_pts(&sel, &SCREEN, bar, PPP),
+            (500.0 - PANEL_GAP - AI_PANEL_SIZE.0, 300.0)
+        );
+    }
+
+    #[test]
+    fn panel_falls_below_when_sides_blocked() {
+        // 左右都放不下（贴边宽选区）→ 下方左对齐
+        let sel = Rect { x: 0, y: 300, width: 1900, height: 200 };
+        assert_eq!(
+            ai_panel_pos_pts(&sel, &SCREEN, None, PPP),
+            (0.0, 500.0 + PANEL_GAP)
+        );
+    }
+
+    #[test]
+    fn panel_falls_back_inside_when_nowhere_fits() {
+        // 全屏选区哪都放不下 → 兜底左上内偏移
+        let sel = Rect { x: 0, y: 0, width: 1920, height: 1080 };
+        assert_eq!(ai_panel_pos_pts(&sel, &SCREEN, None, PPP), (6.0, 28.0));
     }
 }
 
