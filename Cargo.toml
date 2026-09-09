@@ -13,6 +13,10 @@ license = "MIT"
 # 用法：cargo build --target x86_64-pc-windows-msvc --release --features console
 console = []
 
+# 构建脚本依赖：exe 图标资源嵌入（交叉编译走 llvm-rc，见 build.rs 与 AGENTS.md 5.1）。
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 # 错误处理。AGENTS.md 约定：优先 anyhow::Result，避免 unwrap/expect。
 anyhow = "1"
@@ -22,8 +26,9 @@ half = "2"
 # 精简 features：默认会拉 exr/avif/tiff/webp 等大量 codec，只用 png/jpeg 以缩短交叉编译时间。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # 异步运行时（Phase 4：LLM/翻译后台任务 + EventLoopProxy 回传，见 AGENTS.md 3.10）。
-# full 特性：net/time/sync/macros 等一次配齐，避免后续逐个补。
-tokio = { version = "1", features = ["full"] }
+# 按需特性（Phase 5 体积优化）：实际只用到 rt（runtime/spawn/spawn_blocking）
+# 与 macros（join! / #[tokio::test]）；net/time 等由 reqwest 自行按需拉取。
+tokio = { version = "1", features = ["rt", "macros"] }
 # async trait 对象安全（Box<dyn TranslationBackend>，见 AGENTS.md 3.8）。
 async-trait = "0.1"
 # LLM HTTP 客户端（OpenAI 兼容，双后端共用；default-features 关闭省编译量，
@@ -59,12 +64,13 @@ arboard = "3.6"
 # GUI 栈（版本核实于 2026-08-14，egui 三件套必须同版本）：
 #   egui-wgpu 0.36.1 已升级依赖 wgpu 30（附录里 29 作废），egui-winit 0.36.1 锁 winit 0.30.13。
 #   wgpu 30 引入 SurfaceColorSpace（ExtendedSrgbLinear = scRGB 线性，HDR 输出关键）。
-#   egui-wgpu 关闭 default（不拉 wgpu/webgl），手动声明 wgpu 后端 features 只保留 dx12 + vulkan 兜底。
+#   egui-wgpu 关闭 default（不拉 wgpu/webgl），手动声明 wgpu 后端 features 只保留 dx12
+#   （覆盖层/设置窗 gui.rs 已强制 Backends::DX12，vulkan 后端编译进来也用不到，已裁掉）。
 egui = "0.36"
 egui-wgpu = { version = "0.36", default-features = false, features = ["winit"] }
 egui-winit = { version = "0.36", default-features = false, features = ["clipboard"] }
 winit = { version = "0.30", features = ["rwh_06"] }
-wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12", "vulkan"] }
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "dx12"] }
 # 同步阻塞 poll wgpu 异步初始化（官方 demo 用法）
 pollster = "1"
 # wgpu 纹理数据上传（cast_slice）
@@ -101,6 +107,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -150,6 +157,11 @@ windows = { version = "0.62", features = [
 # ─────────────────────────────────────────────────────────────────────────
 
 [profile.release]
+# 性能敏感路径（HDR 色彩映射/马赛克/导出重绘）保持 O3；体积优化靠 LTO + 单编译单元。
 opt-level = 3
-lto = "thin"
+# fat LTO + 单 codegen unit：跨 crate 内联与死代码消除更彻底（Phase 5 体积优化，2026-09-09）。
+lto = "fat"
+codegen-units = 1
+# 无 catch_unwind（全库已核实）：panic 直接退出，省去展开表。
+panic = "abort"
 strip = true

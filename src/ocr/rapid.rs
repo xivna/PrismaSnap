@@ -109,7 +109,7 @@ impl OcrEngine for RapidOcrEngine {
         #[cfg(target_os = "windows")]
         {
             let boxes = windows::detect_boxes(&self.dir, image)?;
-            return Ok(boxes_to_regions(&boxes, true));
+            Ok(boxes_to_regions(&boxes, true))
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -124,7 +124,7 @@ impl OcrEngine for RapidOcrEngine {
     ) -> anyhow::Result<Vec<TextRegion>> {
         #[cfg(target_os = "windows")]
         {
-            return windows::detect_and_recognize_impl(&self.dir, image);
+            windows::detect_and_recognize_impl(&self.dir, image)
         }
         #[cfg(not(target_os = "windows"))]
         {

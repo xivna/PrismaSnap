@@ -91,6 +91,8 @@ pub struct Overlay {
     mode: Mode,
     /// 标注编辑器（Edit 模式的画布状态与标注数据）。
     editor: Editor,
+    /// 工具条字体选择弹层状态（选中文字改字体，Word 式悬停实时预览）。
+    font_picker: super::font_list::FontPickerState,
     /// 最近一次光标位置（物理像素；`MouseInput` 事件不带坐标，以此补足）。
     current_cursor: Option<(f32, f32)>,
     /// 拖动起点（物理像素）。
@@ -200,6 +202,7 @@ impl Overlay {
             hdr_mode,
             mode: Mode::Selecting,
             editor: Editor::new(),
+            font_picker: super::font_list::FontPickerState::default(),
             current_cursor: None,
             drag_start: None,
             selection: None,
@@ -240,14 +243,13 @@ impl Overlay {
                             self.window.request_redraw();
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::Enter) => {
+                        PhysicalKey::Code(KeyCode::Enter)
                             // Shift+Enter 交给 egui 插换行，普通 Enter 确认
-                            if !self.modifiers.shift_key() {
+                            if !self.modifiers.shift_key() => {
                                 self.editor.commit_text_edit();
                                 self.window.request_redraw();
                                 return;
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -638,6 +640,13 @@ impl Overlay {
         let mut copy_translated = false;
         let theme = self.config.ui.theme;
         let editor = &mut self.editor;
+        let mut font_picker_state = std::mem::take(&mut self.font_picker);
+        // 帧开始前预注册本帧要用到的逐标注字体（egui 的 set_fonts 在帧中间调用
+        // 当帧不生效，沿用旧字体表的 galley 会对未绑定 family 直接 panic——
+        // 2026-09-09 实机闪退 "FontFamily::Name(ann_..) is not bound to any fonts"）
+        for font_path in editor.all_text_fonts() {
+            super::gui::ensure_annotation_family(self.gui.egui_ctx(), Some(&font_path));
+        }
         let ai_busy = self.ai_busy;
         let ai_start = self.ai_start;
         let ai_translated = &self.ai_translated;
@@ -689,6 +698,9 @@ impl Overlay {
                     &editor.mosaic_style(),
                     editor.text_font_size(),
                     editor.text_bold(),
+                    editor.has_selected_text().then(|| editor.selected_text_font()),
+                    editor.selected_text_style(),
+                    &mut font_picker_state,
                     editor.can_undo(),
                     editor.can_redo(),
                     ai_busy,
@@ -759,7 +771,10 @@ impl Overlay {
                 let size = egui::vec2(edit_rect.width as f32 / ppp, edit_rect.height as f32 / ppp);
                 let col = egui::Color32::from_rgba_unmultiplied(editor.stroke_color().r, editor.stroke_color().g, editor.stroke_color().b, editor.stroke_color().a);
                 let font_size_val = editor.text_font_size();
-                let font_id = egui::FontId::proportional(font_size_val / ppp);
+                // 按编辑中文字（或悬停预览中）的独立字体渲染内联输入框
+                let edit_font = editor.editing_text_font();
+                let fam = crate::ui::gui::ensure_annotation_family(ui.ctx(), edit_font.as_deref());
+                let font_id = egui::FontId::new(font_size_val / ppp, fam);
                 egui::Area::new(egui::Id::new("text_inline_edit"))
                     .fixed_pos(anchor)
                     .order(egui::Order::Foreground)
@@ -792,6 +807,7 @@ impl Overlay {
         });
         // 缓存工具条实际渲染矩形；首帧测量到边界后请求再绘一帧，
         // 让贴合的遮罩挖洞立即生效
+        self.font_picker = font_picker_state;
         let first_measure = self.bar_rect_cache.is_none() && bar_actual.is_some();
         self.bar_rect_cache = bar_actual;
         if first_measure {
@@ -857,11 +873,28 @@ impl Overlay {
                 self.window.request_redraw();
             }
             ToolbarAction::SetTextFontSize(size) => {
-                self.editor.set_text_font_size(size);
+                // 有选中文字 → 实时改选中标注；无选中 → 新标注默认值（apply_* 内部分流）
+                self.editor.apply_text_font_size(size);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetTextColorAt(color) => {
+                self.editor.apply_text_color(color);
+                self.window.request_redraw();
+            }
+            ToolbarAction::SetTextFont(font) => {
+                // 提交选中文字字体（restore 由 end_text_font_hover 统一处理）
+                self.editor.end_text_font_hover(Some(font));
+                self.window.request_redraw();
+            }
+            ToolbarAction::TextFontHover(font) => {
+                match font {
+                    Some(path) => self.editor.hover_text_font(Some(path)),
+                    None => self.editor.end_text_font_hover(None),
+                }
                 self.window.request_redraw();
             }
             ToolbarAction::SetTextBold(bold) => {
-                self.editor.set_text_bold(bold);
+                self.editor.apply_text_bold(bold);
                 self.window.request_redraw();
             }
             ToolbarAction::SetMosaicStyle(style) => {
@@ -1172,7 +1205,7 @@ impl Overlay {
                     egui::pos2(rect.min.x + 2.0, y),
                     egui::Align2::LEFT_TOP,
                     line,
-                    egui::FontId::proportional(size),
+                    crate::ui::gui::annotation_font_id(size),
                     fg,
                 );
                 y += size * 1.25;

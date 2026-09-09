@@ -1,0 +1,2 @@
+// PrismaSnap exe 图标（资源管理器/任务栏显示；托盘图标在运行时单独加载）。
+1 ICON "app.ico"

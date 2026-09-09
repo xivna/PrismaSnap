@@ -30,6 +30,8 @@ struct BlurCacheEntry {
     padded_rect: Rect,
     radius: f32,
     blurred: image::RgbaImage,
+    /// 构建时已提交标注的修订号（标注变更即重建，保证"下层标注被覆盖效果"与导出一致）。
+    rev: u64,
     handle: egui::TextureHandle,
 }
 
@@ -42,13 +44,21 @@ pub struct Editor {
     blur_cache: HashMap<u64, BlurCacheEntry>,
     /// 在途预览（in_progress）专用缓存，避免每帧新建纹理。
     preview_blur: Option<BlurCacheEntry>,
+    /// 字体悬停预览态（选中文字 idx + 原字体，弹层悬停实时换字体用）。
+    font_hover: Option<(usize, Option<String>)>,
     /// 选区边界（物理像素），标注创建/拖动/缩放均钳制于此（防止拖出选区外并遮挡工具条）。
     selection: Option<Rect>,
 }
 
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Editor {
     pub fn new() -> Self {
-        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None }
+        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None, font_hover: None }
     }
 
     /// 设置选区边界（`Overlay` 每帧同步），`None` 表示无限制。
@@ -82,7 +92,6 @@ impl Editor {
         // preview_blur 的 id 若已提交则会转正，无需额外清理，下次重算即可
     }
     pub fn active_tool(&self) -> Option<Tool> { self.active_tool }
-    pub fn is_editing(&self) -> bool { self.active_tool.is_some() }
     pub fn is_stroking(&self) -> bool { self.mgr.in_progress().is_some() }
     pub fn is_dragging(&self) -> bool { self.mgr.is_dragging() }
     pub fn is_resizing_text(&self) -> bool { self.resizing_text.is_some() }
@@ -302,9 +311,9 @@ impl Editor {
                         let r = self.clamp_rect(rect);
                         if r != rect { Some(Annotation::Mosaic{ id, rect: r, style }) } else { None }
                     },
-                    Annotation::Text{ id, rect, content, color, font_size, bold } => {
+                    Annotation::Text{ id, rect, content, color, font_size, bold, font } => {
                         let r = self.clamp_rect(rect);
-                        if r != rect { Some(Annotation::Text{ id, rect: r, content, color, font_size, bold }) } else { None }
+                        if r != rect { Some(Annotation::Text{ id, rect: r, content, color, font_size, bold, font }) } else { None }
                     },
                     Annotation::Arrow{ id, from, to, color, stroke_width } => {
                         let t = self.clamp_pt(to);
@@ -388,7 +397,7 @@ impl Editor {
                         let clamped = match ann {
                             Annotation::Rect{ id, rect, color, stroke_width } => { let r = self.clamp_rect(rect); Annotation::Rect{ id, rect: r, color, stroke_width } },
                             Annotation::Mosaic{ id, rect, style } => { let r = self.clamp_rect(rect); Annotation::Mosaic{ id, rect: r, style } },
-                            Annotation::Text{ id, rect, content, color, font_size, bold } => { let r = self.clamp_rect(rect); Annotation::Text{ id, rect: r, content, color, font_size, bold } },
+                            Annotation::Text{ id, rect, content, color, font_size, bold, font } => { let r = self.clamp_rect(rect); Annotation::Text{ id, rect: r, content, color, font_size, bold, font } },
                             Annotation::Arrow{ id, from, to, color, stroke_width } => {
                                 let f = self.clamp_pt(from);
                                 let t = self.clamp_pt(to);
@@ -426,6 +435,113 @@ impl Editor {
         if ok { self.prune_blur_cache(); }
         ok
     }
+    /// 字体操作的目标文字下标（编辑态优先，其次选中态）。
+    fn font_target_index(&self) -> Option<usize> {
+        if let Some(st) = &self.editing_text {
+            return st.index;
+        }
+        self.mgr.selected()
+    }
+
+    /// 选中/编辑中文字的独立字体（目标不是文字或无目标返回 `None`）。
+    pub fn selected_text_font(&self) -> Option<String> {
+        self.font_target_index().and_then(|i| self.mgr.text_font_at(i))
+    }
+
+    /// 内联编辑中文字的独立字体（新文字为 None；内联 TextEdit 按此 family 渲染）。
+    pub fn editing_text_font(&self) -> Option<String> {
+        let idx = self.editing_text.as_ref().and_then(|s| s.index)?;
+        match self.mgr.annotations().get(idx) {
+            Some(Annotation::Text { font, .. }) => font.clone(),
+            _ => None,
+        }
+    }
+
+    /// 当前是否有可改字体的文字标注（工具条字体选择器可用性）。
+    pub fn has_selected_text(&self) -> bool {
+        self.font_target_index()
+            .is_some_and(|i| matches!(self.mgr.annotations().get(i), Some(Annotation::Text{..})))
+    }
+
+    /// 选中/编辑中文字的当前样式（工具条字号/加粗/颜色行实时联动用；
+    /// `None` = 无选中文字，工具条走"新标注默认值"路径）。
+    pub fn selected_text_style(&self) -> Option<(f32, bool)> {
+        let idx = self.font_target_index()?;
+        match self.mgr.annotations().get(idx) {
+            Some(Annotation::Text { font_size, bold, .. }) => Some((*font_size, *bold)),
+            _ => None,
+        }
+    }
+
+    /// 选中文字实时改字号（走历史可撤销；无选中文字则改"新标注默认值"）。
+    ///
+    /// 注意默认值与标注都要写：内联编辑预览读 `mgr.text_font_size`（默认值），
+    /// 标注预览/导出读标注自身字段——只写一边另一边就"没反应"
+    /// （2026-09-10 实机反馈根因）。
+    pub fn apply_text_font_size(&mut self, size: f32) {
+        self.mgr.set_text_font_size(size);
+        if let Some(i) = self.font_target_index() {
+            self.mgr.set_text_font_size_at(i, size);
+        }
+    }
+
+    /// 选中文字实时改加粗（默认值与标注双写，理由同上）。
+    pub fn apply_text_bold(&mut self, bold: bool) {
+        self.mgr.set_text_bold(bold);
+        if let Some(i) = self.font_target_index() {
+            self.mgr.set_text_bold_at(i, bold);
+        }
+    }
+
+    /// 选中文字实时改颜色（默认值与标注双写，理由同上）。
+    pub fn apply_text_color(&mut self, color: Color) {
+        self.set_stroke_color(color);
+        if let Some(i) = self.font_target_index() {
+            self.mgr.set_text_color_at(i, color);
+        }
+    }
+
+    /// 全部在用文字字体（覆盖层每帧渲染前预注册 egui family 用，
+    /// 防止 mid-frame set_fonts 不生效导致 FontFamily unbound panic）。
+    pub fn all_text_fonts(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for a in self.mgr.annotations().iter().chain(self.mgr.in_progress()) {
+            if let Annotation::Text { font: Some(f), .. } = a {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// 字体悬停实时预览（Word 式：弹层悬停某字体，选中文字立即变体）。
+    pub fn hover_text_font(&mut self, font_path: Option<String>) {
+        let Some(idx) = self.font_target_index() else { return };
+        if !matches!(self.mgr.annotations().get(idx), Some(Annotation::Text{..})) { return; }
+        if self.font_hover.as_ref().map(|(i, _)| *i) != Some(idx) {
+            self.font_hover = Some((idx, self.mgr.text_font_at(idx)));
+        }
+        if self.mgr.text_font_at(idx) != font_path {
+            self.mgr.set_text_font_raw(idx, font_path);
+        }
+    }
+
+    /// 结束字体悬停预览：`commit = Some(f)` 提交该字体（走历史可撤销），
+    /// `None` 仅还原。
+    pub fn end_text_font_hover(&mut self, commit: Option<Option<String>>) {
+        if let Some((idx, orig)) = self.font_hover.take() {
+            if self.mgr.text_font_at(idx) != orig {
+                self.mgr.set_text_font_raw(idx, orig.clone());
+            }
+            if let Some(f) = commit {
+                if f != orig {
+                    self.mgr.set_text_font_at(idx, f);
+                }
+            }
+        }
+    }
+
     pub fn can_undo(&self) -> bool { self.mgr.can_undo() }
     pub fn can_redo(&self) -> bool { self.mgr.can_redo() }
     pub fn annotations(&self) -> &[Annotation] { self.mgr.annotations() }
@@ -459,9 +575,10 @@ impl Editor {
                     let r = egui::Rect::from_min_max(egui::pos2(rect.x as f32/ppp, rect.y as f32/ppp), egui::pos2(rect.right() as f32/ppp, rect.bottom() as f32/ppp));
                     let radius = radius.max(1.0);
                     let blur_id = *id;
+                    let cur_rev = self.mgr.rev();
                     let mut done = false;
                     if let Some(entry) = self.blur_cache.get_mut(&blur_id) {
-                        if (entry.radius - radius).abs() < 0.01 && rect.x >= entry.padded_rect.x && rect.y >= entry.padded_rect.y && rect.right() <= entry.padded_rect.right() && rect.bottom() <= entry.padded_rect.bottom() {
+                        if entry.rev == cur_rev && (entry.radius - radius).abs() < 0.01 && rect.x >= entry.padded_rect.x && rect.y >= entry.padded_rect.y && rect.right() <= entry.padded_rect.right() && rect.bottom() <= entry.padded_rect.bottom() {
                             let dx = (rect.x - entry.padded_rect.x) as u32;
                             let dy = (rect.y - entry.padded_rect.y) as u32;
                             let w = rect.width; let h = rect.height;
@@ -479,12 +596,15 @@ impl Editor {
                         }
                     }
                     if done { continue; }
-                    // 未命中或半径变化：重算 padded 模糊（方案B stack_blur O(1)）
+                    // 未命中/半径变化/标注变更：重算 padded 模糊（方案B stack_blur O(1)）。
+                    // 先把本马赛克之前的标注画进裁剪块再模糊——与导出 apply_to_image 的
+                    // 顺序一致，保证"被马赛克覆盖的下层标注"预览与导出像素相同（2026-09-09）。
                     let padded = padded_rect_for_blur(*rect, img);
                     if padded.width >= 2 && padded.height >= 2 {
                         let x0 = padded.x as u32; let y0 = padded.y as u32;
                         let pw = padded.width; let ph = padded.height;
                         let mut patch = image::imageops::crop_imm(img, x0, y0, pw, ph).to_image();
+                        crate::annotation::apply_to_image(&mut patch, &self.mgr.annotations()[..idx], (padded.x, padded.y));
                         stack_blur_rgba(&mut patch, radius as u32);
                         // 缓存整块 padded 模糊
                         let entry_exists = self.blur_cache.contains_key(&blur_id);
@@ -496,13 +616,14 @@ impl Editor {
                                 entry.padded_rect = padded;
                                 entry.radius = radius;
                                 entry.blurred = patch;
+                                entry.rev = cur_rev;
                                 entry.handle.set(color_image, egui::TextureOptions::LINEAR);
                                 painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                             }
                         } else {
                             let handle = ctx.load_texture(format!("blur_cache_{}", blur_id), color_image, egui::TextureOptions::LINEAR);
                             let tid = handle.id();
-                            self.blur_cache.insert(blur_id, BlurCacheEntry{ padded_rect: padded, radius, blurred: patch, handle });
+                            self.blur_cache.insert(blur_id, BlurCacheEntry{ padded_rect: padded, radius, blurred: patch, rev: cur_rev, handle });
                             painter.image(tid, r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                         }
                         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
@@ -515,7 +636,7 @@ impl Editor {
                     }
                 }
             }
-            draw_annotation(painter, ctx, ann, ppp, selected, image);
+            draw_annotation(painter, ctx, ann, ppp, selected, image, &self.mgr.annotations()[..idx]);
         }
         if let Some(state) = &self.editing_text {
             let to_pt = |p: (f32,f32)| egui::pos2(p.0/ppp, p.1/ppp);
@@ -541,8 +662,9 @@ impl Editor {
                     let r = egui::Rect::from_min_max(egui::pos2(rect.x as f32/ppp, rect.y as f32/ppp), egui::pos2(rect.right() as f32/ppp, rect.bottom() as f32/ppp));
                     let radius_v = radius.max(1.0);
                     let mut handled = false;
+                    let cur_rev = self.mgr.rev();
                     if let Some(entry) = self.preview_blur.as_mut() {
-                        if (entry.radius - radius_v).abs() < 0.01 && rect.x >= entry.padded_rect.x && rect.y >= entry.padded_rect.y && rect.right() <= entry.padded_rect.right() && rect.bottom() <= entry.padded_rect.bottom() {
+                        if entry.rev == cur_rev && (entry.radius - radius_v).abs() < 0.01 && rect.x >= entry.padded_rect.x && rect.y >= entry.padded_rect.y && rect.right() <= entry.padded_rect.right() && rect.bottom() <= entry.padded_rect.bottom() {
                             let dx = (rect.x - entry.padded_rect.x) as u32;
                             let dy = (rect.y - entry.padded_rect.y) as u32;
                             let w = rect.width; let h = rect.height;
@@ -560,6 +682,7 @@ impl Editor {
                             let x0 = padded.x as u32; let y0 = padded.y as u32;
                             let pw = padded.width; let ph = padded.height;
                             let mut patch = image::imageops::crop_imm(img, x0, y0, pw, ph).to_image();
+                            crate::annotation::apply_to_image(&mut patch, self.mgr.annotations(), (padded.x, padded.y));
                             stack_blur_rgba(&mut patch, radius_v as u32);
                             let dx = (rect.x - padded.x) as u32; let dy = (rect.y - padded.y) as u32;
                             let cropped = image::imageops::crop_imm(&patch, dx, dy, rect.width, rect.height).to_image();
@@ -568,12 +691,13 @@ impl Editor {
                                 entry.padded_rect = padded;
                                 entry.radius = radius_v;
                                 entry.blurred = patch;
+                                entry.rev = cur_rev;
                                 entry.handle.set(color_image, egui::TextureOptions::LINEAR);
                                 painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                             } else {
                                 let handle = ctx.load_texture("preview_blur", color_image, egui::TextureOptions::LINEAR);
                                 let tid = handle.id();
-                                self.preview_blur = Some(BlurCacheEntry{ padded_rect: padded, radius: radius_v, blurred: patch, handle });
+                                self.preview_blur = Some(BlurCacheEntry{ padded_rect: padded, radius: radius_v, blurred: patch, rev: cur_rev, handle });
                                 painter.image(tid, r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                             }
                             painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
@@ -586,12 +710,13 @@ impl Editor {
                 }
             }
             let is_text = matches!(a, Annotation::Text{..});
-            draw_annotation(painter, ctx, &a, ppp, is_text, image);
+            let prefix = self.mgr.annotations().to_vec();
+            draw_annotation(painter, ctx, &a, ppp, is_text, image, &prefix);
         }
     }
 }
 
-fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>) {
+fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>, prefix: &[Annotation]) {
     let to_pt = |p: (f32,f32)| egui::pos2(p.0/ppp, p.1/ppp);
     let stroke = |c: Color, w: f32| egui::Stroke::new(w/ppp, egui::Color32::from_rgba_unmultiplied(c.r,c.g,c.b,c.a));
     match ann {
@@ -602,16 +727,13 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
         Annotation::Arrow{ from, to, color, stroke_width, .. } => {
             let (f,t) = (to_pt(*from), to_pt(*to));
             let st = stroke(*color,*stroke_width);
+            // 线段直通尖端 + 开放 V 形两翼（与导出 draw_arrow 共用 arrow_head_wings 几何，
+            // 简约线条式样无填充，见 2026-09-09 用户定稿）。两翼必须走一条
+            // path（w1→t→w2）：egui Round join 自动圆角连接尖端，对齐导出的
+            // tip disk；拆成两笔独立线段会在尖端留下缺口（2026-09-10 实机反馈）
             painter.line_segment([f,t], st);
-            let dir = (t - f).normalized();
-            if dir.length_sq() > 1e-6 {
-                let hl = 12.0*st.width.max(1.0);
-                for ang in [std::f32::consts::PI*5.0/6.0, -std::f32::consts::PI*5.0/6.0] {
-                    let (s,c) = ang.sin_cos();
-                    let d = egui::vec2(dir.x*c - dir.y*s, dir.x*s + dir.y*c);
-                    painter.line_segment([t, t + d*hl], st);
-                }
-            }
+            let (w1, w2) = crate::annotation::tools::arrow::arrow_head_wings(*from, *to, *stroke_width);
+            painter.add(egui::Shape::line(vec![to_pt(w1), t, to_pt(w2)], st));
         }
         Annotation::Brush{ points, color, stroke_width, highlighter, .. } => {
             let pts: Vec<egui::Pos2> = points.iter().map(|&p| to_pt(p)).collect();
@@ -629,16 +751,23 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
                         let bs=(*block_size as i32).max(2);
                         let x0=rect.x.clamp(0,img.width() as i32); let y0=rect.y.clamp(0,img.height() as i32);
                         let x1=rect.right().clamp(0,img.width() as i32); let y1=rect.bottom().clamp(0,img.height() as i32);
-                        for by in (y0..y1).step_by(bs as usize) { for bx in (x0..x1).step_by(bs as usize) {
-                            let bx1=(bx+bs).min(x1); let by1=(by+bs).min(y1);
-                            let mut rs=0; let mut gs=0; let mut bs_=0; let mut cnt=0;
-                            for py in by..by1 { for px in bx..bx1 { let p=img.get_pixel(px as u32, py as u32).0; rs+=p[0] as u32; gs+=p[1] as u32; bs_+=p[2] as u32; cnt+=1; }}
-                            if cnt==0 {continue;}
-                            let col=egui::Color32::from_rgb((rs/cnt) as u8,(gs/cnt) as u8,(bs_/cnt) as u8);
-                            let lr=egui::Rect::from_min_max(to_pt((bx as f32, by as f32)), to_pt((bx1 as f32, by1 as f32)));
-                            painter.rect_filled(lr,0.0,col);
-                        }}
-                        painter.rect_stroke(r,0.0,egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                        if x0 < x1 && y0 < y1 {
+                            // 先裁剪并把前序标注画进块（与导出 apply_to_image 顺序一致，
+                            // 保证被本马赛克覆盖的下层标注预览可见），再分块均值。
+                            let w = (x1-x0) as u32; let h = (y1-y0) as u32;
+                            let mut patch = image::imageops::crop_imm(img, x0 as u32, y0 as u32, w, h).to_image();
+                            crate::annotation::apply_to_image(&mut patch, prefix, (x0, y0));
+                            for by in (0..h as i32).step_by(bs as usize) { for bx in (0..w as i32).step_by(bs as usize) {
+                                let bx1=(bx+bs).min(w as i32); let by1=(by+bs).min(h as i32);
+                                let mut rs=0; let mut gs=0; let mut bs_=0; let mut cnt=0;
+                                for py in by..by1 { for px in bx..bx1 { let p=patch.get_pixel(px as u32, py as u32).0; rs+=p[0] as u32; gs+=p[1] as u32; bs_+=p[2] as u32; cnt+=1; }}
+                                if cnt==0 {continue;}
+                                let col=egui::Color32::from_rgb((rs/cnt) as u8,(gs/cnt) as u8,(bs_/cnt) as u8);
+                                let lr=egui::Rect::from_min_max(to_pt(((x0+bx) as f32, (y0+by) as f32)), to_pt(((x0+bx1) as f32, (y0+by1) as f32)));
+                                painter.rect_filled(lr,0.0,col);
+                            }}
+                            painter.rect_stroke(r,0.0,egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                        }
                     } else { painter.rect_filled(r,0.0, egui::Color32::from_rgb(68,68,68)); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); }
                 }
                 crate::annotation::MosaicStyle::Blur{ .. } => {
@@ -648,11 +777,13 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
                 crate::annotation::MosaicStyle::Solid{ color } => { painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255)); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); }
             }
         }
-        Annotation::Text{ rect, content, color, font_size, bold, .. } => {
+        Annotation::Text{ rect, content, color, font_size, bold, font, .. } => {
             let r = egui::Rect::from_min_max(to_pt((rect.x as f32, rect.y as f32)), to_pt((rect.right() as f32, rect.bottom() as f32)));
             // 文本框无底色（透明），仅边框与文字，避免遮挡截图内容
             // 按行 wrapping 绘制（与导出一致的简易 wrap）
-            let font_id = egui::FontId::proportional(font_size / ppp);
+            // 文字标注预览用"标注字体" family（独立字体优先，与导出 CPU 渲染同字体文件）
+            let fam = crate::ui::gui::ensure_annotation_family(_ctx, font.as_deref());
+            let font_id = egui::FontId::new(font_size / ppp, fam);
             let col = egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,color.a);
             let wrap_w = (rect.width as f32 / ppp).max(20.0);
             let galley = painter.layout(content.clone(), font_id.clone(), col, wrap_w);

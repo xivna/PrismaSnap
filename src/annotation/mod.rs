@@ -121,6 +121,9 @@ pub enum Annotation {
         font_size: f32,
         /// 是否加粗（预览用 egui 粗体，导出用描边模拟或粗体字体）。
         bold: bool,
+        /// 本条标注独立字体（字体文件路径；`None` = 全局标注字体 `ui.annotation_font`，
+        /// 再回落系统默认。工具条字体选择器对选中文字实时改写）。
+        font: Option<String>,
     },
 }
 
@@ -200,7 +203,7 @@ impl Annotation {
                 }
                 Rect { x: min_x - w, y: min_y - w, width: (max_x - min_x + 2 * w) as u32, height: (max_y - min_y + 2 * w) as u32 }
             }
-            Annotation::Mosaic { rect, style: _, .. } => *rect,
+            Annotation::Mosaic { rect, .. } => *rect,
             Annotation::Text { rect, .. } => *rect,
         }
     }
@@ -235,7 +238,12 @@ impl Annotation {
             }
             Annotation::Arrow { from, to, stroke_width, .. } => {
                 let tol = stroke_width.max(1.0) * 0.5 + TOL;
-                point_to_segment_dist(pt, *from, *to) <= tol
+                // 线段与两翼均可命中（拖箭头头部也能拖动）
+                if point_to_segment_dist(pt, *from, *to) <= tol {
+                    return true;
+                }
+                let (w1, w2) = tools::arrow::arrow_head_wings(*from, *to, *stroke_width);
+                point_to_segment_dist(pt, *to, w1) <= tol || point_to_segment_dist(pt, *to, w2) <= tol
             }
             Annotation::Brush { points, stroke_width, .. } => {
                 if points.len() < 2 {
@@ -331,6 +339,9 @@ pub struct AnnotationManager {
     drag: Option<DragState>,
     /// 自增 id，下一次新建标注分配。
     next_id: u64,
+    /// 已提交标注的修订号：任何改变渲染效果的变更（提交/编辑/拖动/撤销等）
+    /// 自增一次，供马赛克/模糊预览缓存判断失效（2026-09-09 修复"被覆盖工具预览不一致"）。
+    rev: u64,
 }
 
 /// 单次拖动的临时状态。
@@ -359,6 +370,7 @@ impl Default for AnnotationManager {
             selected: None,
             drag: None,
             next_id: 1,
+            rev: 0,
         }
     }
 }
@@ -368,6 +380,15 @@ impl AnnotationManager {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
+    }
+
+    /// 已提交标注修订号（渲染效果变更时自增，预览缓存失效判断用）。
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    fn bump_rev(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
     }
 }
 
@@ -412,6 +433,7 @@ impl AnnotationManager {
                 color: self.stroke_color,
                 font_size: self.text_font_size,
                 bold: self.text_bold,
+                font: None,
             }),
         };
     }
@@ -436,6 +458,7 @@ impl AnnotationManager {
         if let Some(a) = self.in_progress.take() {
             if !a.is_degenerate() {
                 self.stack.push(a);
+                self.bump_rev();
             }
         }
     }
@@ -483,15 +506,11 @@ impl AnnotationManager {
             color: self.stroke_color,
             font_size: self.text_font_size,
             bold: self.text_bold,
+            font: None,
         };
         self.stack.push(ann);
+        self.bump_rev();
         self.selected = Some(self.stack.annotations().len() - 1);
-    }
-
-    /// 便捷：在点位创建默认大小文本框。
-    pub fn push_text_at(&mut self, pos: (f32, f32), content: String) {
-        let rect = Rect { x: pos.0 as i32, y: pos.1 as i32, width: 200, height: 40 };
-        self.push_text(rect, content);
     }
 
     /// 更新已提交的文字标注内容/样式（双击编辑后确认调用）。
@@ -506,7 +525,7 @@ impl AnnotationManager {
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) {
             return false;
         }
-        self.stack.edit_current(|vec| {
+        let ok = self.stack.edit_current(|vec| {
             if let Some(Annotation::Text { content: c, color: col, font_size: fs, bold: b, .. }) = vec.get_mut(index) {
                 *c = content.clone();
                 *col = color;
@@ -516,7 +535,9 @@ impl AnnotationManager {
             } else {
                 false
             }
-        })
+        });
+        if ok { self.bump_rev(); }
+        ok
     }
 
     /// 更新文字框几何（拖动缩放句柄时调用）。
@@ -527,40 +548,75 @@ impl AnnotationManager {
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) {
             return false;
         }
-        self.stack.edit_current(|vec| {
+        let ok = self.stack.edit_current(|vec| {
             if let Some(Annotation::Text { rect, .. }) = vec.get_mut(index) {
                 *rect = new_rect;
                 true
             } else {
                 false
             }
-        })
+        });
+        if ok { self.bump_rev(); }
+        ok
     }
 
     /// 仅更新文字颜色（选中态实时预览用）。
     pub fn set_text_color_at(&mut self, index: usize, color: Color) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
-        self.stack.edit_current(|vec| {
+        let ok = self.stack.edit_current(|vec| {
             if let Some(Annotation::Text { color: c, .. }) = vec.get_mut(index) { *c = color; true } else { false }
-        })
+        });
+        if ok { self.bump_rev(); }
+        ok
     }
     /// 仅更新文字字号。
     pub fn set_text_font_size_at(&mut self, index: usize, size: f32) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
         let size = size.clamp(8.0, 120.0);
-        self.stack.edit_current(|vec| {
+        let ok = self.stack.edit_current(|vec| {
             if let Some(Annotation::Text { font_size: fs, .. }) = vec.get_mut(index) { *fs = size; true } else { false }
-        })
+        });
+        if ok { self.bump_rev(); }
+        ok
     }
     /// 仅更新文字加粗。
     pub fn set_text_bold_at(&mut self, index: usize, bold: bool) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
-        self.stack.edit_current(|vec| {
+        let ok = self.stack.edit_current(|vec| {
             if let Some(Annotation::Text { bold: b, .. }) = vec.get_mut(index) { *b = bold; true } else { false }
-        })
+        });
+        if ok { self.bump_rev(); }
+        ok
+    }
+
+    /// 读文字标注的独立字体（非文字或越界返回 `None`；仅供工具条字体选择器显示当前值）。
+    pub fn text_font_at(&self, index: usize) -> Option<String> {
+        match self.stack.annotations().get(index) {
+            Some(Annotation::Text { font, .. }) => font.clone(),
+            _ => None,
+        }
+    }
+
+    /// 设置文字标注独立字体（工具条字体选择器提交时调用，走历史可撤销）。
+    pub fn set_text_font_at(&mut self, index: usize, font: Option<String>) -> bool {
+        if index >= self.stack.annotations().len() { return false; }
+        if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
+        let ok = self.stack.edit_current(|vec| {
+            if let Some(Annotation::Text { font: f, .. }) = vec.get_mut(index) { *f = font.clone(); true } else { false }
+        });
+        if ok { self.bump_rev(); }
+        ok
+    }
+
+    /// 原地改写文字字体（悬停实时预览用，不走历史；与 update_drag 同级别的临时改写）。
+    pub fn set_text_font_raw(&mut self, index: usize, font: Option<String>) {
+        if let Some(Annotation::Text { font: f, .. }) = self.stack.annotations_mut().get_mut(index) {
+            *f = font;
+            self.bump_rev();
+        }
     }
 
     // ── 选中 / 命中 / 拖动（无工具默认态整体移动）─────────────────────
@@ -616,6 +672,7 @@ impl AnnotationManager {
             if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
                 *cur = d.origin.clone();
                 cur.translate(dx, dy);
+                self.bump_rev();
             }
         }
     }
@@ -659,6 +716,7 @@ impl AnnotationManager {
         if let Some(d) = self.drag.take() {
             if let Some(cur) = self.stack.annotations_mut().get_mut(d.index) {
                 *cur = d.origin.clone();
+                self.bump_rev();
             }
             self.selected = Some(d.index);
         }
@@ -668,6 +726,7 @@ impl AnnotationManager {
     pub fn undo(&mut self) -> bool {
         let ok = self.stack.undo();
         if ok {
+            self.bump_rev();
             // 撤销后选中失效（避免悬空下标）
             if let Some(sel) = self.selected {
                 if sel >= self.stack.annotations().len() {
@@ -683,6 +742,7 @@ impl AnnotationManager {
     pub fn redo(&mut self) -> bool {
         let ok = self.stack.redo();
         if ok {
+            self.bump_rev();
             self.drag = None;
         }
         ok
@@ -703,6 +763,7 @@ impl AnnotationManager {
 
     /// 可变访问已提交标注（拖动/缩放等原地编辑用，调用方需自行保证历史记录）。
     pub fn annotations_mut(&mut self) -> &mut Vec<Annotation> {
+        self.bump_rev();
         self.stack.annotations_mut()
     }
 
@@ -748,9 +809,9 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                     MosaicStyle::Solid { color } => tools::mosaic::draw_solid(img, local, *color),
                 }
             }
-            Annotation::Text { rect, content, color, font_size, bold, .. } => {
+            Annotation::Text { rect, content, color, font_size, bold, font, .. } => {
                 let local_rect = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
-                tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold);
+                tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold, font.as_deref());
             }
         }
     }
@@ -822,7 +883,7 @@ mod tests {
     fn annotation_degeneracy_rules() {
         assert!(Annotation::Arrow { id: 1, from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
         assert!(!Annotation::Arrow { id: 2, from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
-        assert!(Annotation::Text { id: 1, rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false }.is_degenerate());
+        assert!(Annotation::Text { id: 1, rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false, font: None }.is_degenerate());
     }
 
     #[test]

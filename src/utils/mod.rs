@@ -1,6 +1,7 @@
 //! 通用辅助函数模块。
 
 pub mod dpi;
+pub mod fontsel;
 pub mod image_codec;
 pub mod logging;
 pub mod math;

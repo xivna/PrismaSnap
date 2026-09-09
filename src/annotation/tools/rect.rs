@@ -16,10 +16,10 @@ use crate::utils::math::Rect;
 pub fn draw_rect(img: &mut image::RgbaImage, rect: Rect, color: Color, stroke_width: f32) {
     let w = (stroke_width as i32).max(1);
     // 四条边条带（描边在矩形外侧：上/下条带占 y ∈ [y-w, y) 与 [bottom, bottom+w)）
-    let top = Rect { x: rect.x - w, y: rect.y - w, width: rect.width as u32 + 2 * w as u32, height: w as u32 };
-    let bottom = Rect { x: rect.x - w, y: rect.bottom(), width: rect.width as u32 + 2 * w as u32, height: w as u32 };
-    let left = Rect { x: rect.x - w, y: rect.y, width: w as u32, height: rect.height as u32 };
-    let right = Rect { x: rect.right(), y: rect.y, width: w as u32, height: rect.height as u32 };
+    let top = Rect { x: rect.x - w, y: rect.y - w, width: rect.width + 2 * w as u32, height: w as u32 };
+    let bottom = Rect { x: rect.x - w, y: rect.bottom(), width: rect.width + 2 * w as u32, height: w as u32 };
+    let left = Rect { x: rect.x - w, y: rect.y, width: w as u32, height: rect.height };
+    let right = Rect { x: rect.right(), y: rect.y, width: w as u32, height: rect.height };
     for bar in [top, bottom, left, right] {
         fill_rect(img, &bar, color);
     }

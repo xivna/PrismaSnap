@@ -813,22 +813,128 @@ fn cjk_font_bytes() -> Option<&'static [u8]> {
     .as_deref()
 }
 
-/// 把系统中文字体追加为 egui 的 fallback 字体（英文/数字仍用默认字体）。
-fn install_cjk_font(ctx: &egui::Context) {
-    let Some(bytes) = cjk_font_bytes() else {
-        return;
-    };
+/// 安装字体（每个 egui ctx 创建时调用一次；设置页改字体后即时重装当前 ctx，
+/// 覆盖层随下次截图的新 ctx 生效）。
+///
+/// - **界面字体**（`fontsel::interface_font_path`，空 = 系统默认）：作为
+///   Proportional/Monospace 主字体插到最前，用户字体缺 CJK 字形时由雅黑兜底；
+/// - **标注/翻译字体**（`fontsel::annotation_font_path`）：注册为独立
+///   `FontFamily::Name("annotation")`，文字标注预览与译文预览按此 family 绘制，
+///   与导出 CPU 渲染（`tools/text.rs` 读同一份字体文件）所见即所得。
+pub fn install_cjk_font(ctx: &egui::Context) {
+    ctx.set_fonts(build_font_definitions());
+}
+
+/// 构建 egui 字体表（含所有已注册的逐标注字体 family）。
+fn build_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(bytes)),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("cjk".to_owned());
+    // 系统默认 CJK 兜底（始终注册，任何用户字体缺字形时接住）
+    if let Some(bytes) = cjk_font_bytes() {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("cjk".to_owned());
+        }
     }
-    ctx.set_fonts(fonts);
+    // 界面字体（主字体，插到最前）
+    if let Some(path) = crate::utils::fontsel::interface_font_path() {
+        if let Some(bytes) = crate::utils::fontsel::load_font_bytes(&path) {
+            fonts.font_data.insert(
+                "ui_font".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned((*bytes).clone())),
+            );
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, "ui_font".to_owned());
+            }
+        }
+    }
+    // 标注/翻译字体（独立 family；未配置时回落雅黑链路）
+    let ann_bytes = crate::utils::fontsel::annotation_font_path()
+        .as_deref()
+        .and_then(crate::utils::fontsel::load_font_bytes)
+        .or_else(|| cjk_font_bytes().map(|b| std::sync::Arc::new(b.to_vec())));
+    if let Some(bytes) = ann_bytes {
+        fonts.font_data.insert(
+            "annotation_font".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned((*bytes).clone())),
+        );
+        let ann_family = egui::FontFamily::Name("annotation".into());
+        let mut chain = vec!["annotation_font".to_owned()];
+        if fonts.font_data.contains_key("cjk") {
+            chain.push("cjk".to_owned());
+        }
+        fonts.families.insert(ann_family, chain);
+    }
+    // 逐标注字体（工具条字体选择器对选中文字用过的字体，注册为独立 family，
+    // 家族链尾部挂 "annotation_font"/"cjk" 兜底缺字形）
+    for path in extra_annotation_fonts().iter() {
+        if let Some(bytes) = crate::utils::fontsel::load_font_bytes(path) {
+            let key = format!("ann_font_{:08x}", fnv_hash(path));
+            fonts.font_data.insert(
+                key.clone(),
+                std::sync::Arc::new(egui::FontData::from_owned((*bytes).clone())),
+            );
+            let mut chain = vec![key];
+            chain.push("annotation_font".to_owned());
+            chain.push("cjk".to_owned());
+            fonts
+                .families
+                .insert(egui::FontFamily::Name(per_annotation_family_name(path).into()), chain);
+        }
+    }
+    fonts
+}
+
+/// 已注册的逐标注字体路径（进程级；跨 settings/overlay 两个 ctx 共享）。
+fn extra_annotation_fonts() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static EXTRA: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    EXTRA.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 简单 FNV-1a（逐标注字体 family 命名用，稳定性只要求同路径同名）。
+fn fnv_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 逐标注字体的 egui family 名（由字体路径派生，同路径恒同名）。
+fn per_annotation_family_name(path: &str) -> String {
+    format!("ann_{:08x}", fnv_hash(path))
+}
+
+/// 确保某条标注用的字体已注册为 egui family 并返回之（每帧调用安全：
+/// 仅首次注册时 set_fonts 重建字体表；同路径恒返回同名 family）。
+pub fn ensure_annotation_family(ctx: &egui::Context, font_path: Option<&str>) -> egui::FontFamily {
+    match font_path {
+        None => egui::FontFamily::Name("annotation".into()),
+        Some(path) => {
+            let fam = per_annotation_family_name(path);
+            let mut extra = extra_annotation_fonts();
+            if !extra.iter().any(|p| p == path) {
+                extra.push(path.to_string());
+                drop(extra);
+                ctx.set_fonts(build_font_definitions());
+            }
+            egui::FontFamily::Name(fam.into())
+        }
+    }
+}
+
+/// 标注/翻译文字的 egui 字体（独立 family，与导出 CPU 渲染同字体文件）。
+pub fn annotation_font_id(size_pt: f32) -> egui::FontId {
+    egui::FontId::new(size_pt, egui::FontFamily::Name("annotation".into()))
 }

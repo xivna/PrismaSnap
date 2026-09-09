@@ -9,11 +9,6 @@ use libblur::{stack_blur, FastBlurChannels, ThreadingPolicy};
 use crate::annotation::Color;
 use crate::utils::math::Rect;
 
-/// 对图像指定矩形区域做马赛克（像素化，兼容旧 `block_size` 调用）。
-pub fn draw_mosaic(img: &mut image::RgbaImage, rect: Rect, block_size: u32) {
-    draw_pixelate(img, rect, block_size)
-}
-
 /// 像素化（块均值）。
 pub fn draw_pixelate(img: &mut image::RgbaImage, rect: Rect, block_size: u32) {
     let bs = block_size.max(2) as i32;
@@ -124,7 +119,7 @@ mod tests {
     #[test]
     fn mosaic_blocks_fill() {
         let mut img = test_img();
-        draw_mosaic(&mut img, Rect { x: 0, y: 0, width: 8, height: 8 }, 4);
+        draw_pixelate(&mut img, Rect { x: 0, y: 0, width: 8, height: 8 }, 4);
         // 块均值：(0..4) 列灰度 0,16,32,48 均值 24
         assert_eq!(img.get_pixel(2, 2).0[0], 24);
         // 下一块 (4..8) 64,80,96,112 均值 88
@@ -136,9 +131,9 @@ mod tests {
     #[test]
     fn out_of_bounds_safe() {
         let mut img = test_img();
-        draw_mosaic(&mut img, Rect { x: -4, y: -4, width: 8, height: 8 }, 4);
+        draw_pixelate(&mut img, Rect { x: -4, y: -4, width: 8, height: 8 }, 4);
         // 不应 panic
-        draw_mosaic(&mut img, Rect { x: 100, y: 100, width: 8, height: 8 }, 4);
+        draw_pixelate(&mut img, Rect { x: 100, y: 100, width: 8, height: 8 }, 4);
     }
 
     #[test]

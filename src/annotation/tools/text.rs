@@ -8,100 +8,6 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use crate::annotation::Color;
 use super::rect::blend_pixel;
 
-/// 绘制文字标注（本地坐标，物理像素）。
-///
-/// * `pos` - 基线起点（本地坐标，物理像素；第一行基线）；
-/// * `content` - 文本内容（支持 `\n` 多行，行距 1.2 倍字号）；
-/// * `color` - 颜色；
-/// * `font_size` - 字号（物理像素，建议 12~48，限 8..72）；
-/// * `bold` - 是否加粗（优先尝试粗体字体文件，缺失时模拟描边）。
-pub fn draw_text(
-    img: &mut image::RgbaImage,
-    pos: (f32, f32),
-    content: &str,
-    color: Color,
-    font_size: f32,
-    bold: bool,
-) {
-    if content.trim().is_empty() || color.a == 0 {
-        return;
-    }
-    let font_size = font_size.clamp(8.0, 120.0);
-    // 字体选择：粗体优先 msyhbd.ttc，否则回落普通字体并模拟加粗
-    let (font_bytes, simulate_bold) = if bold {
-        if let Some(b) = cjk_font_bytes_bold() {
-            (b, false)
-        } else if let Some(n) = cjk_font_bytes() {
-            (n, true)
-        } else {
-            tracing::warn!("未找到系统中文字体，文字标注未写入");
-            return;
-        }
-    } else if let Some(n) = cjk_font_bytes() {
-        (n, false)
-    } else {
-        tracing::warn!("未找到系统中文字体，文字标注未写入");
-        return;
-    };
-    let font = match FontRef::try_from_slice(font_bytes) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("字体解析失败: {e:?}");
-            return;
-        }
-    };
-    let scale = PxScale::from(font_size);
-    let scaled = font.as_scaled(scale);
-    let line_height = font_size * 1.25;
-
-    for (line_idx, line) in content.split('\n').enumerate() {
-        let baseline_y = pos.1 + line_idx as f32 * line_height;
-        let mut caret_x = pos.0;
-        // 空行仅换行，不绘制
-        if line.is_empty() {
-            continue;
-        }
-        for ch in line.chars() {
-            let glyph_id = font.glyph_id(ch);
-            let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(caret_x, baseline_y));
-            if let Some(outlined) = font.outline_glyph(glyph) {
-                let bounds = outlined.px_bounds();
-                let advance = scaled.h_advance(glyph_id);
-                // 模拟加粗：四向偏移增强厚度（无粗体字体时）
-                let offsets: &[(f32, f32)] = if simulate_bold {
-                    &[(0.0, 0.0), (0.9, 0.0), (0.0, 0.9), (0.9, 0.9)]
-                } else {
-                    &[(0.0, 0.0)]
-                };
-                for (ox, oy) in offsets {
-                    // 偏移后的包围盒（模拟时整体平移）
-                    let off_x = *ox;
-                    let off_y = *oy;
-                    outlined.draw(|x, y, cov| {
-                        // ab_glyph draw 回调的 x,y 为相对 bounds.min 的偏移
-                        let px = (bounds.min.x as i32 + x as i32 + off_x as i32) as u32;
-                        let py = (bounds.min.y as i32 + y as i32 + off_y as i32) as u32;
-                        if px >= img.width() || py >= img.height() {
-                            return;
-                        }
-                        let a = (color.a as f32 * cov) as u8;
-                        if a == 0 {
-                            return;
-                        }
-                        let col = Color { r: color.r, g: color.g, b: color.b, a };
-                        // 加粗模拟第二遍时用稍低透明混合，避免过重
-                        blend_pixel(img.get_pixel_mut(px, py), col);
-                    });
-                }
-                caret_x += advance;
-            } else {
-                // 无轮廓字体（如空格）仍需推进
-                caret_x += scaled.h_advance(glyph_id);
-            }
-        }
-    }
-}
-
 /// 在矩形文本框内绘制文字（带自动换行，超出宽度按字符 wrapping）。
 ///
 /// `rect` 为物理像素文本框（`x,y` 为左上，`width` 为可用宽度，高度超出可溢出）。
@@ -112,6 +18,7 @@ pub fn draw_text_in_rect(
     color: Color,
     font_size: f32,
     bold: bool,
+    font: Option<&str>,
 ) {
     if content.trim().is_empty() || color.a == 0 || rect.width < 4 || rect.height < 4 {
         // 空内容或过小矩形不绘制（避免除零）
@@ -119,9 +26,9 @@ pub fn draw_text_in_rect(
     }
     let font_size = font_size.clamp(8.0, 120.0);
     let (font_bytes, simulate_bold) = if bold {
-        if let Some(b) = cjk_font_bytes_bold() { (b, false) } else if let Some(n) = cjk_font_bytes() { (n, true) } else { tracing::warn!("未找到字体"); return; }
-    } else if let Some(n) = cjk_font_bytes() { (n, false) } else { tracing::warn!("未找到字体"); return; };
-    let font = match FontRef::try_from_slice(font_bytes) { Ok(f) => f, Err(e) => { tracing::warn!("字体解析失败: {e:?}"); return; } };
+        if let Some(b) = cjk_font_bytes_bold(font) { (b, false) } else if let Some(n) = cjk_font_bytes(font) { (n, true) } else { tracing::warn!("未找到字体"); return; }
+    } else if let Some(n) = cjk_font_bytes(font) { (n, false) } else { tracing::warn!("未找到字体"); return; };
+    let font = match FontRef::try_from_slice(&font_bytes) { Ok(f) => f, Err(e) => { tracing::warn!("字体解析失败: {e:?}"); return; } };
     let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
     let line_height = font_size * 1.25;
@@ -177,15 +84,15 @@ pub fn draw_text_in_rect(
 ///
 /// 与 [`draw_text_in_rect`] 用同一字体选择（粗体优先 `msyhbd`，缺失则模拟加粗约 +0.9px）；
 /// 找不到任何系统字体时回退按"0.6 倍字号每字"估算（WSL2 等无 CJK 环境仍可跑通逻辑）。
-pub fn measure_line_width(line: &str, font_size: f32, bold: bool) -> f32 {
+pub fn measure_line_width(line: &str, font_size: f32, bold: bool, font: Option<&str>) -> f32 {
     let font_size = font_size.clamp(8.0, 120.0);
     if line.is_empty() {
         return 0.0;
     }
     let (font_bytes, simulate_bold) = if bold {
-        if let Some(b) = cjk_font_bytes_bold() { (b, false) } else if let Some(n) = cjk_font_bytes() { (n, true) } else { return line.chars().count() as f32 * font_size * 0.6; }
-    } else if let Some(n) = cjk_font_bytes() { (n, false) } else { return line.chars().count() as f32 * font_size * 0.6; };
-    let font = match FontRef::try_from_slice(font_bytes) { Ok(f) => f, Err(_) => return line.chars().count() as f32 * font_size * 0.6 };
+        if let Some(b) = cjk_font_bytes_bold(font) { (b, false) } else if let Some(n) = cjk_font_bytes(font) { (n, true) } else { return line.chars().count() as f32 * font_size * 0.6; }
+    } else if let Some(n) = cjk_font_bytes(font) { (n, false) } else { return line.chars().count() as f32 * font_size * 0.6; };
+    let font = match FontRef::try_from_slice(&font_bytes) { Ok(f) => f, Err(_) => return line.chars().count() as f32 * font_size * 0.6 };
     let scale = PxScale::from(font_size);
     let scaled = font.as_scaled(scale);
     let w: f32 = line.chars().map(|ch| scaled.h_advance(font.glyph_id(ch))).sum();
@@ -202,20 +109,21 @@ pub fn wrap_text_for_width(
     font_size: f32,
     max_width: f32,
     bold: bool,
+    font: Option<&str>,
 ) -> Vec<String> {
     let font_size = font_size.clamp(8.0, 120.0);
     if max_width <= 0.0 {
         return content.split('\n').map(str::to_string).collect();
     }
     let (font_bytes, _) = if bold {
-        if let Some(b) = cjk_font_bytes_bold() {
+        if let Some(b) = cjk_font_bytes_bold(font) {
             (Some(b), false)
-        } else if let Some(n) = cjk_font_bytes() {
+        } else if let Some(n) = cjk_font_bytes(font) {
             (Some(n), true)
         } else {
             (None, true)
         }
-    } else if let Some(n) = cjk_font_bytes() {
+    } else if let Some(n) = cjk_font_bytes(font) {
         (Some(n), false)
     } else {
         (None, false)
@@ -237,7 +145,7 @@ pub fn wrap_text_for_width(
         }
         return out;
     };
-    let font = match FontRef::try_from_slice(bytes) {
+    let font = match FontRef::try_from_slice(&bytes) {
         Ok(f) => f,
         Err(_) => {
             return content.split('\n').map(str::to_string).collect();
@@ -273,114 +181,102 @@ fn wrap_line(line: &str, font: &FontRef, scale: PxScale, max_w: f32) -> Vec<Stri
     lines
 }
 
-/// 普通 CJK 字体字节（进程内缓存，避免重复读盘）。
-fn cjk_font_bytes() -> Option<&'static [u8]> {
-    static FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    FONT.get_or_init(|| {
-        const CANDIDATES: [&str; 4] = [
-            r"C:\Windows\Fonts\msyh.ttc",
-            r"C:\Windows\Fonts\msyh.ttf",
-            r"C:\Windows\Fonts\simhei.ttf",
-            r"C:\Windows\Fonts\simsun.ttc",
-        ];
-        for path in CANDIDATES {
-            if let Ok(bytes) = std::fs::read(path) {
-                return Some(bytes);
-            }
+/// 普通 CJK 字体字节（标注/翻译字体；进程内缓存，预览与导出共享同一份）。
+///
+/// 优先用户在设置页选择的字体（`ui.annotation_font`），空则回落系统默认链路
+/// （微软雅黑 → 黑体 → 宋体 → Linux DejaVu，WSL2 单测可跑）。
+fn cjk_font_bytes(font: Option<&str>) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(p) = font {
+        return crate::utils::fontsel::load_font_bytes(p);
+    }
+    if let Some(p) = crate::utils::fontsel::annotation_font_path() {
+        return crate::utils::fontsel::load_font_bytes(&p);
+    }
+    const CANDIDATES: [&str; 4] = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ];
+    for path in CANDIDATES {
+        if let Some(b) = crate::utils::fontsel::load_font_bytes(path) {
+            return Some(b);
         }
-        for path in [r"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] {
-            if let Ok(bytes) = std::fs::read(path) {
-                return Some(bytes);
-            }
+    }
+    for path in [r"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] {
+        if let Some(b) = crate::utils::fontsel::load_font_bytes(path) {
+            return Some(b);
         }
-        None
-    })
-    .as_deref()
+    }
+    None
 }
 
-/// 粗体 CJK 字体字节（优先 msyhbd.ttc，缺失时返回 None 由上层模拟）。
-fn cjk_font_bytes_bold() -> Option<&'static [u8]> {
-    static FONT_BOLD: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    FONT_BOLD.get_or_init(|| {
-        const CANDIDATES: [&str; 3] = [
-            r"C:\Windows\Fonts\msyhbd.ttc",
-            r"C:\Windows\Fonts\msyhbd.ttf",
-            r"C:\Windows\Fonts\msyh_bold.ttf",
-        ];
-        for path in CANDIDATES {
-            if let Ok(bytes) = std::fs::read(path) {
-                return Some(bytes);
-            }
+/// 粗体 CJK 字体字节（优先用户字体的粗体变体；缺失返回 None 由上层模拟加粗）。
+fn cjk_font_bytes_bold(font: Option<&str>) -> Option<std::sync::Arc<Vec<u8>>> {
+    let effective = font.map(str::to_string)
+        .or_else(crate::utils::fontsel::annotation_font_path);
+    if let Some(p) = effective {
+        if let Some(bold_path) = crate::utils::fontsel::bold_variant_path(&p) {
+            return crate::utils::fontsel::load_font_bytes(&bold_path);
         }
-        None
-    })
-    .as_deref()
-}
-
-/// 估算文字包围尺寸（物理像素），用于 `Annotation::bounds` 快速命中。
-pub fn estimate_text_size(content: &str, font_size: f32) -> (u32, u32) {
-    let lines: Vec<&str> = content.split('\n').collect();
-    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
-    let w = (max_chars * font_size * 0.6).ceil().max(20.0) as u32 + 4;
-    let h = (lines.len() as f32 * font_size * 1.25).ceil().max(font_size) as u32 + 4;
-    (w, h)
+        // 字体无粗体变体：直接 None 走四向模拟加粗
+        return None;
+    }
+    const CANDIDATES: [&str; 3] = [
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttf",
+        r"C:\Windows\Fonts\msyh_bold.ttf",
+    ];
+    for path in CANDIDATES {
+        if let Some(b) = crate::utils::fontsel::load_font_bytes(path) {
+            return Some(b);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::annotation::Color;
+    use crate::utils::math::Rect;
 
     #[test]
-    fn empty_content_does_nothing() {
+    fn empty_content_draws_nothing() {
         let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (5.0, 10.0), "   ", Color::BLACK, 16.0, false);
+        draw_text_in_rect(&mut img, Rect { x: 2, y: 2, width: 60, height: 40 }, "   ", Color::BLACK, 16.0, false, None);
         assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 255, 255, 255]));
     }
 
     #[test]
     fn draw_does_not_panic() {
-        let mut img = image::RgbaImage::from_pixel(40, 20, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (2.0, 15.0), "Hi", Color::BLACK, 16.0, false);
-    }
-
-    #[test]
-    fn draw_multiline_does_not_panic() {
         let mut img = image::RgbaImage::from_pixel(60, 60, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (2.0, 15.0), "Hi\n世界", Color::RED, 18.0, false);
-        draw_text(&mut img, (2.0, 40.0), "Hi\n世界", Color::BLUE, 18.0, true);
+        draw_text_in_rect(&mut img, Rect { x: 2, y: 2, width: 56, height: 56 }, "Hi", Color::BLACK, 16.0, false, None);
+        draw_text_in_rect(&mut img, Rect { x: 2, y: 2, width: 56, height: 56 }, "Hi\n世界", Color::RED, 18.0, true, None);
     }
 
     #[test]
     fn empty_multiline_is_degenerate_handled() {
         let mut img = image::RgbaImage::from_pixel(20, 20, image::Rgba([255, 255, 255, 255]));
-        draw_text(&mut img, (5.0, 10.0), "\n\n   \n", Color::BLACK, 16.0, false);
+        draw_text_in_rect(&mut img, Rect { x: 2, y: 2, width: 16, height: 16 }, "\n\n   \n", Color::BLACK, 16.0, false, None);
         assert_eq!(img.get_pixel(10, 10), &image::Rgba([255, 255, 255, 255]));
     }
 
     #[test]
-    fn estimate_size_grows_with_lines() {
-        let (w1, h1) = estimate_text_size("Hi", 20.0);
-        let (w2, h2) = estimate_text_size("Hi\n世界", 20.0);
-        assert!(h2 > h1);
-        assert!(w2 >= w1);
-    }
-
-    #[test]
     fn measure_width_scales_with_font_size() {
-        let w16 = measure_line_width("Hello世界", 16.0, false);
-        let w32 = measure_line_width("Hello世界", 32.0, false);
+        let w16 = measure_line_width("Hello世界", 16.0, false, None);
+        let w32 = measure_line_width("Hello世界", 32.0, false, None);
         assert!(w16 > 0.0);
         // 同一字体链路下 advance 随字号线性缩放（模拟加粗 +0.9px，留容差）
         assert!((w32 / w16 - 2.0).abs() < 0.15, "w16={w16} w32={w32}");
-        assert_eq!(measure_line_width("", 16.0, false), 0.0);
+        assert_eq!(measure_line_width("", 16.0, false, None), 0.0);
     }
 
     #[test]
     fn wrap_short_line_is_unchanged() {
-        assert_eq!(wrap_text_for_width("你好世界", 20.0, 400.0, false), vec!["你好世界"]);
+        assert_eq!(wrap_text_for_width("你好世界", 20.0, 400.0, false, None), vec!["你好世界"]);
         // 空段保留为空行
-        assert_eq!(wrap_text_for_width("甲\n\n乙", 20.0, 400.0, false), vec!["甲", "", "乙"]);
+        assert_eq!(wrap_text_for_width("甲\n\n乙", 20.0, 400.0, false, None), vec!["甲", "", "乙"]);
     }
 
     #[test]
@@ -388,14 +284,14 @@ mod tests {
         // WSL2 回退字体（DejaVu）缺 CJK 字形，断行用 ASCII 长行验证逻辑；
         // CJK 路径与导出 `draw_text_in_rect` 共用 `wrap_line`，Windows 实机覆盖。
         let long = "Top 10% salaries in Singapore by age and industry from 25 to 45";
-        let lines = wrap_text_for_width(long, 20.0, 100.0, false);
+        let lines = wrap_text_for_width(long, 20.0, 100.0, false, None);
         assert!(lines.len() > 1, "应断成多行：{lines:?}");
         // 断行不丢字
         assert_eq!(lines.concat(), long);
         // 每行实测宽度都不超限（含浮点容差）
         for l in &lines {
             assert!(
-                measure_line_width(l, 20.0, false) <= 100.0 + 1.0,
+                measure_line_width(l, 20.0, false, None) <= 100.0 + 1.0,
                 "行超宽：{l}"
             );
         }
@@ -403,6 +299,6 @@ mod tests {
 
     #[test]
     fn wrap_nonpositive_width_keeps_paragraphs() {
-        assert_eq!(wrap_text_for_width("甲\n乙", 20.0, 0.0, false), vec!["甲", "乙"]);
+        assert_eq!(wrap_text_for_width("甲\n乙", 20.0, 0.0, false, None), vec!["甲", "乙"]);
     }
 }

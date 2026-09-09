@@ -46,7 +46,7 @@ mod imp {
         use prismsnap::ui::overlay::{CapturedShot, Overlay};
     use prismsnap::ui::settings::Settings;
     use prismsnap::ui::tray::{Tray, TrayAction};
-    use prismsnap::utils::{logging, paths, single_instance};
+    use prismsnap::utils::{fontsel, logging, paths, single_instance};
 
     /// winit 自定义事件：捕获线程完成截图后经 `EventLoopProxy` 唤醒主循环。
     enum UserEvent {
@@ -485,6 +485,18 @@ mod imp {
             }
         };
         info!("配置加载: {}", config_path.display());
+
+        // 3.5 字体选择（界面字体 + 标注/翻译字体，Phase 5；空 = 系统默认）
+        fontsel::set_interface_font((!config.ui.interface_font.is_empty())
+            .then(|| config.ui.interface_font.clone()));
+        fontsel::set_annotation_font((!config.ui.annotation_font.is_empty())
+            .then(|| config.ui.annotation_font.clone()));
+        if !config.ui.interface_font.is_empty() || !config.ui.annotation_font.is_empty() {
+            info!(
+                "字体选择: 界面={} 标注={}",
+                config.ui.interface_font, config.ui.annotation_font
+            );
+        }
 
         // 4. 全局热键（在事件循环创建前注册，id 供消息钩子比对）
         let hotkeys = HotkeyManager::register(&config.hotkey).with_context(|| {

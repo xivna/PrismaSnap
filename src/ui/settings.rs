@@ -113,6 +113,8 @@ pub struct Settings {
     /// OCR 插件模型下载会话状态（不进配置，关闭设置窗口即丢弃；下载线程
     /// 的 `JoinHandle` 不保留——线程结束即退出，结束事件经 channel 回收）。
     model_dl: ModelDownloadUi,
+    /// 字体选择弹层状态（key = "interface"/"annotation"；纹理缓存与 ctx 绑定）。
+    font_pickers: std::collections::HashMap<String, super::font_list::FontPickerState>,
 }
 
 /// 单文件下载任务的 UI 侧句柄（`None` 表示该行无在途/暂停任务）。
@@ -128,6 +130,7 @@ struct FileJob {
 }
 
 /// OCR 插件模型下载的会话状态（设置页 AI 分区"插件模型"卡片用）。
+#[derive(Default)]
 struct ModelDownloadUi {
     /// 是否展开手动下载帮助窗口。
     show_help: bool,
@@ -139,16 +142,6 @@ struct ModelDownloadUi {
     copied: Option<String>,
 }
 
-impl Default for ModelDownloadUi {
-    fn default() -> Self {
-        Self {
-            show_help: false,
-            jobs: [None, None, None, None],
-            result: None,
-            copied: None,
-        }
-    }
-}
 
 impl ModelDownloadUi {
     /// 是否有在跑的下载线程（进度动画用）。
@@ -304,6 +297,7 @@ impl Settings {
             close_requested: false,
             status: None,
             model_dl: ModelDownloadUi::default(),
+            font_pickers: std::collections::HashMap::new(),
         })
     }
 
@@ -413,7 +407,8 @@ impl Settings {
         let mut start_recording = false;
         let recording = self.recording_hotkey;
         let status = self.status.clone();
-        let mut mdl = std::mem::replace(&mut self.model_dl, ModelDownloadUi::default());
+        let mut mdl = std::mem::take(&mut self.model_dl);
+        let mut font_pickers = std::mem::take(&mut self.font_pickers);
 
         self.gui.render(self.window.as_ref(), |ui| {
             // 主题实时预览：改选项立即生效（正式写盘仍走 pending_save）
@@ -428,6 +423,7 @@ impl Settings {
                 &mut changed,
                 &mut start_recording,
                 &mut mdl,
+                &mut font_pickers,
             );
         });
 
@@ -436,6 +432,7 @@ impl Settings {
         self.dir_input = dir_input;
         self.active_section = active_section;
         self.model_dl = mdl;
+        self.font_pickers = font_pickers;
         if start_recording {
             self.recording_hotkey = true;
         }
@@ -472,6 +469,7 @@ fn draw_settings_ui(
     changed: &mut bool,
     start_recording: &mut bool,
     mdl: &mut ModelDownloadUi,
+    font_pickers: &mut std::collections::HashMap<String, super::font_list::FontPickerState>,
 ) {
     let pal = palette(matches!(draft.ui.theme, Theme::Dark));
 
@@ -519,7 +517,7 @@ fn draw_settings_ui(
                 }
                 Section::Save => draw_save(ui, &pal, draft, dir_input, changed),
                 Section::Capture => draw_capture(ui, &pal, draft, changed),
-                Section::Appearance => draw_appearance(ui, &pal, draft, changed),
+                Section::Appearance => draw_appearance(ui, &pal, draft, changed, font_pickers),
                 Section::Ai => draw_ai(ui, &pal, draft, changed, mdl),
             }
 
@@ -697,8 +695,14 @@ fn draw_capture(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &
     });
 }
 
-/// 「外观」分区：主题。
-fn draw_appearance(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed: &mut bool) {
+/// 「外观」分区：主题 + 界面字体 + 标注/翻译字体（2026-09-09 用户需求）。
+fn draw_appearance(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    draft: &mut Config,
+    changed: &mut bool,
+    font_pickers: &mut std::collections::HashMap<String, super::font_list::FontPickerState>,
+) {
     card(ui, pal, |ui| {
         setting_row(ui, "主题", |ui| {
             *changed |= segmented(
@@ -709,7 +713,70 @@ fn draw_appearance(ui: &mut egui::Ui, pal: &Palette, draft: &mut Config, changed
                 &mut draft.ui.theme,
             );
         });
+        let dark = matches!(draft.ui.theme, Theme::Dark);
+        let style = super::font_list::PickerStyle {
+            fill: pal.control_bg,
+            stroke: egui::Stroke::new(1.0, pal.separator),
+            text: if dark { egui::Color32::from_rgb(240, 240, 245) } else { egui::Color32::from_rgb(26, 26, 28) },
+            popup_fill: pal.card_bg,
+            popup_stroke: egui::Stroke::new(1.0, pal.card_stroke),
+        };
+        // 界面字体：设置窗口与覆盖层 UI（改后即时重装当前 ctx；覆盖层下次截图生效）
+        row_separator(ui, pal);
+        setting_row(ui, "界面字体", |ui| {
+            if font_pick_row(ui, "interface", style, &mut draft.ui.interface_font, font_pickers) {
+                crate::utils::fontsel::set_interface_font((!draft.ui.interface_font.is_empty())
+                    .then(|| draft.ui.interface_font.clone()));
+                super::gui::install_cjk_font(ui.ctx());
+                *changed = true;
+            }
+        });
+        // 标注/翻译字体：文字标注 + 译文覆盖（导出与预览同字体，所见即所得）
+        row_separator(ui, pal);
+        setting_row(ui, "标注与翻译字体", |ui| {
+            if font_pick_row(ui, "annotation", style, &mut draft.ui.annotation_font, font_pickers) {
+                crate::utils::fontsel::set_annotation_font((!draft.ui.annotation_font.is_empty())
+                    .then(|| draft.ui.annotation_font.clone()));
+                super::gui::install_cjk_font(ui.ctx());
+                *changed = true;
+            }
+        });
     });
+}
+
+/// 单行字体选择（共享弹层组件；返回是否发生选择提交）。
+fn font_pick_row(
+    ui: &mut egui::Ui,
+    key: &str,
+    style: super::font_list::PickerStyle,
+    value: &mut String,
+    font_pickers: &mut std::collections::HashMap<String, super::font_list::FontPickerState>,
+) -> bool {
+    let fonts = crate::utils::fontsel::list_fonts();
+    if fonts.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new("系统默认").weak()));
+        return false;
+    }
+    let state = font_pickers.entry(key.to_string()).or_default();
+    let display = if value.is_empty() {
+        "系统默认（微软雅黑）".to_string()
+    } else {
+        super::font_list::display_name_for(value)
+    };
+    if let super::font_list::FontPickOutcome::Committed(picked) = super::font_list::font_picker_widget(
+        ui,
+        key,
+        state,
+        style,
+        &display,
+        120.0,
+        true,
+    ) {
+        // 提交：None=系统默认，Some(path)=选字体
+        *value = picked.unwrap_or_default();
+        return true;
+    }
+    false
 }
 
 /// 「AI 接口」分区：基础 LLM（文本翻译后端，布局保持不动）+ 多模态 LLM
@@ -1083,11 +1150,10 @@ fn draw_model_help(ctx: &egui::Context, mdl: &mut ModelDownloadUi) {
             ] {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new(name).size(12.5));
-                    if ui.small_button("复制链接").clicked() {
-                        if crate::utils::clipboard::copy_text(url).is_ok() {
+                    if ui.small_button("复制链接").clicked()
+                        && crate::utils::clipboard::copy_text(url).is_ok() {
                             mdl.copied = Some(url.to_string());
                         }
-                    }
                 });
                 ui.label(egui::RichText::new(url).size(11.5).color(egui::Color32::GRAY));
                 ui.add_space(2.0);

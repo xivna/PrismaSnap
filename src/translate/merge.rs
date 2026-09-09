@@ -4,7 +4,7 @@
 //! 本模块按几何邻近关系把相邻行合并为语义块，供翻译调度层消费。
 //! 默认按段落合并（通顺）；阈值常量已按常规 UI 行距调过，高级"按行保真"选项预留。
 
-use crate::ocr::{BBox, TextBlock, TextRegion};
+use crate::ocr::{TextBlock, TextRegion};
 
 /// 垂直间距阈值系数：相邻行间距 `<` 行高 × 此系数即视为同段。
 ///
@@ -93,18 +93,11 @@ fn join_texts(regions: &[TextRegion]) -> Option<String> {
     Some(out)
 }
 
-/// 外接矩形求并（[`BBox::union`] 的多元素版本，空输入返回零矩形）。
-pub fn outer_bbox(boxes: &[BBox]) -> BBox {
-    boxes
-        .iter()
-        .copied()
-        .reduce(|a, b| a.union(b))
-        .unwrap_or(BBox { x: 0, y: 0, width: 0, height: 0 })
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ocr::BBox;
 
     fn line(id: usize, x: u32, y: u32, w: u32, h: u32, text: &str) -> TextRegion {
         TextRegion {
@@ -200,9 +193,5 @@ mod tests {
             est_font_size: 8,
         };
         assert!(merge_regions_into_blocks(vec![zero]).is_empty());
-        assert_eq!(
-            outer_bbox(&[]),
-            BBox { x: 0, y: 0, width: 0, height: 0 }
-        );
     }
 }

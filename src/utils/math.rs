@@ -43,11 +43,6 @@ impl Rect {
         self.y + self.height as i32
     }
 
-    /// 面积（像素数）。
-    pub fn area(&self) -> u64 {
-        self.width as u64 * self.height as u64
-    }
-
     /// 是否退化（零宽或零高）。
     pub fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0
@@ -221,7 +216,6 @@ mod tests {
     fn from_points_zero_size() {
         let r = Rect::from_points(5, 5, 5, 5);
         assert!(r.is_empty());
-        assert_eq!(r.area(), 0);
     }
 
     #[test]
@@ -229,7 +223,6 @@ mod tests {
         let r = Rect { x: 10, y: 20, width: 30, height: 40 };
         assert_eq!(r.right(), 40);
         assert_eq!(r.bottom(), 60);
-        assert_eq!(r.area(), 1200);
         assert!(!r.is_empty());
     }
 

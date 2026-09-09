@@ -28,74 +28,6 @@ pub const BAR_GAP: f32 = 10.0;
 /// 保证洞的圆角与工具条卡片完全重合（见 `overlay::dim_outside_selection`）。
 pub const CORNER_RADIUS: f32 = 10.0;
 
-/// 提取文字面板估算尺寸（egui 点：360 内容宽 + 边距，标题栏 + 8 行文本 + 按钮）。
-pub const AI_PANEL_SIZE: (f32, f32) = (372.0, 310.0);
-
-/// 提取面板与选区间的间距（egui 点）。
-pub const PANEL_GAP: f32 = 8.0;
-
-/// 计算提取文字面板左上角位置（egui 逻辑点）。
-///
-/// * `sel` - 选区（物理像素）；
-/// * `screen` - 显示器物理矩形；
-/// * `bar` - 工具条矩形 `(x0, y0, x1, y1)`（egui 点，遮罩挖洞用的同一份缓存），
-///   候选位置与其重叠即跳过，保证面板不盖工具条；
-/// * `ppp` - 当前 DPI 缩放。
-///
-/// 优先级：选区右侧 → 左侧 → 下方 → 上方（均须屏内放下且不压工具条）；
-/// 都放不下时兜底选区左上内偏移（ historical 行为，钳制屏内）。
-/// 右/左候选与选区顶部对齐——面板纵向是文字流，不挡选区正文。
-pub fn ai_panel_pos_pts(
-    sel: &Rect,
-    screen: &Rect,
-    bar: Option<(f32, f32, f32, f32)>,
-    ppp: f32,
-) -> (f32, f32) {
-    let (pw, ph) = AI_PANEL_SIZE;
-    let sx0 = sel.x as f32 / ppp;
-    let sy0 = sel.y as f32 / ppp;
-    let sx1 = sel.right() as f32 / ppp;
-    let sy1 = sel.bottom() as f32 / ppp;
-    let scx0 = screen.x as f32 / ppp;
-    let scy0 = screen.y as f32 / ppp;
-    let scx1 = screen.right() as f32 / ppp;
-    let scy1 = screen.bottom() as f32 / ppp;
-
-    let overlaps_bar = |x: f32, y: f32| match bar {
-        None => false,
-        Some((bx0, by0, bx1, by1)) => x < bx1 && bx0 < x + pw && y < by1 && by0 < y + ph,
-    };
-    let fits = |x: f32, y: f32| x >= scx0 && y >= scy0 && x + pw <= scx1 && y + ph <= scy1;
-
-    // 右侧（与选区顶对齐）
-    let (rx, ry) = (sx1 + PANEL_GAP, sy0);
-    if fits(rx, ry) && !overlaps_bar(rx, ry) {
-        return (rx, ry);
-    }
-    // 左侧
-    let (lx, ly) = (sx0 - PANEL_GAP - pw, sy0);
-    if fits(lx, ly) && !overlaps_bar(lx, ly) {
-        return (lx, ly);
-    }
-    // 下方（左对齐选区，x 钳制屏内）
-    let bx = sx0.clamp(scx0, (scx1 - pw).max(scx0));
-    let by = sy1 + PANEL_GAP;
-    if fits(bx, by) && !overlaps_bar(bx, by) {
-        return (bx, by);
-    }
-    // 上方
-    let ax = bx;
-    let ay = sy0 - PANEL_GAP - ph;
-    if fits(ax, ay) && !overlaps_bar(ax, ay) {
-        return (ax, ay);
-    }
-    // 兜底：选区左上内偏移（历史行为），钳制屏内
-    (
-        (sx0 + 6.0).clamp(scx0, (scx1 - pw).max(scx0)),
-        (sy0 + 28.0).clamp(scy0, (scy1 - ph).max(scy0)),
-    )
-}
-
 /// 预设标注颜色（展示顺序，取自 [`Color`] 常量）。
 #[cfg(target_os = "windows")]
 const PRESET_COLORS: [Color; 6] = [
@@ -207,43 +139,9 @@ mod tests {
         assert_eq!(x, 400.0);
     }
 
-    #[test]
-    fn panel_prefers_right_of_selection() {
-        // 右侧有空 → 选区右 + gap，顶部对齐
-        let sel = Rect { x: 500, y: 300, width: 400, height: 200 };
-        assert_eq!(
-            ai_panel_pos_pts(&sel, &SCREEN, None, PPP),
-            (900.0 + PANEL_GAP, 300.0)
-        );
-    }
 
-    #[test]
-    fn panel_dodges_toolbar_to_left() {
-        // 工具条压住右侧候选 → 改走左侧
-        let sel = Rect { x: 500, y: 300, width: 400, height: 200 };
-        let bar = Some((900.0, 290.0, 1500.0, 400.0));
-        assert_eq!(
-            ai_panel_pos_pts(&sel, &SCREEN, bar, PPP),
-            (500.0 - PANEL_GAP - AI_PANEL_SIZE.0, 300.0)
-        );
-    }
 
-    #[test]
-    fn panel_falls_below_when_sides_blocked() {
-        // 左右都放不下（贴边宽选区）→ 下方左对齐
-        let sel = Rect { x: 0, y: 300, width: 1900, height: 200 };
-        assert_eq!(
-            ai_panel_pos_pts(&sel, &SCREEN, None, PPP),
-            (0.0, 500.0 + PANEL_GAP)
-        );
-    }
 
-    #[test]
-    fn panel_falls_back_inside_when_nowhere_fits() {
-        // 全屏选区哪都放不下 → 兜底左上内偏移
-        let sel = Rect { x: 0, y: 0, width: 1920, height: 1080 };
-        assert_eq!(ai_panel_pos_pts(&sel, &SCREEN, None, PPP), (6.0, 28.0));
-    }
 }
 
 // ── egui 绘制（仅 Windows，依赖 egui）────────────────────────────────────
@@ -346,6 +244,12 @@ pub enum ToolbarAction {
     SetTextFontSize(f32),
     /// 切换文字是否加粗。
     SetTextBold(bool),
+    /// 设置选中文字的独立字体（`None` = 恢复全局标注字体；走历史可撤销）。
+    SetTextFont(Option<String>),
+    /// 实时改选中文字的颜色（无选中文字时工具条不发此动作）。
+    SetTextColorAt(Color),
+    /// 字体悬停实时预览（`None` = 悬停结束还原；原地改写不走历史）。
+    TextFontHover(Option<String>),
     /// 切换遮挡样式（马赛克工具）。
     SetMosaicStyle(crate::annotation::MosaicStyle),
     Undo,
@@ -379,6 +283,13 @@ pub fn toolbar_ui(
     mosaic_style: &crate::annotation::MosaicStyle,
     text_font_size: f32,
     text_bold: bool,
+    // 选中文字的独立字体（None = 无选中文字，字体选择器置灰；
+    // Some(f)：f = None 未设字体（跟随全局），Some(path) 已设字体）
+    selected_text_font: Option<Option<String>>,
+    // 选中/编辑中文字的当前样式（字号/加粗/颜色实时联动选中标注；
+    // None = 无选中文字，走"新标注默认值"路径）
+    selected_text_style: Option<(f32, bool)>,
+    font_picker_state: &mut super::font_list::FontPickerState,
     can_undo: bool,
     can_redo: bool,
     ai_busy: bool,
@@ -565,6 +476,7 @@ pub fn toolbar_ui(
                             });
                         } else if active_tool == Some(Tool::Text) {
                             ui.horizontal(|ui| {
+                                ui.separator();
                                 for &c in &PRESET_COLORS {
                                     let selected = stroke_color == c;
                                     let stroke = if selected {
@@ -578,19 +490,69 @@ pub fn toolbar_ui(
                                         .min_size(egui::vec2(20.0, 20.0))
                                         .corner_radius(10.0);
                                     if ui.add(btn).clicked() {
-                                        action = Some(ToolbarAction::SetColor(c));
+                                        // 有选中文字 → 实时改选中标注颜色；否则改新标注默认色
+                                        action = Some(if selected_text_style.is_some() {
+                                            ToolbarAction::SetTextColorAt(c)
+                                        } else {
+                                            ToolbarAction::SetColor(c)
+                                        });
                                     }
                                 }
                                 ui.separator();
-                                let mut sz = text_font_size;
+                                // 字号/加粗：有选中文字时初值与修改目标都是选中标注（实时联动）
+                                let (cur_size, cur_bold) = selected_text_style.unwrap_or((text_font_size, text_bold));
+                                let mut sz = cur_size;
                                 let resp = ui.add(egui::Slider::new(&mut sz, 8.0..=120.0).text("字号"));
                                 if resp.changed() {
                                     action = Some(ToolbarAction::SetTextFontSize(sz));
                                 }
-                                let mut bold = text_bold;
+                                let mut bold = cur_bold;
                                 if ui.checkbox(&mut bold, "加粗").changed() {
                                     action = Some(ToolbarAction::SetTextBold(bold));
                                 }
+                                // 字体选择（仅选中文字时可改；悬停实时预览，点击提交）
+                                match selected_text_font {
+                                    None => {
+                                        let b = egui::Button::new(
+                                            egui::RichText::new("字体").size(12.5).weak(),
+                                        )
+                                        .min_size(egui::vec2(64.0, 24.0))
+                                        .corner_radius(6.0);
+                                        let r = ui.add(b).on_hover_text("先选中文字（无工具态单击文字）");
+                                        let _ = r;
+                                    }
+                                    Some(cur) => {
+                                        let disp = match cur {
+                                            None => "字体：默认".to_string(),
+                                            Some(p) => format!("字体：{}", super::font_list::display_name_for(&p)),
+                                        };
+                                        let st = super::font_list::PickerStyle {
+                                            fill: if dark_mode { egui::Color32::from_white_alpha(22) } else { egui::Color32::from_black_alpha(8) },
+                                            stroke: egui::Stroke::new(1.0, egui::Color32::from_black_alpha(40)),
+                                            text: ui.visuals().strong_text_color(),
+                                            popup_fill: fill,
+                                            popup_stroke: egui::Stroke::new(1.0, frame_stroke),
+                                        };
+                                        match super::font_list::font_picker_widget(
+                                            ui,
+                                            "toolbar_text_font",
+                                            font_picker_state,
+                                            st,
+                                            &disp,
+                                            96.0,
+                                            true,
+                                        ) {
+                                            super::font_list::FontPickOutcome::Committed(picked) => {
+                                                action = Some(ToolbarAction::SetTextFont(picked));
+                                            }
+                                            super::font_list::FontPickOutcome::Hover(h) => {
+                                                action = Some(ToolbarAction::TextFontHover(h));
+                                            }
+                                            super::font_list::FontPickOutcome::None => {}
+                                        }
+                                    }
+                                }
+                                ui.separator();
                             });
                         } else {
                             ui.horizontal(|ui| {

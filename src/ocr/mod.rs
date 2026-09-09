@@ -29,11 +29,6 @@ pub struct BBox {
 }
 
 impl BBox {
-    /// 面积（物理像素，`u64` 防大图溢出）。
-    pub fn area(self) -> u64 {
-        self.width as u64 * self.height as u64
-    }
-
     /// 外接矩形（区域合并时求语义块包围盒用）。
     pub fn union(self, other: BBox) -> BBox {
         let x1 = self.x.min(other.x);
@@ -239,7 +234,6 @@ mod tests {
             a.union(b),
             BBox { x: 10, y: 15, width: 35, height: 30 }
         );
-        assert_eq!(a.area(), 300);
     }
 
     #[test]

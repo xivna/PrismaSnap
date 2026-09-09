@@ -5,6 +5,10 @@
 
 pub mod toolbar;
 
+// 字体选择弹层（设置页与工具条共用，仅 Windows，见 font_list.rs）。
+#[cfg(target_os = "windows")]
+pub mod font_list;
+
 // AI 后台任务（OCR/翻译线程与回传类型，仅 Windows，见 ai.rs）。
 #[cfg(target_os = "windows")]
 pub mod ai;

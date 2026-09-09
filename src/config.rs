@@ -96,6 +96,10 @@ pub struct LoggingConfig {
 pub struct UiConfig {
     /// 主题（深色工具条文字辨识度差，默认浅色）。
     pub theme: Theme,
+    /// 界面字体文件路径（设置页下拉选择；空 = 系统默认微软雅黑链路）。
+    pub interface_font: String,
+    /// 标注/翻译字体文件路径（文字标注 + 译文覆盖渲染及对应预览；空 = 系统默认）。
+    pub annotation_font: String,
 }
 
 /// 界面主题（TOML 里蛇形小写，如 `theme = "light"`）。

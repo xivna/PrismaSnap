@@ -117,21 +117,6 @@ fn color_diff(a: [u8; 3], b: [u8; 3]) -> i32 {
         + (a[2] as i32 - b[2] as i32).abs()
 }
 
-/// 背景擦除：众数色矩形填充 bbox（含 [`ERASE_PAD`] 外扩，钳制在图内）。
-pub fn erase_background(img: &mut RgbaImage, bbox: BBox, bg: [u8; 3]) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let x0 = (bbox.x as i32 - ERASE_PAD).clamp(0, w);
-    let y0 = (bbox.y as i32 - ERASE_PAD).clamp(0, h);
-    let x1 = (bbox.x as i32 + bbox.width as i32 + ERASE_PAD).clamp(0, w);
-    let y1 = (bbox.y as i32 + bbox.height as i32 + ERASE_PAD).clamp(0, h);
-    let fill = image::Rgba([bg[0], bg[1], bg[2], 255]);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            *img.get_pixel_mut(x as u32, y as u32) = fill;
-        }
-    }
-}
-
 /// 字号自适应：按实测宽度等比缩小，底限 [`MIN_FONT_SIZE`]（仍超则调用方自动换行）。
 ///
 /// - `initial`：初值（原文字 `est_font_size`，钳制到 8~120）；
@@ -145,7 +130,7 @@ pub fn fit_font_size(initial: f32, translated: &str, max_width: f32, bold: bool)
     }
     let widest = translated
         .split('\n')
-        .map(|line| measure_line_width(line, initial, bold))
+        .map(|line| measure_line_width(line, initial, bold, None))
         .fold(0.0_f32, f32::max);
     if widest <= 0.0 || widest <= max_width {
         return initial;
@@ -177,14 +162,14 @@ pub fn fit_font_size_box(
     }
     let mut size = fit_font_size(initial, translated, max_w, bold);
     for _ in 0..8 {
-        let lines = wrap_text_for_width(translated, size, max_w, bold);
+        let lines = wrap_text_for_width(translated, size, max_w, bold, None);
         let need_h = text_block_height(lines.len(), size);
         if need_h <= max_h || size <= MIN_FONT_SIZE {
             return (size, lines);
         }
         size = (size * (max_h / need_h) * 0.98).clamp(MIN_FONT_SIZE, size);
     }
-    (size, wrap_text_for_width(translated, size, max_w, bold))
+    (size, wrap_text_for_width(translated, size, max_w, bold, None))
 }
 
 /// 排好版的多行文本总高度（物理像素）：行距只计在行与行之间，
@@ -196,15 +181,6 @@ fn text_block_height(line_count: usize, size: f32) -> f32 {
     (line_count - 1) as f32 * size * 1.25 + size + 4.0
 }
 
-/// 全图 bbox 按选区原点平移为图内本地矩形（与 `apply_to_image` 同约定）。
-pub fn shift_bbox(bbox: BBox, origin: (i32, i32)) -> Rect {
-    Rect {
-        x: bbox.x as i32 - origin.0,
-        y: bbox.y as i32 - origin.1,
-        width: bbox.width,
-        height: bbox.height,
-    }
-}
 
 /// 渲染单个译文区域到图上（背景擦除 + 自适应字号 + 文字工具绘制）。
 ///
@@ -261,7 +237,7 @@ pub fn render_translated_region(
         b: region.text_color[2],
         a: 255,
     };
-    draw_text_in_rect(&mut tmp, rect, &lines.join("\n"), color, size, bold);
+    draw_text_in_rect(&mut tmp, rect, &lines.join("\n"), color, size, bold, None);
     // 整体拷回（不透明覆盖 = 擦除语义；超出 bbox 的绘制已被临时图裁掉）
     for y in 0..th {
         for x in 0..tw {
@@ -305,16 +281,6 @@ mod tests {
         assert_eq!(sample_text_color(&dark, bbox, [5, 5, 5]), [255, 255, 255]);
     }
 
-    #[test]
-    fn erase_fills_and_clamps() {
-        let mut img = fixture();
-        erase_background(&mut img, BBox { x: 10, y: 10, width: 80, height: 20 }, [255, 255, 255]);
-        // 黑条被盖掉
-        assert_eq!(img.get_pixel(50, 20).0, [255, 255, 255, 255]);
-        // 越界擦除不 panic
-        erase_background(&mut img, BBox { x: 90, y: 30, width: 50, height: 30 }, [0, 0, 0]);
-        assert_eq!(img.get_pixel(99, 39).0, [0, 0, 0, 255]);
-    }
 
     #[test]
     fn fit_keeps_short_shrinks_long() {
@@ -382,11 +348,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shift_matches_apply_to_image_convention() {
-        let r = shift_bbox(BBox { x: 20, y: 30, width: 15, height: 10 }, (10, 20));
-        assert_eq!((r.x, r.y, r.width, r.height), (10, 10, 15, 10));
-    }
 
     #[test]
     fn render_end_to_end_draws_text() {
