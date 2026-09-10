@@ -230,6 +230,34 @@ fn icon_button(
     ui.add_enabled(enabled, btn).on_hover_text(tooltip)
 }
 
+/// 色块圆点（自绘正圆）。
+///
+/// 2026-09-10 用户实机：`Button` 版（`min_size`/`add_sized` + `corner_radius`）
+/// 在选中态 2.5px 描边下仍被渲染成椭圆。改 `allocate_exact_size` + painter
+/// 精确画圆（描边内收，外缘恰为圆点边界）——布局怎么变都圆。
+#[cfg(target_os = "windows")]
+fn color_dot(ui: &mut egui::Ui, c: Color, selected: bool) -> egui::Response {
+    const D: f32 = 20.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(D, D), egui::Sense::click());
+    let center = rect.center();
+    ui.painter().circle_filled(
+        center,
+        D * 0.5,
+        egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a),
+    );
+    let (w, col) = if selected {
+        (2.5, ui.visuals().strong_text_color())
+    } else {
+        (1.0, egui::Color32::from_black_alpha(50))
+    };
+    ui.painter()
+        .circle_stroke(center, D * 0.5 - w * 0.5, egui::Stroke::new(w, col));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 /// 工具条点击结果（由覆盖层在处理完渲染后统一响应）。
 #[cfg(target_os = "windows")]
 #[derive(Debug, Clone, PartialEq)]
@@ -456,17 +484,7 @@ pub fn toolbar_ui(
                                         // 纯色共享统一颜色（与绘制图形同一调色板）
                                         for &c in &PRESET_COLORS {
                                             let selected = stroke_color == c;
-                                            let stroke = if selected {
-                                                egui::Stroke::new(2.5, ui.visuals().strong_text_color())
-                                            } else {
-                                                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
-                                            };
-                                            let btn = egui::Button::new("")
-                                                .fill(egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a))
-                                                .stroke(stroke)
-                                                .min_size(egui::vec2(20.0, 20.0))
-                                                .corner_radius(10.0);
-                                            if ui.add(btn).clicked() {
+                                            if color_dot(ui, c, selected).clicked() {
                                                 // 同步更新统一颜色与纯色遮挡颜色
                                                 action = Some(ToolbarAction::SetMosaicStyle(crate::annotation::MosaicStyle::Solid { color: c }));
                                             }
@@ -477,19 +495,10 @@ pub fn toolbar_ui(
                         } else if active_tool == Some(Tool::Text) {
                             ui.horizontal(|ui| {
                                 ui.separator();
+                                // 色块自绘正圆（见 color_dot）
                                 for &c in &PRESET_COLORS {
                                     let selected = stroke_color == c;
-                                    let stroke = if selected {
-                                        egui::Stroke::new(2.5, ui.visuals().strong_text_color())
-                                    } else {
-                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
-                                    };
-                                    let btn = egui::Button::new("")
-                                        .fill(egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a))
-                                        .stroke(stroke)
-                                        .min_size(egui::vec2(20.0, 20.0))
-                                        .corner_radius(10.0);
-                                    if ui.add(btn).clicked() {
+                                    if color_dot(ui, c, selected).clicked() {
                                         // 有选中文字 → 实时改选中标注颜色；否则改新标注默认色
                                         action = Some(if selected_text_style.is_some() {
                                             ToolbarAction::SetTextColorAt(c)
@@ -556,21 +565,10 @@ pub fn toolbar_ui(
                             });
                         } else {
                             ui.horizontal(|ui| {
+                                // 色块自绘正圆（见 color_dot）
                                 for &c in &PRESET_COLORS {
                                     let selected = stroke_color == c;
-                                    let stroke = if selected {
-                                        egui::Stroke::new(2.5, ui.visuals().strong_text_color())
-                                    } else {
-                                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(50))
-                                    };
-                                    let btn = egui::Button::new("")
-                                        .fill(egui::Color32::from_rgba_unmultiplied(
-                                            c.r, c.g, c.b, c.a,
-                                        ))
-                                        .stroke(stroke)
-                                        .min_size(egui::vec2(20.0, 20.0))
-                                        .corner_radius(10.0);
-                                    if ui.add(btn).clicked() {
+                                    if color_dot(ui, c, selected).clicked() {
                                         action = Some(ToolbarAction::SetColor(c));
                                     }
                                 }

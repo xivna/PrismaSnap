@@ -329,6 +329,17 @@ mod imp {
             if let Some(overlay) = &mut self.overlay {
                 if overlay.window_id() == window_id {
                     overlay.on_window_event(&event);
+                    // 工具条字体选择同步了全局默认：写盘 + 热更新 App.config
+                    // （设置菜单下次打开即显示新字体；截图期间设置窗口隐藏，无竞写）
+                    if let Some(cfg) = overlay.take_pending_config() {
+                        match cfg.save(&self.config_path) {
+                            Ok(()) => {
+                                self.config = Arc::new(cfg);
+                                info!("标注字体已同步为全局默认");
+                            }
+                            Err(e) => error!("同步标注字体写盘失败: {e:#}"),
+                        }
+                    }
                     if overlay.exit_requested {
                         self.close_overlay(event_loop);
                     }

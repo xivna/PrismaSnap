@@ -15,6 +15,14 @@ pub struct TextEditState {
     pub buffer: String,
     /// 正在编辑的已提交标注下标（`None` 为新建）。
     pub index: Option<usize>,
+    /// 草稿字号：工具条编辑态绑定它（新建时进框前只能改"默认值"，
+    /// 输入框无反馈——2026-09-10 用户反馈"加粗无反应"根因），提交时落到标注。
+    pub font_size: f32,
+    /// 草稿加粗（同上）。
+    pub bold: bool,
+    /// 草稿独立字体（`None` = 跟随全局；新建文字 previously 无处可挂，
+    /// 字体选择器只能置灰——同上根因；提交时落到标注）。
+    pub font: Option<String>,
 }
 
 /// 文本框缩放状态。
@@ -46,6 +54,9 @@ pub struct Editor {
     preview_blur: Option<BlurCacheEntry>,
     /// 字体悬停预览态（选中文字 idx + 原字体，弹层悬停实时换字体用）。
     font_hover: Option<(usize, Option<String>)>,
+    /// 编辑态字体悬停原值（输入框内悬停换字体时暂存 draft.font，移出/关闭还原用；
+    /// 新建文字无标注下标，无法复用上面的 `(idx, orig)` 形式）。
+    edit_font_hover_orig: Option<Option<String>>,
     /// 选区边界（物理像素），标注创建/拖动/缩放均钳制于此（防止拖出选区外并遮挡工具条）。
     selection: Option<Rect>,
 }
@@ -58,7 +69,7 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
-        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None, font_hover: None }
+        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None, font_hover: None, edit_font_hover_orig: None }
     }
 
     /// 设置选区边界（`Overlay` 每帧同步），`None` 表示无限制。
@@ -152,33 +163,58 @@ impl Editor {
 
     pub fn begin_text_edit_with_rect(&mut self, rect: Rect) {
         let rect = if rect.width < 24 || rect.height < 16 { Rect{ x: rect.x, y: rect.y, width: 200, height: 60 } } else { rect };
-        self.editing_text = Some(TextEditState{ rect, buffer: String::new(), index: None });
+        // 新建草稿样式取当前默认值（工具条在输入态即可实时改 draft，所见即所得）
+        let (font_size, bold) = (self.mgr.text_font_size, self.mgr.text_bold);
+        self.editing_text = Some(TextEditState{ rect, buffer: String::new(), index: None, font_size, bold, font: None });
+        self.edit_font_hover_orig = None;
         self.mgr.select(None);
     }
     pub fn begin_text_edit_existing(&mut self, index: usize) -> bool {
-        let Some(Annotation::Text{ rect, content, color, font_size, bold, .. }) = self.mgr.annotations().get(index).cloned() else { return false; };
+        let Some(Annotation::Text{ rect, content, color, font_size, bold, font, .. }) = self.mgr.annotations().get(index).cloned() else { return false; };
         self.mgr.stroke_color = color;
         self.mgr.text_font_size = font_size;
         self.mgr.text_bold = bold;
-        self.editing_text = Some(TextEditState{ rect, buffer: content, index: Some(index) });
+        self.editing_text = Some(TextEditState{ rect, buffer: content, index: Some(index), font_size, bold, font });
+        self.edit_font_hover_orig = None;
         self.mgr.select(Some(index));
         true
     }
     pub fn commit_text_edit(&mut self) -> bool {
         let Some(state) = self.editing_text.take() else { return false; };
+        self.edit_font_hover_orig = None;
         if state.buffer.trim().is_empty() { return false; }
         if let Some(idx) = state.index {
-            let ok = self.mgr.update_text(idx, state.buffer, self.mgr.stroke_color, self.mgr.text_font_size, self.mgr.text_bold);
+            // 二次编辑：内容/颜色/字号/加粗按 draft 落盘，保留已有逐字符样式与字体表
+            let (cs, ft) = match self.mgr.annotations().get(idx) {
+                Some(Annotation::Text { char_styles, font_table, .. }) => {
+                    (char_styles.clone(), font_table.clone())
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            let ok = self.mgr.update_text_styled(idx, state.buffer, self.mgr.stroke_color, state.font_size, state.bold, cs, ft);
             if ok { self.mgr.select(Some(idx)); }
+            // …字体变化才写（走历史可撤销；无变化不压历史）
+            if self.mgr.text_font_at(idx) != state.font {
+                let _ = self.mgr.set_text_font_at(idx, state.font);
+            }
+            self.mgr.text_font_size = state.font_size.clamp(8.0, 120.0);
+            self.mgr.text_bold = state.bold;
             // 同步更新几何（编辑期间可能缩放过）
             let _ = self.mgr.update_text_rect(idx, state.rect);
             ok
         } else {
             self.mgr.push_text(state.rect, state.buffer);
+            // 新建提交后 push_text 已选中新标注：draft 字体落到它（raw，不另压历史；
+            // 字号/加粗/颜色走默认值通道，apply_* 在编辑态已同步过默认值）
+            if let Some(idx) = self.mgr.selected() {
+                self.mgr.set_text_font_raw(idx, state.font);
+            }
+            self.mgr.text_font_size = state.font_size.clamp(8.0, 120.0);
+            self.mgr.text_bold = state.bold;
             true
         }
     }
-    pub fn cancel_text_edit(&mut self) { self.editing_text = None; }
+    pub fn cancel_text_edit(&mut self) { self.editing_text = None; self.edit_font_hover_orig = None; }
 
     // ── 文本框缩放 ──
     pub fn hit_text_handle(&self, pt: (f32,f32)) -> Option<(usize, usize)> {
@@ -311,9 +347,9 @@ impl Editor {
                         let r = self.clamp_rect(rect);
                         if r != rect { Some(Annotation::Mosaic{ id, rect: r, style }) } else { None }
                     },
-                    Annotation::Text{ id, rect, content, color, font_size, bold, font } => {
+                    Annotation::Text{ id, rect, content, color, font_size, bold, font, char_styles, font_table } => {
                         let r = self.clamp_rect(rect);
-                        if r != rect { Some(Annotation::Text{ id, rect: r, content, color, font_size, bold, font }) } else { None }
+                        if r != rect { Some(Annotation::Text{ id, rect: r, content, color, font_size, bold, font, char_styles, font_table }) } else { None }
                     },
                     Annotation::Arrow{ id, from, to, color, stroke_width } => {
                         let t = self.clamp_pt(to);
@@ -397,7 +433,7 @@ impl Editor {
                         let clamped = match ann {
                             Annotation::Rect{ id, rect, color, stroke_width } => { let r = self.clamp_rect(rect); Annotation::Rect{ id, rect: r, color, stroke_width } },
                             Annotation::Mosaic{ id, rect, style } => { let r = self.clamp_rect(rect); Annotation::Mosaic{ id, rect: r, style } },
-                            Annotation::Text{ id, rect, content, color, font_size, bold, font } => { let r = self.clamp_rect(rect); Annotation::Text{ id, rect: r, content, color, font_size, bold, font } },
+                            Annotation::Text{ id, rect, content, color, font_size, bold, font, char_styles, font_table } => { let r = self.clamp_rect(rect); Annotation::Text{ id, rect: r, content, color, font_size, bold, font, char_styles, font_table } },
                             Annotation::Arrow{ id, from, to, color, stroke_width } => {
                                 let f = self.clamp_pt(from);
                                 let t = self.clamp_pt(to);
@@ -443,29 +479,33 @@ impl Editor {
         self.mgr.selected()
     }
 
-    /// 选中/编辑中文字的独立字体（目标不是文字或无目标返回 `None`）。
-    pub fn selected_text_font(&self) -> Option<String> {
-        self.font_target_index().and_then(|i| self.mgr.text_font_at(i))
-    }
-
-    /// 内联编辑中文字的独立字体（新文字为 None；内联 TextEdit 按此 family 渲染）。
-    pub fn editing_text_font(&self) -> Option<String> {
-        let idx = self.editing_text.as_ref().and_then(|s| s.index)?;
-        match self.mgr.annotations().get(idx) {
-            Some(Annotation::Text { font, .. }) => font.clone(),
-            _ => None,
+    /// 选中/编辑中文字的独立字体。
+    ///
+    /// `None` = 无目标（工具条字体选择器置灰）；`Some(f)` 中 `f = None` 表示
+    /// 未设独立字体（跟随全局）。编辑态（即使新建未提交）也返回 `Some`，
+    /// 字体选择器可用——此前新建输入时恒 `None` 导致置灰（2026-09-10 用户反馈）。
+    pub fn selected_text_font(&self) -> Option<Option<String>> {
+        if let Some(st) = &self.editing_text {
+            return Some(st.font.clone());
         }
+        self.font_target_index().and_then(|i| match self.mgr.annotations().get(i) {
+            Some(Annotation::Text { font, .. }) => Some(font.clone()),
+            _ => None,
+        })
     }
 
-    /// 当前是否有可改字体的文字标注（工具条字体选择器可用性）。
-    pub fn has_selected_text(&self) -> bool {
-        self.font_target_index()
-            .is_some_and(|i| matches!(self.mgr.annotations().get(i), Some(Annotation::Text{..})))
+    /// 内联编辑框的独立字体（草稿值；悬停预览实时跟随）。
+    pub fn editing_text_font(&self) -> Option<String> {
+        self.editing_text.as_ref().and_then(|st| st.font.clone())
     }
 
     /// 选中/编辑中文字的当前样式（工具条字号/加粗/颜色行实时联动用；
     /// `None` = 无选中文字，工具条走"新标注默认值"路径）。
+    /// 编辑态返回草稿值（输入框所见即所得），否则返回选中标注值。
     pub fn selected_text_style(&self) -> Option<(f32, bool)> {
+        if let Some(st) = &self.editing_text {
+            return Some((st.font_size, st.bold));
+        }
         let idx = self.font_target_index()?;
         match self.mgr.annotations().get(idx) {
             Some(Annotation::Text { font_size, bold, .. }) => Some((*font_size, *bold)),
@@ -473,22 +513,35 @@ impl Editor {
         }
     }
 
+    /// 内联编辑框的草稿字号（工具条字号滑块/输入框渲染共用）。
+    pub fn editing_text_size(&self) -> Option<f32> {
+        self.editing_text.as_ref().map(|st| st.font_size)
+    }
+
+    /// 内联编辑框是否草稿加粗（粗体变体 family 选择用）。
+    pub fn editing_text_bold(&self) -> bool {
+        self.editing_text.as_ref().is_some_and(|st| st.bold)
+    }
+
     /// 选中文字实时改字号（走历史可撤销；无选中文字则改"新标注默认值"）。
     ///
-    /// 注意默认值与标注都要写：内联编辑预览读 `mgr.text_font_size`（默认值），
-    /// 标注预览/导出读标注自身字段——只写一边另一边就"没反应"
-    /// （2026-09-10 实机反馈根因）。
+    /// 编辑态改草稿 + 同步默认值（提交通道读默认值，见 `commit_text_edit`）。
     pub fn apply_text_font_size(&mut self, size: f32) {
+        let size = size.clamp(8.0, 120.0);
         self.mgr.set_text_font_size(size);
-        if let Some(i) = self.font_target_index() {
+        if let Some(st) = &mut self.editing_text {
+            st.font_size = size;
+        } else if let Some(i) = self.font_target_index() {
             self.mgr.set_text_font_size_at(i, size);
         }
     }
 
-    /// 选中文字实时改加粗（默认值与标注双写，理由同上）。
+    /// 选中文字实时改加粗（编辑态改草稿 + 同步默认值，理由同上）。
     pub fn apply_text_bold(&mut self, bold: bool) {
         self.mgr.set_text_bold(bold);
-        if let Some(i) = self.font_target_index() {
+        if let Some(st) = &mut self.editing_text {
+            st.bold = bold;
+        } else if let Some(i) = self.font_target_index() {
             self.mgr.set_text_bold_at(i, bold);
         }
     }
@@ -503,20 +556,39 @@ impl Editor {
 
     /// 全部在用文字字体（覆盖层每帧渲染前预注册 egui family 用，
     /// 防止 mid-frame set_fonts 不生效导致 FontFamily unbound panic）。
+    /// 含编辑态草稿字体（新建文字的字体不在标注表里，不预注册输入框必崩）。
     pub fn all_text_fonts(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for a in self.mgr.annotations().iter().chain(self.mgr.in_progress()) {
-            if let Annotation::Text { font: Some(f), .. } = a {
+        let mut push = |f: &Option<String>| {
+            if let Some(f) = f {
                 if !out.contains(f) {
                     out.push(f.clone());
                 }
             }
+        };
+        for a in self.mgr.annotations().iter().chain(self.mgr.in_progress()) {
+            if let Annotation::Text { font, .. } = a {
+                push(font);
+            }
+        }
+        if let Some(st) = &self.editing_text {
+            push(&st.font);
         }
         out
     }
 
-    /// 字体悬停实时预览（Word 式：弹层悬停某字体，选中文字立即变体）。
+    /// 字体悬停实时预览（Word 式：弹层悬停某字体，目标文字立即变体）。
+    ///
+    /// 编辑态只改草稿（新建文字尚无标注可写；输入框按草稿实时渲染），
+    /// 非编辑态沿用原地改写 + 还原的老路径。
     pub fn hover_text_font(&mut self, font_path: Option<String>) {
+        if let Some(st) = &mut self.editing_text {
+            if self.edit_font_hover_orig.is_none() {
+                self.edit_font_hover_orig = Some(st.font.clone());
+            }
+            st.font = font_path;
+            return;
+        }
         let Some(idx) = self.font_target_index() else { return };
         if !matches!(self.mgr.annotations().get(idx), Some(Annotation::Text{..})) { return; }
         if self.font_hover.as_ref().map(|(i, _)| *i) != Some(idx) {
@@ -527,9 +599,25 @@ impl Editor {
         }
     }
 
-    /// 结束字体悬停预览：`commit = Some(f)` 提交该字体（走历史可撤销），
-    /// `None` 仅还原。
+    /// 结束字体悬停预览：`commit = Some(f)` 提交该字体，`None` 仅还原。
+    ///
+    /// 编辑态提交只定草稿（真正落盘在 `commit_text_edit`，提交与否走同一出口，
+    /// 点选提交不再依赖悬停暂存——此前"悬停帧与点击同帧到达即提交丢失"的盲区关闭）；
+    /// 非编辑态提交走历史可撤销。
     pub fn end_text_font_hover(&mut self, commit: Option<Option<String>>) {
+        if self.editing_text.is_some() {
+            if let Some(f) = commit {
+                if let Some(st) = &mut self.editing_text {
+                    st.font = f;
+                }
+                self.edit_font_hover_orig = None;
+            } else if let Some(orig) = self.edit_font_hover_orig.take() {
+                if let Some(st) = &mut self.editing_text {
+                    st.font = orig;
+                }
+            }
+            return;
+        }
         if let Some((idx, orig)) = self.font_hover.take() {
             if self.mgr.text_font_at(idx) != orig {
                 self.mgr.set_text_font_raw(idx, orig.clone());
@@ -543,6 +631,18 @@ impl Editor {
     }
 
     pub fn can_undo(&self) -> bool { self.mgr.can_undo() }
+
+    /// 编辑态草稿字体需预注册的加粗变体（覆盖层每帧渲染前调用，防 mid-frame
+    /// set_fonts 导致 FontFamily unbound panic，见 `all_text_fonts`；
+    /// 仅有变体时返回 `Some`，无变体走阴影垫底无需预注册）。
+    pub fn editing_bold_font(&self) -> Option<Option<String>> {
+        let st = self.editing_text.as_ref()?;
+        if !st.bold {
+            return None;
+        }
+        crate::ui::gui::bold_variant_available(st.font.as_deref())
+            .then(|| st.font.clone())
+    }
     pub fn can_redo(&self) -> bool { self.mgr.can_redo() }
     pub fn annotations(&self) -> &[Annotation] { self.mgr.annotations() }
 
@@ -727,13 +827,17 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
         Annotation::Arrow{ from, to, color, stroke_width, .. } => {
             let (f,t) = (to_pt(*from), to_pt(*to));
             let st = stroke(*color,*stroke_width);
-            // 线段直通尖端 + 开放 V 形两翼（与导出 draw_arrow 共用 arrow_head_wings 几何，
-            // 简约线条式样无填充，见 2026-09-09 用户定稿）。两翼必须走一条
-            // path（w1→t→w2）：egui Round join 自动圆角连接尖端，对齐导出的
-            // tip disk；拆成两笔独立线段会在尖端留下缺口（2026-09-10 实机反馈）
-            painter.line_segment([f,t], st);
+            // 轴线只画到三角底边中心（arrow_shaft_end，平头端埋进实心三角内），
+            // 尖端纯粹是三角锐角顶点——锐利尖头，与导出 draw_arrow 同源几何
+            // （2026-09-10：轴线画到 to 会把尖端截平成线宽宽的平头）。
+            let shaft_end = to_pt(crate::annotation::tools::arrow::arrow_shaft_end(*from, *to, *stroke_width));
+            painter.line_segment([f, shaft_end], st);
             let (w1, w2) = crate::annotation::tools::arrow::arrow_head_wings(*from, *to, *stroke_width);
-            painter.add(egui::Shape::line(vec![to_pt(w1), t, to_pt(w2)], st));
+            painter.add(egui::Shape::convex_polygon(
+                vec![t, to_pt(w1), to_pt(w2)],
+                egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a),
+                egui::Stroke::NONE,
+            ));
         }
         Annotation::Brush{ points, color, stroke_width, highlighter, .. } => {
             let pts: Vec<egui::Pos2> = points.iter().map(|&p| to_pt(p)).collect();

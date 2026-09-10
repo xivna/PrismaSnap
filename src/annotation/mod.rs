@@ -124,7 +124,28 @@ pub enum Annotation {
         /// 本条标注独立字体（字体文件路径；`None` = 全局标注字体 `ui.annotation_font`，
         /// 再回落系统默认。工具条字体选择器对选中文字实时改写）。
         font: Option<String>,
+        /// 逐字符样式覆盖（富文本：颜色/加粗/字体按选区生效，2026-09-10 用户定稿）。
+        /// 空 = 整框统一走上面的基础字段；非空时长度恒等于 `content` 字符数。
+        char_styles: Vec<CharStyle>,
+        /// 本框用过的字体路径表（`CharStyle.font` 的下标指向此处，避免逐字符存字符串）。
+        font_table: Vec<String>,
     },
+}
+
+/// 单字符样式（富文本覆盖项；`None` 字体 = 跟随框级基础字体）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CharStyle {
+    pub color: Color,
+    pub bold: bool,
+    /// 框内字体表下标（`font_table`）。
+    pub font: Option<u16>,
+}
+
+impl CharStyle {
+    /// 框级基础样式（未覆盖字符按此渲染）。
+    pub fn base(color: Color, bold: bool) -> Self {
+        Self { color, bold, font: None }
+    }
 }
 
 impl Annotation {
@@ -434,6 +455,8 @@ impl AnnotationManager {
                 font_size: self.text_font_size,
                 bold: self.text_bold,
                 font: None,
+                char_styles: Vec::new(),
+                font_table: Vec::new(),
             }),
         };
     }
@@ -490,6 +513,19 @@ impl AnnotationManager {
 
     /// 直接提交一条文字标注（点击输入确认后调用，绕开 in_progress）。
     pub fn push_text(&mut self, rect: Rect, content: String) {
+        self.push_text_styled(rect, content, Vec::new(), Vec::new());
+    }
+
+    /// 直接提交一条文字标注（点击输入确认后调用，绕开 in_progress）。
+    /// 富文本版本：携带逐字符样式与框内字体表（来自输入框草稿）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_text_styled(
+        &mut self,
+        rect: Rect,
+        content: String,
+        char_styles: Vec<CharStyle>,
+        font_table: Vec<String>,
+    ) {
         if content.trim().is_empty() {
             return;
         }
@@ -507,6 +543,8 @@ impl AnnotationManager {
             font_size: self.text_font_size,
             bold: self.text_bold,
             font: None,
+            char_styles,
+            font_table,
         };
         self.stack.push(ann);
         self.bump_rev();
@@ -514,7 +552,18 @@ impl AnnotationManager {
     }
 
     /// 更新已提交的文字标注内容/样式（双击编辑后确认调用）。
-    pub fn update_text(&mut self, index: usize, content: String, color: Color, font_size: f32, bold: bool) -> bool {
+    /// 富文本版本：逐字符样式与字体表随草稿一并落盘。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_text_styled(
+        &mut self,
+        index: usize,
+        content: String,
+        color: Color,
+        font_size: f32,
+        bold: bool,
+        char_styles: Vec<CharStyle>,
+        font_table: Vec<String>,
+    ) -> bool {
         if content.trim().is_empty() {
             return false;
         }
@@ -526,11 +575,13 @@ impl AnnotationManager {
             return false;
         }
         let ok = self.stack.edit_current(|vec| {
-            if let Some(Annotation::Text { content: c, color: col, font_size: fs, bold: b, .. }) = vec.get_mut(index) {
+            if let Some(Annotation::Text { content: c, color: col, font_size: fs, bold: b, char_styles: cs, font_table: ft, .. }) = vec.get_mut(index) {
                 *c = content.clone();
                 *col = color;
                 *fs = font_size;
                 *b = bold;
+                *cs = char_styles;
+                *ft = font_table;
                 true
             } else {
                 false
@@ -560,12 +611,16 @@ impl AnnotationManager {
         ok
     }
 
-    /// 仅更新文字颜色（选中态实时预览用）。
+    /// 仅更新文字颜色（选中态实时预览用）。整框语义：清空逐字符覆盖。
     pub fn set_text_color_at(&mut self, index: usize, color: Color) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
         let ok = self.stack.edit_current(|vec| {
-            if let Some(Annotation::Text { color: c, .. }) = vec.get_mut(index) { *c = color; true } else { false }
+            if let Some(Annotation::Text { color: c, char_styles, .. }) = vec.get_mut(index) {
+                *c = color;
+                char_styles.clear();
+                true
+            } else { false }
         });
         if ok { self.bump_rev(); }
         ok
@@ -581,12 +636,16 @@ impl AnnotationManager {
         if ok { self.bump_rev(); }
         ok
     }
-    /// 仅更新文字加粗。
+    /// 仅更新文字加粗。整框语义：清空逐字符覆盖。
     pub fn set_text_bold_at(&mut self, index: usize, bold: bool) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
         let ok = self.stack.edit_current(|vec| {
-            if let Some(Annotation::Text { bold: b, .. }) = vec.get_mut(index) { *b = bold; true } else { false }
+            if let Some(Annotation::Text { bold: b, char_styles, .. }) = vec.get_mut(index) {
+                *b = bold;
+                char_styles.clear();
+                true
+            } else { false }
         });
         if ok { self.bump_rev(); }
         ok
@@ -601,20 +660,27 @@ impl AnnotationManager {
     }
 
     /// 设置文字标注独立字体（工具条字体选择器提交时调用，走历史可撤销）。
+    /// 整框语义：清空逐字符覆盖。
     pub fn set_text_font_at(&mut self, index: usize, font: Option<String>) -> bool {
         if index >= self.stack.annotations().len() { return false; }
         if !matches!(self.stack.annotations()[index], Annotation::Text { .. }) { return false; }
         let ok = self.stack.edit_current(|vec| {
-            if let Some(Annotation::Text { font: f, .. }) = vec.get_mut(index) { *f = font.clone(); true } else { false }
+            if let Some(Annotation::Text { font: f, char_styles, .. }) = vec.get_mut(index) {
+                *f = font.clone();
+                char_styles.clear();
+                true
+            } else { false }
         });
         if ok { self.bump_rev(); }
         ok
     }
 
     /// 原地改写文字字体（悬停实时预览用，不走历史；与 update_drag 同级别的临时改写）。
+    /// 整框语义：清空逐字符覆盖（悬停预览统一显示，提交还原由调用方负责）。
     pub fn set_text_font_raw(&mut self, index: usize, font: Option<String>) {
-        if let Some(Annotation::Text { font: f, .. }) = self.stack.annotations_mut().get_mut(index) {
+        if let Some(Annotation::Text { font: f, char_styles, .. }) = self.stack.annotations_mut().get_mut(index) {
             *f = font;
+            char_styles.clear();
             self.bump_rev();
         }
     }
@@ -809,9 +875,17 @@ pub fn apply_to_image(img: &mut image::RgbaImage, annotations: &[Annotation], or
                     MosaicStyle::Solid { color } => tools::mosaic::draw_solid(img, local, *color),
                 }
             }
-            Annotation::Text { rect, content, color, font_size, bold, font, .. } => {
+            Annotation::Text { rect, content, color, font_size, bold, font, char_styles, font_table, .. } => {
                 let local_rect = Rect { x: rect.x - origin.0, y: rect.y - origin.1, width: rect.width, height: rect.height };
-                tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold, font.as_deref());
+                if char_styles.is_empty() {
+                    tools::text::draw_text_in_rect(img, local_rect, content, *color, *font_size, *bold, font.as_deref());
+                } else {
+                    // 富文本：逐字符颜色/加粗/字体（字号整框统一，2026-09-10 用户定稿）
+                    tools::text::draw_rich_text_in_rect(
+                        img, local_rect, content, *color, *bold, font.as_deref(), *font_size,
+                        char_styles, font_table,
+                    );
+                }
             }
         }
     }
@@ -883,7 +957,7 @@ mod tests {
     fn annotation_degeneracy_rules() {
         assert!(Annotation::Arrow { id: 1, from: (0.0, 0.0), to: (1.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
         assert!(!Annotation::Arrow { id: 2, from: (0.0, 0.0), to: (10.0, 0.0), color: Color::RED, stroke_width: 2.0 }.is_degenerate());
-        assert!(Annotation::Text { id: 1, rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false, font: None }.is_degenerate());
+        assert!(Annotation::Text { id: 1, rect: Rect { x: 0, y: 0, width: 100, height: 30 }, content: "  ".into(), color: Color::RED, font_size: 16.0, bold: false, font: None, char_styles: Vec::new(), font_table: Vec::new() }.is_degenerate());
     }
 
     #[test]

@@ -892,6 +892,22 @@ fn build_font_definitions() -> egui::FontDefinitions {
                 .insert(egui::FontFamily::Name(per_annotation_family_name(path).into()), chain);
         }
     }
+    // 粗体变体（输入框加粗实时预览用，有变体才用真粗体；链路与常规逐标注字体相同）
+    for path in extra_bold_fonts().iter() {
+        if let Some(bytes) = crate::utils::fontsel::load_font_bytes(path) {
+            let key = format!("ann_bold_{:08x}", fnv_hash(path));
+            fonts.font_data.insert(
+                key.clone(),
+                std::sync::Arc::new(egui::FontData::from_owned((*bytes).clone())),
+            );
+            let mut chain = vec![key];
+            chain.push("annotation_font".to_owned());
+            chain.push("cjk".to_owned());
+            fonts
+                .families
+                .insert(egui::FontFamily::Name(per_annotation_bold_family_name(path).into()), chain);
+        }
+    }
     fonts
 }
 
@@ -916,6 +932,45 @@ fn per_annotation_family_name(path: &str) -> String {
     format!("ann_{:08x}", fnv_hash(path))
 }
 
+/// 粗体变体的 egui family 名（由变体文件路径派生；注意是变体路径而非原路径，
+/// 同一原字体恒对应同一变体，无变体时不注册、调用方回落常规 family + 阴影垫底）。
+fn per_annotation_bold_family_name(variant_path: &str) -> String {
+    format!("ann_bold_{:08x}", fnv_hash(variant_path))
+}
+
+/// 已注册的粗体变体路径（进程级；跨 settings/overlay 两个 ctx 共享）。
+fn extra_bold_fonts() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static EXTRA_BOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    EXTRA_BOLD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 粗体变体文件路径（与 `tools/text.rs::cjk_font_bytes_bold` 同构，但返回路径供注册；
+/// 无变体返回 `None`，调用方回落常规 family + 阴影垫底模拟加粗）。
+fn bold_variant_font_path(font: Option<&str>) -> Option<String> {
+    let effective = font
+        .map(str::to_string)
+        .or_else(crate::utils::fontsel::annotation_font_path);
+    if let Some(p) = effective {
+        return crate::utils::fontsel::bold_variant_path(&p);
+    }
+    const CANDIDATES: [&str; 3] = [
+        r"C:\Windows\Fonts\msyhbd.ttc",
+        r"C:\Windows\Fonts\msyhbd.ttf",
+        r"C:\Windows\Fonts\msyh_bold.ttf",
+    ];
+    for path in CANDIDATES {
+        if std::path::Path::new(path).is_file() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// 是否有粗体变体可用（输入框加粗走真粗体还是阴影垫底的分流开关）。
+pub fn bold_variant_available(font_path: Option<&str>) -> bool {
+    bold_variant_font_path(font_path).is_some()
+}
+
 /// 确保某条标注用的字体已注册为 egui family 并返回之（每帧调用安全：
 /// 仅首次注册时 set_fonts 重建字体表；同路径恒返回同名 family）。
 pub fn ensure_annotation_family(ctx: &egui::Context, font_path: Option<&str>) -> egui::FontFamily {
@@ -932,6 +987,26 @@ pub fn ensure_annotation_family(ctx: &egui::Context, font_path: Option<&str>) ->
             egui::FontFamily::Name(fam.into())
         }
     }
+}
+
+/// 确保粗体变体 family 已注册并返回（内联输入框加粗实时预览用；
+/// 每帧调用安全：仅首次注册时 set_fonts 重建字体表）。
+/// 无变体文件时回落常规 family（调用方改走阴影垫底）。
+pub fn ensure_annotation_family_bold(
+    ctx: &egui::Context,
+    font_path: Option<&str>,
+) -> egui::FontFamily {
+    let Some(variant) = bold_variant_font_path(font_path) else {
+        return ensure_annotation_family(ctx, font_path);
+    };
+    let fam = per_annotation_bold_family_name(&variant);
+    let mut extra = extra_bold_fonts();
+    if !extra.iter().any(|p| p == &variant) {
+        extra.push(variant);
+        drop(extra);
+        ctx.set_fonts(build_font_definitions());
+    }
+    egui::FontFamily::Name(fam.into())
 }
 
 /// 标注/翻译文字的 egui 字体（独立 family，与导出 CPU 渲染同字体文件）。

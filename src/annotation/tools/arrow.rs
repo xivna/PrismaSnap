@@ -1,20 +1,22 @@
 //! 箭头标注工具。
 //!
-//! 简约线条式样（对齐 Flameshot/ShareX 等业界截图工具，2026-09-09 用户定稿）：
-//! 线段直通尖端 + 开放 V 形两翼（无三角形填充，避免填充/描边抗锯齿接缝），
-//! 头长 4 倍线宽（原 12 倍过大且盖住线段，拖动稍短就只剩三角）。
+//! 简约式样（2026-09-10 用户定稿）：线段 + 实心尖三角头（无描边填充，
+//! 头长 3 倍线宽、内侧半角 22° 的瘦头；4w/25° 版显胖，已收）。此前开放 V 形
+//! （预览/导出各一次，SDR 下尤其明显），改实心填充后缺口无从产生，
+//! 预览（egui 实心多边形）与导出（CPU 三角形光栅化）天然一致。
 //!
-//! 光栅策略：遍历箭头包围盒内像素，距离场判定描边覆盖（AGENTS.md 3.7 节）。
-//! 头部几何由 [`arrow_head_wings`] 统一提供，导出/egui 预览/命中测试三处同源。
+//! 光栅策略：遍历箭头包围盒内像素，距离场判定覆盖（AGENTS.md 3.7 节）。
+//! 头部几何由 [`arrow_head_wings`] 统一提供（三角的两个底角），
+//! 导出/egui 预览/命中测试三处同源。
 
 use crate::annotation::Color;
 
 use super::rect::blend_pixel;
 
-/// 头部长度系数（× 线宽）。
-const HEAD_LEN_FACTOR: f32 = 4.0;
-/// 两翼与前进方向夹角（±155°，即内侧 25°，比旧 30° 略尖更精神）。
-const WING_ANGLE: f32 = std::f32::consts::PI * 155.0 / 180.0;
+/// 头部长度系数（× 线宽；2026-09-10 用户实机：4w 实心头显胖，收至 3w）。
+const HEAD_LEN_FACTOR: f32 = 3.0;
+/// 两翼与前进方向夹角（±158°，即内侧 22°；2026-09-10 瘦头：25° 太开显坨）。
+const WING_ANGLE: f32 = std::f32::consts::PI * 158.0 / 180.0;
 
 /// 箭头两翼端点（从终点 `to` 向起点侧张开）。
 ///
@@ -42,6 +44,32 @@ pub fn arrow_head_wings(
     (wing(WING_ANGLE), wing(-WING_ANGLE))
 }
 
+/// 轴线终点（三角底边中心，`to` 向起点侧退一个头长）。
+///
+/// 2026-09-10 锐尖根因：轴线若画到 `to`，其平头端帽宽=线宽 w，而三角尖端
+/// 附近比轴线细（半宽 d·tan22° 要 d≥1.2w 才盖过 w/2）——最后一段轮廓其实是
+/// 轴线的平头端，尖端被截平成宽 w 的平头。轴线只画到底边中心（底半宽
+/// 3w·tan22°≈1.21w > w/2，平头端完整埋进实心三角内），尖端才纯粹是三角
+/// 的锐角顶点。导出/预览同源换用；命中测试仍测整段（拖动友好）。
+pub fn arrow_shaft_end(
+    from: (f32, f32),
+    to: (f32, f32),
+    stroke_width: f32,
+) -> (f32, f32) {
+    let w = stroke_width.max(1.0);
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        return to;
+    }
+    let head_len = HEAD_LEN_FACTOR * w;
+    (
+        to.0 - dx / len * head_len,
+        to.1 - dy / len * head_len,
+    )
+}
+
 /// 在导出图上绘制箭头（坐标为图像本地像素，越界部分自动裁剪）。
 ///
 /// * `from` - 起点（本地坐标）；
@@ -67,6 +95,7 @@ pub fn draw_arrow(
         return;
     }
     let (wing1, wing2) = arrow_head_wings(from, to, w);
+    let shaft_end = arrow_shaft_end(from, to, w);
 
     // 包围盒（ shaft + head 扩大 half ）
     let min_x = from.0.min(to.0).min(wing1.0).min(wing2.0) - half - 1.0;
@@ -82,17 +111,11 @@ pub fn draw_arrow(
     for py in y0..y1 {
         for px in x0..x1 {
             let p = (px as f32 + 0.5, py as f32 + 0.5);
-            // 三段（轴线 + 两翼）取最大覆盖率。平头端帽 + 双向 AA 羽化：
-            // egui 开路径端点是平头（tessellator 仅外扩羽化，无圆帽），导出须对齐
-            // （旧版圆头胶囊导致预览/保存端点样式不一致，2026-09-10 实机反馈）
-            // 尖端圆角连接盘（对齐 egui 默认 Round join）：三段平头在顶点各自衰减
-            // 会让联合覆盖率掉到 ~0.5 出现缺口/毛刺，顶点半径=线宽一半的圆盘补满。
-            // 尾部起点仍是平头端帽（与预览一致）。
-            let dt = ((p.0 - to.0).powi(2) + (p.1 - to.1).powi(2)).sqrt();
-            let cov = segment_coverage(p, from, to, tol)
-                .max(segment_coverage(p, to, wing1, tol))
-                .max(segment_coverage(p, to, wing2, tol))
-                .max((tol + 0.5 - dt).clamp(0.0, 1.0));
+            // 轴线只画到三角底边中心（平头端埋进实心三角内，见 arrow_shaft_end）
+            // + 实心三角头（t, wing1, wing2，无描边填充，边缘 0.5px AA）。
+            // 尖端 = 三角锐角顶点，干净尖头（轴线不再把尖端截平）。
+            let cov = segment_coverage(p, from, shaft_end, tol)
+                .max(filled_tri_coverage(p, to, wing1, wing2));
             if cov > 0.0 {
                 let mut c = color;
                 c.a = (c.a as f32 * cov) as u8;
@@ -102,6 +125,26 @@ pub fn draw_arrow(
             }
         }
     }
+}
+
+/// 实心三角形内的像素覆盖率（三边半平面取交，边缘各 0.5px AA 过渡）。
+///
+/// 顶点 winding 不固定：先按符号面积统一为逆时针，再取各边左法线距离
+/// （逆时针三角内部恒在各边左侧），三边最小值即覆盖率。
+fn filled_tri_coverage(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    let (b, c) = if area < 0.0 { (c, b) } else { (b, c) };
+    let edge = |p0: (f32, f32), p1: (f32, f32)| {
+        let ex = p1.0 - p0.0;
+        let ey = p1.1 - p0.1;
+        let len = (ex * ex + ey * ey).sqrt().max(1e-6);
+        // 左法线距离（内为正）
+        ((p.0 - p0.0) * (-ey) + (p.1 - p0.1) * ex) / len
+    };
+    (edge(a, b) + 0.5)
+        .min(edge(b, c) + 0.5)
+        .min(edge(c, a) + 0.5)
+        .clamp(0.0, 1.0)
 }
 
 /// 平头端帽线段的像素覆盖率（垂直方向与沿段方向各 0.5px 过渡带）。
@@ -146,8 +189,8 @@ mod tests {
         assert_eq!(px(&img, 20, 20)[0..3], [255, 59, 48]);
         // 远离轴线不着色
         assert_eq!(px(&img, 20, 30), [255, 255, 255, 255]);
-        // 箭头尖端应着色（头内填充）
-        assert_eq!(px(&img, 44, 20)[0..3], [255, 59, 48]);
+        // 箭头尖端附近有三角着色（AA 部分覆盖，不再断言纯色）
+        assert_ne!(px(&img, 43, 20), [255, 255, 255, 255]);
     }
 
     #[test]
@@ -177,5 +220,25 @@ mod tests {
         let mut img = blank();
         draw_arrow(&mut img, (20.0, 20.0), (20.0, 20.0), Color::RED, 2.0);
         assert_eq!(px(&img, 20, 20), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn tip_sharp_no_notch() {
+        // 实心尖三角 + 轴线缩短：尖端纯粹是三角锐角顶点（无平头截断、无圆角 blob）
+        let mut img = blank();
+        draw_arrow(&mut img, (5.0, 20.0), (45.0, 20.0), Color::RED, 6.0);
+        // 头部内部（三角内）实心
+        assert_eq!(px(&img, 40, 20)[0..3], [255, 59, 48]);
+        // 尖端之外干净
+        assert_eq!(px(&img, 47, 20), [255, 255, 255, 255]);
+        assert_eq!(px(&img, 50, 20), [255, 255, 255, 255]);
+        // 锐角判据：接近尖端的列，覆盖宽度必须远小于轴线宽（6px 线宽的平头
+        // 端会盖满 ±3.5px；三角在 d=2.5 处半宽仅 ~1px，17/23 行必须干净）
+        assert_eq!(px(&img, 43, 17), [255, 255, 255, 255]);
+        assert_eq!(px(&img, 43, 23), [255, 255, 255, 255]);
+        // 同列三角体内仍有着色（19 行）
+        assert_ne!(px(&img, 43, 19), [255, 255, 255, 255]);
+        // 中段轴线照常（17 行在轴半宽 3 内）
+        assert_ne!(px(&img, 15, 17), [255, 255, 255, 255]);
     }
 }

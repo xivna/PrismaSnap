@@ -15,3 +15,6 @@ config.toml
 
 # OCR 插件（模型 + onnxruntime.dll，>5M，随便携包分发，不入库，见 AGENTS.md 3.8）
 /plugins/
+
+# 本机 cargo 配置（交叉链路/工具链路径因设备而异，不入库，家目录 ~/.cargo 同效）
+.cargo/

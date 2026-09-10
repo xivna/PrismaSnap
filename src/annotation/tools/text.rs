@@ -5,7 +5,7 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
-use crate::annotation::Color;
+use crate::annotation::{CharStyle, Color};
 use super::rect::blend_pixel;
 
 /// 在矩形文本框内绘制文字（带自动换行，超出宽度按字符 wrapping）。
@@ -59,10 +59,13 @@ pub fn draw_text_in_rect(
                 if let Some(outlined) = font.outline_glyph(glyph) {
                     let bounds = outlined.px_bounds();
                     let offsets: &[(f32,f32)] = if simulate_bold { &[(0.0,0.0),(0.9,0.0),(0.0,0.9),(0.9,0.9)] } else { &[(0.0,0.0)] };
-                    for (ox,oy) in offsets {
-                        outlined.draw(|x,y,cov| {
-                            let px = (bounds.min.x as i32 + x as i32 + *ox as i32) as u32;
-                            let py = (bounds.min.y as i32 + y as i32 + *oy as i32) as u32;
+                    for (ox, oy) in offsets {
+                        outlined.draw(|x, y, cov| {
+                            // 注意偏移要先加再取整（原写法 `min as i32 + x + ox as i32`
+                            // 各自截断，0.9px 偏移恒为 0——模拟加粗一直是 no-op，
+                            // Windows 有 msyhbd 真粗体从未暴露，2026-09-10 单测抓出）
+                            let px = ((bounds.min.x + *ox).round() as i32 + x as i32) as u32;
+                            let py = ((bounds.min.y + *oy).round() as i32 + y as i32) as u32;
                             if px >= img.width() || py >= img.height() { return; }
                             let a = (color.a as f32 * cov) as u8; if a==0 {return;}
                             let col = Color{r:color.r,g:color.g,b:color.b,a};
@@ -80,7 +83,149 @@ pub fn draw_text_in_rect(
     }
 }
 
-/// 测量单行文本宽度（物理像素），供翻译渲染字号自适应等调用方复用同一字体链路。
+/// 富文本版 [`draw_text_in_rect`]：逐字符颜色/加粗/字体，**字号整框统一**
+/// （2026-09-10 用户定稿），换行/行高/基线与统一版一致，保证混合与统一
+/// 渲染的排版相同。
+///
+/// * `char_styles` - 逐字符覆盖（空或长度不符时整框回退基础样式）；
+/// * `font_table` - 框内字体路径表（`CharStyle.font` 下标）。
+pub fn draw_rich_text_in_rect(
+    img: &mut image::RgbaImage,
+    rect: crate::utils::math::Rect,
+    content: &str,
+    base_color: Color,
+    base_bold: bool,
+    base_font: Option<&str>,
+    font_size: f32,
+    char_styles: &[CharStyle],
+    font_table: &[String],
+) {
+    if content.trim().is_empty() || rect.width < 4 || rect.height < 4 {
+        return;
+    }
+    let font_size = font_size.clamp(8.0, 120.0);
+    let base = CharStyle::base(base_color, base_bold);
+    // 逐字符覆盖仅在长度与字符数一致时生效（防外部传入坏数据部分套用）
+    let styles_valid = char_styles.len() == content.chars().count();
+    let style_of = |i: usize| -> CharStyle {
+        if styles_valid { char_styles.get(i).copied().unwrap_or(base) } else { base }
+    };
+    // 字体槽：样式签名（字体路径, 加粗）→ (字节, 模拟加粗)。同槽复用，加载一次。
+    let mut slots: Vec<(Option<String>, bool, Option<std::sync::Arc<Vec<u8>>>, bool)> = Vec::new();
+    let resolve_font = |path: Option<&str>, bold: bool| -> (Option<std::sync::Arc<Vec<u8>>>, bool) {
+        if bold {
+            if let Some(b) = cjk_font_bytes_bold(path) { (Some(b), false) }
+            else if let Some(n) = cjk_font_bytes(path) { (Some(n), true) }
+            else { (None, true) }
+        } else if let Some(n) = cjk_font_bytes(path) { (Some(n), false) } else { (None, false) }
+    };
+    let slot_of = |slots: &mut Vec<(Option<String>, bool, Option<std::sync::Arc<Vec<u8>>>, bool)>,
+                   path: Option<&str>, bold: bool| -> usize {
+        if let Some(i) = slots.iter().position(|(p, b, _, _)| *b == bold && p.as_deref() == path) {
+            return i;
+        }
+        let (bytes, sim) = resolve_font(path, bold);
+        slots.push((path.map(str::to_string), bold, bytes, sim));
+        slots.len() - 1
+    };
+    // 逐字符计划（char 域；i 对齐 char_styles）
+    let mut plan: Vec<(char, usize, Color)> = Vec::new();
+    for (i, ch) in content.chars().enumerate() {
+        let style = style_of(i);
+        let path = style
+            .font
+            .and_then(|fi| font_table.get(fi as usize).map(String::as_str))
+            .or(base_font);
+        let slot = slot_of(&mut slots, path, style.bold);
+        plan.push((ch, slot, style.color));
+    }
+    let scale = PxScale::from(font_size);
+    // 字体引用一次解析（借用 slots，slots 此后只读）
+    let font_refs: Vec<Option<FontRef>> = slots
+        .iter()
+        .map(|(_, _, bytes, _)| {
+            bytes.as_ref().and_then(|b| FontRef::try_from_slice(b).ok())
+        })
+        .collect();
+    let advance_of = |ch: char, slot: usize| -> f32 {
+        match font_refs.get(slot).and_then(|f| f.as_ref()) {
+            Some(font) => font.as_scaled(scale).h_advance(font.glyph_id(ch)),
+            None => font_size * 0.6, // 无字体回退估算（与统一版链路一致）
+        }
+    };
+    let line_height = font_size * 1.25;
+    let max_w = rect.width as f32 - 4.0;
+    let first_baseline = rect.y as f32 + 2.0 + font_size * 0.85;
+    // 画一行（行内字符可各用字体/颜色/加粗；换行决策在外层）
+    let mut line_idx: usize = 0;
+    let mut pending: Vec<(char, usize, Color)> = Vec::new();
+    let mut pend_w = 0.0f32;
+    let mut draw_line = |line: &[((char, usize, Color))], line_idx: usize| {
+        if line.is_empty() {
+            return;
+        }
+        let baseline_y = first_baseline + line_idx as f32 * line_height;
+        let mut caret_x = rect.x as f32 + 2.0;
+        for &(ch, slot, color) in line.iter() {
+            if color.a == 0 {
+                caret_x += advance_of(ch, slot);
+                continue;
+            }
+            if let Some(font) = font_refs.get(slot).and_then(|f| f.as_ref()) {
+                let scaled = font.as_scaled(scale);
+                let gid = font.glyph_id(ch);
+                let glyph = gid.with_scale_and_position(scale, ab_glyph::point(caret_x, baseline_y));
+                if let Some(outlined) = font.outline_glyph(glyph) {
+                    let bounds = outlined.px_bounds();
+                    let sim = slots[slot].3;
+                    let offsets: &[(f32, f32)] = if sim {
+                        &[(0.0, 0.0), (0.9, 0.0), (0.0, 0.9), (0.9, 0.9)]
+                    } else {
+                        &[(0.0, 0.0)]
+                    };
+                    for (ox, oy) in offsets {
+                        outlined.draw(|x, y, cov| {
+                            // 同上：偏移先加再取整（老写法 0.9px 恒被截断成 0）
+                            let px = ((bounds.min.x + *ox).round() as i32 + x as i32) as u32;
+                            let py = ((bounds.min.y + *oy).round() as i32 + y as i32) as u32;
+                            if px >= img.width() || py >= img.height() { return; }
+                            let a = (color.a as f32 * cov) as u8;
+                            if a == 0 { return; }
+                            blend_pixel(img.get_pixel_mut(px, py), Color { r: color.r, g: color.g, b: color.b, a });
+                        });
+                    }
+                    caret_x += scaled.h_advance(gid);
+                } else {
+                    caret_x += scaled.h_advance(gid);
+                }
+            } else {
+                caret_x += advance_of(ch, slot);
+            }
+        }
+    };
+    // 逐字符 wrapping（宽度用各自字体 advance；行内不同字体共存），按 \n 分段
+    for &(ch, slot, color) in plan.iter() {
+        if ch == '\n' {
+            draw_line(&pending, line_idx);
+            line_idx += 1;
+            pending.clear();
+            pend_w = 0.0;
+            continue;
+        }
+        let w = advance_of(ch, slot);
+        if pend_w + w > max_w && !pending.is_empty() {
+            draw_line(&pending, line_idx);
+            line_idx += 1;
+            pending.clear();
+            pend_w = 0.0;
+        }
+        pending.push((ch, slot, color));
+        pend_w += w;
+    }
+    if !pending.is_empty() {
+        draw_line(&pending, line_idx);
+    }
+}
 ///
 /// 与 [`draw_text_in_rect`] 用同一字体选择（粗体优先 `msyhbd`，缺失则模拟加粗约 +0.9px）；
 /// 找不到任何系统字体时回退按"0.6 倍字号每字"估算（WSL2 等无 CJK 环境仍可跑通逻辑）。
@@ -240,6 +385,87 @@ mod tests {
     use super::*;
     use crate::annotation::Color;
     use crate::utils::math::Rect;
+
+    #[test]
+    fn rich_mixed_colors() {
+        let mut img = image::RgbaImage::from_pixel(80, 30, image::Rgba([255, 255, 255, 255]));
+        let styles = vec![
+            CharStyle::base(Color::RED, false),
+            CharStyle::base(Color::BLUE, false),
+        ];
+        draw_rich_text_in_rect(
+            &mut img,
+            Rect { x: 2, y: 2, width: 70, height: 26 },
+            "AB",
+            Color::BLACK, false, None,
+            16.0,
+            &styles,
+            &[],
+        );
+        let reds = img.pixels().filter(|p| p[0] > 150 && p[2] < 100).count();
+        let blues = img.pixels().filter(|p| p[2] > 150 && p[0] < 100).count();
+        assert!(reds > 0, "A 应有红色像素");
+        assert!(blues > 0, "B 应有蓝色像素");
+    }
+
+    #[test]
+    fn rich_sim_bold_covers_more() {
+        let count = |bold: bool| -> usize {
+            let mut img = image::RgbaImage::from_pixel(60, 30, image::Rgba([255, 255, 255, 255]));
+            let styles = vec![CharStyle::base(Color::BLACK, bold)];
+            draw_rich_text_in_rect(
+                &mut img,
+                Rect { x: 2, y: 2, width: 50, height: 26 },
+                "H",
+                Color::BLACK, bold, None,
+                16.0,
+                &styles,
+                &[],
+            );
+            img.pixels().filter(|p| p[0] < 250).count()
+        };
+        // 无粗体变体环境（WSL）走四向模拟加粗，覆盖应严格更多
+        assert!(count(true) > count(false));
+    }
+
+    #[test]
+    fn rich_style_len_mismatch_falls_back_to_base() {
+        let mut img = image::RgbaImage::from_pixel(80, 30, image::Rgba([255, 255, 255, 255]));
+        // 长度不符（1 vs 3 字符）→ 全部回退基础红色，蓝色不应出现
+        let styles = vec![CharStyle::base(Color::BLUE, false)];
+        draw_rich_text_in_rect(
+            &mut img,
+            Rect { x: 2, y: 2, width: 70, height: 26 },
+            "ABC",
+            Color::RED, false, None,
+            16.0,
+            &styles,
+            &[],
+        );
+        let reds = img.pixels().filter(|p| p[0] > 150 && p[2] < 100).count();
+        let blues = img.pixels().filter(|p| p[2] > 150 && p[0] < 100).count();
+        assert!(reds > 0);
+        assert_eq!(blues, 0);
+    }
+
+    #[test]
+    fn rich_newline_and_wrap() {
+        // 换行 + 窄框 wrapping 不 panic，且两行都有着色
+        let mut img = image::RgbaImage::from_pixel(40, 60, image::Rgba([255, 255, 255, 255]));
+        let styles: Vec<CharStyle> = "AA\nBB".chars().map(|_| CharStyle::base(Color::BLACK, false)).collect();
+        draw_rich_text_in_rect(
+            &mut img,
+            Rect { x: 2, y: 2, width: 12, height: 56 },
+            "AA\nBB",
+            Color::BLACK, false, None,
+            12.0,
+            &styles,
+            &[],
+        );
+        let row_has = |y: u32| (0..img.width()).any(|x| img.get_pixel(x, y)[0] < 250);
+        assert!(row_has(8), "第一行应有文字");
+        assert!(row_has(26), "第二行应有文字");
+    }
 
     #[test]
     fn empty_content_draws_nothing() {

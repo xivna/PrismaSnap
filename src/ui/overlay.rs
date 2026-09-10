@@ -107,6 +107,9 @@ pub struct Overlay {
     /// 当前修饰键状态（判断 Ctrl+C / Ctrl+S）。
     modifiers: ModifiersState,
     config: Arc<Config>,
+    /// 工具条字体选择同步全局默认后暂存的新配置（宿主负责写盘 + 热更新
+    /// `App.config`；写盘 single-writer 仍在宿主，见 Bug4 2026-09-10）。
+    pending_config: Option<Config>,
     /// 工具条上一帧的实际渲染矩形（egui 逻辑点，遮罩挖洞用；
     /// 首帧测量后帧间复用，选区确定后位置固定不变）。
     bar_rect_cache: Option<egui::Rect>,
@@ -211,6 +214,7 @@ impl Overlay {
             monitor_rect: shot.monitor_rect,
             modifiers: ModifiersState::empty(),
             config,
+            pending_config: None,
             bar_rect_cache: None,
             exit_requested: false,
             last_click: None,
@@ -229,6 +233,11 @@ impl Overlay {
     /// 窗口 id（宿主按 id 分发事件）。
     pub fn window_id(&self) -> WindowId {
         self.window.id()
+    }
+
+    /// 取出暂存的全局配置更新（宿主写盘 + 热更新后即清空，单次有效）。
+    pub fn take_pending_config(&mut self) -> Option<Config> {
+        self.pending_config.take()
     }
 
     /// 事件入口：先喂 egui 记录输入，再处理业务逻辑与重绘。
@@ -647,6 +656,10 @@ impl Overlay {
         for font_path in editor.all_text_fonts() {
             super::gui::ensure_annotation_family(self.gui.egui_ctx(), Some(&font_path));
         }
+        // 编辑态草稿加粗变体同样帧前预注册（有变体才用真粗体 family 渲染输入框）
+        if let Some(bold_font) = editor.editing_bold_font() {
+            super::gui::ensure_annotation_family_bold(self.gui.egui_ctx(), bold_font.as_deref());
+        }
         let ai_busy = self.ai_busy;
         let ai_start = self.ai_start;
         let ai_translated = &self.ai_translated;
@@ -698,7 +711,9 @@ impl Overlay {
                     &editor.mosaic_style(),
                     editor.text_font_size(),
                     editor.text_bold(),
-                    editor.has_selected_text().then(|| editor.selected_text_font()),
+                    // 选中/编辑中文字的独立字体（编辑态恒 Some，新建输入中也可用；
+                    // None = 无目标，字体选择器置灰）
+                    editor.selected_text_font(),
                     editor.selected_text_style(),
                     &mut font_picker_state,
                     editor.can_undo(),
@@ -770,11 +785,26 @@ impl Overlay {
                 let anchor = egui::pos2(edit_rect.x as f32 / ppp, edit_rect.y as f32 / ppp);
                 let size = egui::vec2(edit_rect.width as f32 / ppp, edit_rect.height as f32 / ppp);
                 let col = egui::Color32::from_rgba_unmultiplied(editor.stroke_color().r, editor.stroke_color().g, editor.stroke_color().b, editor.stroke_color().a);
-                let font_size_val = editor.text_font_size();
+                // 输入框按草稿样式渲染（字号/字体实时所见即所得；加粗混合策略，
+                // 2026-09-10 用户定稿：有粗体变体用真粗体 family，无变体用阴影垫底）
+                let font_size_val = editor.editing_text_size().unwrap_or_else(|| editor.text_font_size());
                 // 按编辑中文字（或悬停预览中）的独立字体渲染内联输入框
                 let edit_font = editor.editing_text_font();
-                let fam = crate::ui::gui::ensure_annotation_family(ui.ctx(), edit_font.as_deref());
+                let edit_bold = editor.editing_text_bold();
+                let edit_bold_variant =
+                    edit_bold && crate::ui::gui::bold_variant_available(edit_font.as_deref());
+                let fam = if edit_bold_variant {
+                    crate::ui::gui::ensure_annotation_family_bold(ui.ctx(), edit_font.as_deref())
+                } else {
+                    crate::ui::gui::ensure_annotation_family(ui.ctx(), edit_font.as_deref())
+                };
                 let font_id = egui::FontId::new(font_size_val / ppp, fam);
+                let bold_shadow = egui::Color32::from_rgba_unmultiplied(
+                    editor.stroke_color().r,
+                    editor.stroke_color().g,
+                    editor.stroke_color().b,
+                    (editor.stroke_color().a as f32 * 0.9) as u8,
+                );
                 egui::Area::new(egui::Id::new("text_inline_edit"))
                     .fixed_pos(anchor)
                     .order(egui::Order::Foreground)
@@ -788,17 +818,30 @@ impl Overlay {
                             .show(ui, |ui| {
                                 ui.visuals_mut().override_text_color = Some(col);
                                 if let Some(state) = editor.text_edit_state_mut() {
-                                    let resp = ui.add(
-                                        egui::TextEdit::multiline(&mut state.buffer)
-                                            .hint_text("输入文字…")
-                                            .font(font_id.clone())
-                                            .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
-                                            .desired_width(size.x - 4.0)
-                                            .desired_rows(((size.y / (font_size_val / ppp * 1.25)).ceil() as usize).max(1)),
-                                    );
-                                    let needs_focus = ui.ctx().memory(|m| m.focused() != Some(resp.id));
+                                    // `show`（而非 `ui.add`）取回排好的 galley 与精确起点，
+                                    // 无变体垫底阴影与输入文字同 galley、对齐分毫不差
+                                    let out = egui::TextEdit::multiline(&mut state.buffer)
+                                        .hint_text("输入文字…")
+                                        .font(font_id.clone())
+                                        .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
+                                        .desired_width(size.x - 4.0)
+                                        .desired_rows(((size.y / (font_size_val / ppp * 1.25)).ceil() as usize).max(1))
+                                        .show(ui);
+                                    // 无变体垫底：复用 TextEdit 刚排好的 galley 按预览
+                                    // 同款三向偏移叠阴影（同字形同换行，只有 0.8pt
+                                    // 位移是刻意的加粗，没有重影）。
+                                    if edit_bold && !edit_bold_variant {
+                                        for (dx, dy) in [(0.8, 0.0), (0.0, 0.8), (0.8, 0.8)] {
+                                            ui.painter().galley(
+                                                out.galley_pos + egui::vec2(dx, dy),
+                                                out.galley.clone(),
+                                                bold_shadow,
+                                            );
+                                        }
+                                    }
+                                    let needs_focus = ui.ctx().memory(|m| m.focused() != Some(out.response.id));
                                     if needs_focus {
-                                        ui.ctx().memory_mut(|m| m.request_focus(resp.id));
+                                        ui.ctx().memory_mut(|m| m.request_focus(out.response.id));
                                     }
                                 }
                             });
@@ -883,7 +926,14 @@ impl Overlay {
             }
             ToolbarAction::SetTextFont(font) => {
                 // 提交选中文字字体（restore 由 end_text_font_hover 统一处理）
-                self.editor.end_text_font_hover(Some(font));
+                self.editor.end_text_font_hover(Some(font.clone()));
+                // 同步为全局默认（2026-09-10 用户定稿）：后续新文字默认用它，
+                // 设置菜单下次打开显示它。立即先生效（fontsel 全局），写盘与
+                // App.config 热更新由宿主经 take_pending_config 完成。
+                crate::utils::fontsel::set_annotation_font(font.clone());
+                let mut cfg = (*self.config).clone();
+                cfg.ui.annotation_font = font.unwrap_or_default();
+                self.pending_config = Some(cfg);
                 self.window.request_redraw();
             }
             ToolbarAction::TextFontHover(font) => {
