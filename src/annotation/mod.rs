@@ -148,6 +148,125 @@ impl CharStyle {
     }
 }
 
+/// 把字体路径 intern 进框内字体表，返回下标（`CharStyle.font` 用）。
+///
+/// * `None` 输入 → `None`（跟随框级基础字体，不占表项）；
+/// * 同一路径重复 intern 返回同一下标；
+/// * 表满（`u16::MAX` 项）时返回 `None`（调用方回退基础字体，不崩）。
+pub fn intern_font_path(table: &mut Vec<String>, path: Option<&str>) -> Option<u16> {
+    let p = path?;
+    if let Some(i) = table.iter().position(|e| e == p) {
+        return Some(i as u16);
+    }
+    if table.len() >= u16::MAX as usize {
+        return None;
+    }
+    table.push(p.to_string());
+    Some((table.len() - 1) as u16)
+}
+
+/// 按当前字符数同步样式向量长度（富文本草稿随打字增删时调用）。
+/// 空向量 = 整框统一（uniform 快捷路径），保持空、不逐字符填充；
+/// 非空（已有富文本覆盖）才按 `base` 补齐新增字符、截掉删除字符。
+/// 调用方在 `buffer` 变化后、提交前均可调用，保证 `len == char_count` 或保持空。
+pub fn sync_styles_to_len(styles: &mut Vec<CharStyle>, char_count: usize, base: CharStyle) {
+    if styles.is_empty() {
+        return;
+    }
+    styles.truncate(char_count);
+    styles.resize(char_count, base);
+}
+
+/// 把样式向量 materialize 为逐字符（空 → 全按 `base` 填充），供选区首次套用时调用。
+pub fn materialize_styles(styles: &mut Vec<CharStyle>, char_count: usize, base: CharStyle) {
+    if styles.is_empty() {
+        styles.resize(char_count, base);
+    } else {
+        sync_styles_to_len(styles, char_count, base);
+    }
+}
+
+/// 选区范围钳制到 `[0, char_count]` 并排序（空选区/越界返回 `None`）。
+pub fn clamp_style_range(sel: Option<(usize, usize)>, char_count: usize) -> Option<(usize, usize)> {
+    let (a, b) = sel?;
+    let (s, e) = (a.min(b), a.max(b));
+    let s = s.min(char_count);
+    let e = e.min(char_count);
+    if s >= e {
+        return None;
+    }
+    Some((s, e))
+}
+
+/// 选区套颜色（纯逻辑；空向量首次套用时按 `base` materialize 全框）。
+pub fn apply_color_to_range(
+    styles: &mut Vec<CharStyle>,
+    char_count: usize,
+    base: CharStyle,
+    range: (usize, usize),
+    color: Color,
+) -> bool {
+    materialize_styles(styles, char_count, base);
+    let Some((s, e)) = clamp_style_range(Some(range), char_count) else {
+        return false;
+    };
+    if styles.len() != char_count {
+        return false;
+    }
+    for st in &mut styles[s..e] {
+        st.color = color;
+    }
+    true
+}
+
+/// 选区套加粗（纯逻辑；materialize 语义同颜色）。
+pub fn apply_bold_to_range(
+    styles: &mut Vec<CharStyle>,
+    char_count: usize,
+    base: CharStyle,
+    range: (usize, usize),
+    bold: bool,
+) -> bool {
+    materialize_styles(styles, char_count, base);
+    let Some((s, e)) = clamp_style_range(Some(range), char_count) else {
+        return false;
+    };
+    if styles.len() != char_count {
+        return false;
+    }
+    for st in &mut styles[s..e] {
+        st.bold = bold;
+    }
+    true
+}
+
+/// 选区套字体（纯逻辑；`path = None` 表示该选区回退框级基础字体）。
+pub fn apply_font_to_range(
+    styles: &mut Vec<CharStyle>,
+    font_table: &mut Vec<String>,
+    char_count: usize,
+    base: CharStyle,
+    range: (usize, usize),
+    path: Option<&str>,
+) -> bool {
+    materialize_styles(styles, char_count, base);
+    let Some((s, e)) = clamp_style_range(Some(range), char_count) else {
+        return false;
+    };
+    if styles.len() != char_count {
+        return false;
+    }
+    let fi = intern_font_path(font_table, path);
+    // `Some(path)` 但表满 intern 失败 → 不套用（回退基础，避免指向坏下标）
+    if path.is_some() && fi.is_none() {
+        return false;
+    }
+    for st in &mut styles[s..e] {
+        st.font = fi;
+    }
+    true
+}
+
 impl Annotation {
     /// 稳定 id（不因 delete/undo 复用）。
     pub fn id(&self) -> u64 {
@@ -1055,5 +1174,96 @@ mod tests {
         // 平移后箭头 (10,5)->(30,5) 轴线在 y=5 附近
         let p = img.get_pixel(20, 5).0;
         assert_eq!(p[0..3], [255, 59, 48]);
+    }
+
+    #[test]
+    fn intern_font_path_dedups_and_none() {
+        let mut table = Vec::new();
+        assert_eq!(intern_font_path(&mut table, None), None);
+        assert!(table.is_empty());
+        assert_eq!(intern_font_path(&mut table, Some("a.ttf")), Some(0));
+        assert_eq!(intern_font_path(&mut table, Some("b.ttf")), Some(1));
+        // 重复返回同一下标，不增表
+        assert_eq!(intern_font_path(&mut table, Some("a.ttf")), Some(0));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn sync_keeps_uniform_empty_but_truncates_rich() {
+        let base = CharStyle::base(Color::RED, false);
+        // uniform 空向量：打字也不填充（保持整框统一快捷路径）
+        let mut uniform = Vec::new();
+        sync_styles_to_len(&mut uniform, 5, base);
+        assert!(uniform.is_empty());
+        // 富文本：截短与补齐
+        let mut rich = vec![base; 5];
+        sync_styles_to_len(&mut rich, 3, base);
+        assert_eq!(rich.len(), 3);
+        sync_styles_to_len(&mut rich, 6, base);
+        assert_eq!(rich.len(), 6);
+        assert!(rich.iter().all(|s| *s == base));
+    }
+
+    #[test]
+    fn selection_color_materializes_and_clamps() {
+        let base = CharStyle::base(Color::BLACK, false);
+        // 空向量首次套用：全框 materialize，只有选区变色
+        let mut styles = Vec::new();
+        assert!(apply_color_to_range(&mut styles, 4, base, (1, 3), Color::RED));
+        assert_eq!(styles.len(), 4);
+        assert_eq!(styles[0].color, Color::BLACK);
+        assert_eq!(styles[1].color, Color::RED);
+        assert_eq!(styles[2].color, Color::RED);
+        assert_eq!(styles[3].color, Color::BLACK);
+        // 逆序与越界钳制
+        let mut styles2 = Vec::new();
+        assert!(apply_color_to_range(&mut styles2, 4, base, (10, 2), Color::BLUE));
+        assert_eq!(styles2[0].color, Color::BLACK);
+        assert_eq!(styles2[1].color, Color::BLACK);
+        assert_eq!(styles2[2].color, Color::BLUE);
+        assert_eq!(styles2[3].color, Color::BLUE);
+        // 空选区返回 false
+        let mut styles3 = vec![base; 3];
+        assert!(!apply_color_to_range(&mut styles3, 3, base, (1, 1), Color::RED));
+    }
+
+    #[test]
+    fn selection_bold_and_font_roundtrip() {
+        let base = CharStyle::base(Color::BLACK, false);
+        let mut styles = Vec::new();
+        let mut table: Vec<String> = Vec::new();
+        assert!(apply_bold_to_range(&mut styles, 3, base, (0, 2), true));
+        assert!(styles[0].bold && styles[1].bold && !styles[2].bold);
+        assert!(apply_font_to_range(&mut styles, &mut table, 3, base, (1, 3), Some("x.ttf")));
+        assert_eq!(table, vec!["x.ttf".to_string()]);
+        assert_eq!(styles[0].font, None);
+        assert_eq!(styles[1].font, Some(0));
+        assert_eq!(styles[2].font, Some(0));
+        // 回退基础字体：选区 font 清零
+        assert!(apply_font_to_range(&mut styles, &mut table, 3, base, (1, 2), None));
+        assert_eq!(styles[1].font, None);
+        // 同路径复用同一下标
+        assert!(apply_font_to_range(&mut styles, &mut table, 3, base, (0, 1), Some("x.ttf")));
+        assert_eq!(styles[0].font, Some(0));
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn selection_cjk_mixed_char_not_byte_index() {
+        // 外援 R4：选区/CCursor 按 char 计数，中英混排绝不能混用字节偏移。
+        // "啊A阿B" = 4 字符（字节 3+1+3+1），选区 (1, 3) 应只改 A、阿。
+        let content = "啊A阿B";
+        assert_eq!(content.chars().count(), 4);
+        let base = CharStyle::base(Color::BLACK, false);
+        let mut styles = Vec::new();
+        assert!(apply_color_to_range(&mut styles, 4, base, (1, 3), Color::RED));
+        assert_eq!(styles[0].color, Color::BLACK); // 啊
+        assert_eq!(styles[1].color, Color::RED); // A
+        assert_eq!(styles[2].color, Color::RED); // 阿
+        assert_eq!(styles[3].color, Color::BLACK); // B
+        // 全选越界钳制不断言 panic
+        let mut styles2 = Vec::new();
+        assert!(apply_bold_to_range(&mut styles2, 4, base, (0, 99), true));
+        assert!(styles2.iter().all(|s| s.bold));
     }
 }

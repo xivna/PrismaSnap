@@ -134,7 +134,10 @@ pub struct Overlay {
     /// OCR 缓存：产生该结果时的选区（命中才复用，避免重复识别）。
     ai_cached_sel: Option<Rect>,
     /// OCR 缓存：全图坐标的识别区域。
-    ai_cached_regions: Vec<TextRegion>,
+    pub ai_cached_regions: Vec<TextRegion>,
+    /// 内联文字输入框本帧的 egui Id（工具条提交后恢复焦点/选区用，外援 R3；
+    /// `TextEdit` 无显式 id 时按 Ui 位置派生，内容变化不影响其稳定）。
+    edit_text_id: Option<egui::Id>,
 }
 
 impl Overlay {
@@ -227,6 +230,7 @@ impl Overlay {
             ai_translated: Vec::new(),
             ai_cached_sel: None,
             ai_cached_regions: Vec::new(),
+            edit_text_id: None,
         })
     }
 
@@ -653,8 +657,11 @@ impl Overlay {
         // 帧开始前预注册本帧要用到的逐标注字体（egui 的 set_fonts 在帧中间调用
         // 当帧不生效，沿用旧字体表的 galley 会对未绑定 family 直接 panic——
         // 2026-09-09 实机闪退 "FontFamily::Name(ann_..) is not bound to any fonts"）
+        // 常规与粗体变体都预注册（富文本逐字符字体/加粗各用各 family，预览 LayoutJob
+        // 帧内 ensure 只是复用已注册项，不触发 set_fonts）。
         for font_path in editor.all_text_fonts() {
             super::gui::ensure_annotation_family(self.gui.egui_ctx(), Some(&font_path));
+            super::gui::ensure_annotation_family_bold(self.gui.egui_ctx(), Some(&font_path));
         }
         // 编辑态草稿加粗变体同样帧前预注册（有变体才用真粗体 family 渲染输入框）
         if let Some(bold_font) = editor.editing_bold_font() {
@@ -670,6 +677,8 @@ impl Overlay {
         // 渲染后拿到实际矩形会主动请求再绘一帧补上
         let cached_bar_rect = self.bar_rect_cache;
         let mut bar_actual: Option<egui::Rect> = None;
+        // 内联输入框本帧 Id（渲染闭包内回填，见下；未编辑时保持 None）
+        let mut edit_text_id: Option<egui::Id> = None;
         let presented = self.gui.render(window.as_ref(), |ui| {
             super::gui::apply_theme(ui.ctx(), theme);
             draw_frame(
@@ -843,6 +852,17 @@ impl Overlay {
                                     if needs_focus {
                                         ui.ctx().memory_mut(|m| m.request_focus(out.response.id));
                                     }
+                                    // 富文本选区回填：工具条颜色/加粗/字体在有选区时只 splice
+                                    // 选区（见 `Editor::apply_text_color/bold/end_text_font_hover`），
+                                    // 无选区走整框 legacy。`cursor_range` 字符下标（非字节），
+                                    // 与草稿 `char_styles` 的字符对齐一致。
+                                    let sel = out.cursor_range.and_then(|rg| {
+                                        let a: usize = rg.primary.index.0;
+                                        let b: usize = rg.secondary.index.0;
+                                        if a == b { None } else { Some((a.min(b), a.max(b))) }
+                                    });
+                                    editor.note_edit_frame(sel);
+                                    edit_text_id = Some(out.response.id);
                                 }
                             });
                     });
@@ -851,6 +871,7 @@ impl Overlay {
         // 缓存工具条实际渲染矩形；首帧测量到边界后请求再绘一帧，
         // 让贴合的遮罩挖洞立即生效
         self.font_picker = font_picker_state;
+        self.edit_text_id = edit_text_id;
         let first_measure = self.bar_rect_cache.is_none() && bar_actual.is_some();
         self.bar_rect_cache = bar_actual;
         if first_measure {
@@ -922,6 +943,7 @@ impl Overlay {
             }
             ToolbarAction::SetTextColorAt(color) => {
                 self.editor.apply_text_color(color);
+                self.restore_edit_focus();
                 self.window.request_redraw();
             }
             ToolbarAction::SetTextFont(font) => {
@@ -934,6 +956,7 @@ impl Overlay {
                 let mut cfg = (*self.config).clone();
                 cfg.ui.annotation_font = font.unwrap_or_default();
                 self.pending_config = Some(cfg);
+                self.restore_edit_focus();
                 self.window.request_redraw();
             }
             ToolbarAction::TextFontHover(font) => {
@@ -945,6 +968,7 @@ impl Overlay {
             }
             ToolbarAction::SetTextBold(bold) => {
                 self.editor.apply_text_bold(bold);
+                self.restore_edit_focus();
                 self.window.request_redraw();
             }
             ToolbarAction::SetMosaicStyle(style) => {
@@ -968,6 +992,31 @@ impl Overlay {
             ToolbarAction::ExtractText => self.start_extract(),
             ToolbarAction::Translate => self.start_translate(),
         }
+    }
+
+    /// 工具条提交样式后，把焦点和选区还给内联输入框（外援 R3）。
+    ///
+    /// 点加粗/颜色/字体按钮当帧 TextEdit 失焦（选区被折叠，提交靠粘性选区），
+    /// 若不恢复焦点，用户点一次按钮输入框就丢光标、体验别扭。选区按
+    /// `edit_sel_range`（当帧→粘性）重建后写回 egui（`load/store`），无选区
+    /// 时只恢复焦点。非编辑态直接返回。
+    fn restore_edit_focus(&self) {
+        if !self.editor.is_editing_text() {
+            return;
+        }
+        let Some(id) = self.edit_text_id else { return };
+        let ctx = self.gui.egui_ctx();
+        if let Some((s, e)) = self.editor.edit_sel_range() {
+            if let Some(mut st) = egui::text_edit::TextEditState::load(ctx, id) {
+                let rg = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(s),
+                    egui::text::CCursor::new(e),
+                );
+                st.cursor.set_char_range(Some(rg));
+                st.store(ctx, id);
+            }
+        }
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
     /// 注入 AI 完成回传（宿主在打开覆盖层时设置，接到 winit `EventLoopProxy`）。

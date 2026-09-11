@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use crate::annotation::{Annotation, AnnotationManager, Color, Tool};
+use crate::annotation::{Annotation, AnnotationManager, CharStyle, Color, Tool};
+use crate::annotation::{apply_bold_to_range, apply_color_to_range, apply_font_to_range};
+use crate::annotation::{intern_font_path, materialize_styles, sync_styles_to_len};
 use crate::utils::math::Rect;
 use libblur::{stack_blur, FastBlurChannels, ThreadingPolicy};
 
@@ -23,6 +25,23 @@ pub struct TextEditState {
     /// 草稿独立字体（`None` = 跟随全局；新建文字 previously 无处可挂，
     /// 字体选择器只能置灰——同上根因；提交时落到标注）。
     pub font: Option<String>,
+    /// 草稿逐字符样式（富文本选区套用后非空；空 = 整框统一走颜色/加粗/字体）。
+    /// 长度恒等于 `buffer` 字符数（打字增删后由 `note_edit_frame` 同步）。
+    pub char_styles: Vec<CharStyle>,
+    /// 草稿框内字体表（`char_styles.font` 下标指向此处）。
+    pub font_table: Vec<String>,
+    /// 内联输入框当前选区（字符下标排序后 `[s, e)`；`None`/空 = 本帧无选区）。
+    /// 由覆盖层每帧经 `note_edit_frame` 回填。
+    pub sel: Option<(usize, usize)>,
+    /// 最近一次非空选区（粘性选区，外援 R1 建议）。
+    ///
+    /// 点工具条按钮（加粗复选框/字体弹层）会让 TextEdit 当帧失焦、egui 内部
+    /// 选区被折叠——若只认当帧 `sel`，提交动作会 fallback 到整框（"改字体对
+    /// 全部生效"）或 no-op（"加粗无反应"）。粘性选区保留用户拖出的范围，
+    /// 打字（字符数变化）后自动失效。
+    pub sticky_sel: Option<(usize, usize)>,
+    /// 粘性选区对应的字符数（`buffer` 变化即失活，防过期 range 错位）。
+    pub sticky_len: usize,
 }
 
 /// 文本框缩放状态。
@@ -165,33 +184,36 @@ impl Editor {
         let rect = if rect.width < 24 || rect.height < 16 { Rect{ x: rect.x, y: rect.y, width: 200, height: 60 } } else { rect };
         // 新建草稿样式取当前默认值（工具条在输入态即可实时改 draft，所见即所得）
         let (font_size, bold) = (self.mgr.text_font_size, self.mgr.text_bold);
-        self.editing_text = Some(TextEditState{ rect, buffer: String::new(), index: None, font_size, bold, font: None });
+        self.editing_text = Some(TextEditState{ rect, buffer: String::new(), index: None, font_size, bold, font: None, char_styles: Vec::new(), font_table: Vec::new(), sel: None, sticky_sel: None, sticky_len: 0 });
         self.edit_font_hover_orig = None;
         self.mgr.select(None);
     }
     pub fn begin_text_edit_existing(&mut self, index: usize) -> bool {
-        let Some(Annotation::Text{ rect, content, color, font_size, bold, font, .. }) = self.mgr.annotations().get(index).cloned() else { return false; };
+        let Some(Annotation::Text{ rect, content, color, font_size, bold, font, char_styles, font_table, .. }) = self.mgr.annotations().get(index).cloned() else { return false; };
         self.mgr.stroke_color = color;
         self.mgr.text_font_size = font_size;
         self.mgr.text_bold = bold;
-        self.editing_text = Some(TextEditState{ rect, buffer: content, index: Some(index), font_size, bold, font });
+        self.editing_text = Some(TextEditState{ rect, buffer: content, index: Some(index), font_size, bold, font, char_styles, font_table, sel: None, sticky_sel: None, sticky_len: 0 });
         self.edit_font_hover_orig = None;
         self.mgr.select(Some(index));
         true
     }
     pub fn commit_text_edit(&mut self) -> bool {
-        let Some(state) = self.editing_text.take() else { return false; };
+        let Some(mut state) = self.editing_text.take() else { return false; };
         self.edit_font_hover_orig = None;
         if state.buffer.trim().is_empty() { return false; }
+        // 提交前按当前字符数规整样式向量（打字增删后长度可能漂移；空保持空）
+        let char_count = state.buffer.chars().count();
+        let base = self.draft_base_for(&state);
+        sync_styles_to_len(&mut state.char_styles, char_count, base);
+        // 长度仍对不上（不应发生）则整体回退整框统一，避免导出半套用
+        if !state.char_styles.is_empty() && state.char_styles.len() != char_count {
+            state.char_styles.clear();
+            state.font_table.clear();
+        }
         if let Some(idx) = state.index {
-            // 二次编辑：内容/颜色/字号/加粗按 draft 落盘，保留已有逐字符样式与字体表
-            let (cs, ft) = match self.mgr.annotations().get(idx) {
-                Some(Annotation::Text { char_styles, font_table, .. }) => {
-                    (char_styles.clone(), font_table.clone())
-                }
-                _ => (Vec::new(), Vec::new()),
-            };
-            let ok = self.mgr.update_text_styled(idx, state.buffer, self.mgr.stroke_color, state.font_size, state.bold, cs, ft);
+            // 二次编辑：内容/颜色/字号/加粗按 draft 落盘，逐字符样式与字体表随草稿落盘
+            let ok = self.mgr.update_text_styled(idx, state.buffer, self.mgr.stroke_color, state.font_size, state.bold, state.char_styles, state.font_table);
             if ok { self.mgr.select(Some(idx)); }
             // …字体变化才写（走历史可撤销；无变化不压历史）
             if self.mgr.text_font_at(idx) != state.font {
@@ -203,8 +225,8 @@ impl Editor {
             let _ = self.mgr.update_text_rect(idx, state.rect);
             ok
         } else {
-            self.mgr.push_text(state.rect, state.buffer);
-            // 新建提交后 push_text 已选中新标注：draft 字体落到它（raw，不另压历史；
+            self.mgr.push_text_styled(state.rect, state.buffer, state.char_styles, state.font_table);
+            // 新建提交后已选中新标注：draft 字体落到它（raw，不另压历史；
             // 字号/加粗/颜色走默认值通道，apply_* 在编辑态已同步过默认值）
             if let Some(idx) = self.mgr.selected() {
                 self.mgr.set_text_font_raw(idx, state.font);
@@ -215,6 +237,92 @@ impl Editor {
         }
     }
     pub fn cancel_text_edit(&mut self) { self.editing_text = None; self.edit_font_hover_orig = None; }
+
+    /// 草稿基础样式（新字符/首次选区 materialize 用）：颜色取当前统一色，
+    /// 加粗/字体取草稿值（字体下标为草稿表内已存在项，不存在则 None 跟随框级）。
+    fn draft_base_for(&self, state: &TextEditState) -> CharStyle {
+        CharStyle {
+            color: self.mgr.stroke_color,
+            bold: state.bold,
+            font: state.font.as_deref().and_then(|p| {
+                state.font_table.iter().position(|e| e == p).map(|i| i as u16)
+            }),
+        }
+    }
+
+    /// 内联输入框每帧回填（覆盖层在 `TextEdit::show` 后调用）。
+    ///
+    /// * `sel` - 当前选区字符范围（已排序 `[s, e)`；空选区传 `None`）；
+    /// * 同步样式向量到当前 `buffer` 长度（打字新增字符按草稿基础样式补齐，
+    ///   uniform 空向量保持空）；
+    /// * 非空选区同步写入粘性选区（外援 R1：工具条点击当帧失焦折叠选区后，
+    ///   提交动作仍有 range 可用）；字符数变化则粘性选区失活。
+    pub fn note_edit_frame(&mut self, sel: Option<(usize, usize)>) {
+        let Some(st) = self.editing_text.as_mut() else { return; };
+        // 选区钳制到当前字符数
+        let n = st.buffer.chars().count();
+        st.sel = sel.and_then(|(a, b)| {
+            let (s, e) = (a.min(b), a.max(b));
+            let s = s.min(n);
+            let e = e.min(n);
+            if s < e { Some((s, e)) } else { None }
+        });
+        if n != st.sticky_len {
+            st.sticky_sel = None;
+        }
+        if let Some(r) = st.sel {
+            st.sticky_sel = Some(r);
+            st.sticky_len = n;
+        }
+        let base = CharStyle::base(self.mgr.stroke_color, st.bold);
+        // base.font：草稿字体在表中的下标（不在表则 None=跟随框级，套用时再 intern）
+        let base = CharStyle {
+            color: base.color,
+            bold: base.bold,
+            font: st.font.as_deref().and_then(|p| {
+                st.font_table.iter().position(|e| e == p).map(|i| i as u16)
+            }),
+        };
+        sync_styles_to_len(&mut st.char_styles, n, base);
+    }
+
+    /// 编辑态是否有非空选区（工具条走选区 splice 还是整框 legacy 的分流开关）。
+    ///
+    /// 当帧选区优先，否则用粘性选区（点击工具条当帧失焦折叠后的 fallback，
+    /// 外援 R1；粘性选区已按字符数校验，打字后失活）。
+    pub fn edit_sel_range(&self) -> Option<(usize, usize)> {
+        let st = self.editing_text.as_ref()?;
+        if let Some(r) = st.sel {
+            return Some(r);
+        }
+        let r = st.sticky_sel?;
+        let n = st.buffer.chars().count();
+        if st.sticky_len == n {
+            // 双重钳制（防御：极端情况下 buffer 与 sticky_len 一致但越界）
+            let (s, e) = (r.0.min(n), r.1.min(n));
+            if s < e { Some((s, e)) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// 确保草稿样式已 materialize（空 → 全按当前基础填充），返回字符数。
+    /// 选区套用前调用；调用后 `char_styles.len() == char_count`（uniform 除外已填）。
+    fn ensure_draft_materialized(&mut self) -> usize {
+        let Some(st) = self.editing_text.as_mut() else { return 0 };
+        let n = st.buffer.chars().count();
+        let base = CharStyle {
+            color: self.mgr.stroke_color,
+            bold: st.bold,
+            font: st.font.as_deref().and_then(|p| {
+                st.font_table.iter().position(|e| e == p).map(|i| i as u16)
+            }),
+        };
+        materialize_styles(&mut st.char_styles, n, base);
+        // materialize 后若草稿字体不在表而样式引用了它，下标为 None（跟随框级）即可，
+        // 渲染时 `or(base_font)` 会回退到框级字体，无需强制 intern
+        n
+    }
 
     // ── 文本框缩放 ──
     pub fn hit_text_handle(&self, pt: (f32,f32)) -> Option<(usize, usize)> {
@@ -537,7 +645,18 @@ impl Editor {
     }
 
     /// 选中文字实时改加粗（编辑态改草稿 + 同步默认值，理由同上）。
+    ///
+    /// 富文本：编辑态有非空选区时只 splice 选区（不改草稿基准、不清空覆盖）；
+    /// 无选区走整框 legacy 路径。
     pub fn apply_text_bold(&mut self, bold: bool) {
+        if let Some(range) = self.edit_sel_range() {
+            let n = self.ensure_draft_materialized();
+            if let Some(st) = self.editing_text.as_mut() {
+                let base = CharStyle::base(self.mgr.stroke_color, st.bold);
+                apply_bold_to_range(&mut st.char_styles, n, base, range, bold);
+            }
+            return;
+        }
         self.mgr.set_text_bold(bold);
         if let Some(st) = &mut self.editing_text {
             st.bold = bold;
@@ -547,7 +666,17 @@ impl Editor {
     }
 
     /// 选中文字实时改颜色（默认值与标注双写，理由同上）。
+    ///
+    /// 富文本：编辑态有非空选区时只 splice 选区（不改统一色、不清空覆盖）。
     pub fn apply_text_color(&mut self, color: Color) {
+        if let Some(range) = self.edit_sel_range() {
+            let n = self.ensure_draft_materialized();
+            if let Some(st) = self.editing_text.as_mut() {
+                let base = CharStyle::base(self.mgr.stroke_color, st.bold);
+                apply_color_to_range(&mut st.char_styles, n, base, range, color);
+            }
+            return;
+        }
         self.set_stroke_color(color);
         if let Some(i) = self.font_target_index() {
             self.mgr.set_text_color_at(i, color);
@@ -556,23 +685,33 @@ impl Editor {
 
     /// 全部在用文字字体（覆盖层每帧渲染前预注册 egui family 用，
     /// 防止 mid-frame set_fonts 不生效导致 FontFamily unbound panic）。
-    /// 含编辑态草稿字体（新建文字的字体不在标注表里，不预注册输入框必崩）。
+    /// 含编辑态草稿字体（新建文字的字体不在标注表里，不预注册输入框必崩）
+    /// 与草稿/已提交字体表里的逐字符字体（富文本预览逐 family 取用）。
     pub fn all_text_fonts(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut push = |f: &Option<String>| {
+        let push_one = |out: &mut Vec<String>, f: &Option<String>| {
             if let Some(f) = f {
                 if !out.contains(f) {
                     out.push(f.clone());
                 }
             }
         };
+        let push_table = |out: &mut Vec<String>, table: &[String]| {
+            for p in table {
+                if !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
+        };
         for a in self.mgr.annotations().iter().chain(self.mgr.in_progress()) {
-            if let Annotation::Text { font, .. } = a {
-                push(font);
+            if let Annotation::Text { font, font_table, .. } = a {
+                push_one(&mut out, font);
+                push_table(&mut out, font_table);
             }
         }
         if let Some(st) = &self.editing_text {
-            push(&st.font);
+            push_one(&mut out, &st.font);
+            push_table(&mut out, &st.font_table);
         }
         out
     }
@@ -581,12 +720,19 @@ impl Editor {
     ///
     /// 编辑态只改草稿（新建文字尚无标注可写；输入框按草稿实时渲染），
     /// 非编辑态沿用原地改写 + 还原的老路径。
+    /// 富文本：编辑态有非空选区时悬停不预览（选区 splice 只在点击提交时落盘，
+    /// 避免 hover/restore 与草稿样式备份纠缠）。
     pub fn hover_text_font(&mut self, font_path: Option<String>) {
-        if let Some(st) = &mut self.editing_text {
-            if self.edit_font_hover_orig.is_none() {
-                self.edit_font_hover_orig = Some(st.font.clone());
+        if self.editing_text.is_some() {
+            if self.edit_sel_range().is_some() {
+                return;
             }
-            st.font = font_path;
+            if let Some(st) = &mut self.editing_text {
+                if self.edit_font_hover_orig.is_none() {
+                    self.edit_font_hover_orig = Some(st.font.clone());
+                }
+                st.font = font_path;
+            }
             return;
         }
         let Some(idx) = self.font_target_index() else { return };
@@ -604,8 +750,39 @@ impl Editor {
     /// 编辑态提交只定草稿（真正落盘在 `commit_text_edit`，提交与否走同一出口，
     /// 点选提交不再依赖悬停暂存——此前"悬停帧与点击同帧到达即提交丢失"的盲区关闭）；
     /// 非编辑态提交走历史可撤销。
+    /// 富文本：编辑态有非空选区时提交只 splice 选区（不改草稿基准字体）。
     pub fn end_text_font_hover(&mut self, commit: Option<Option<String>>) {
         if self.editing_text.is_some() {
+            if let Some(range) = self.edit_sel_range() {
+                if let Some(f) = commit {
+                    let n = self.ensure_draft_materialized();
+                    if let Some(st) = self.editing_text.as_mut() {
+                        let base = CharStyle::base(self.mgr.stroke_color, st.bold);
+                        // 选区套字体：intern 进草稿表（None = 回退框级）
+                        match f {
+                            Some(path) => {
+                                let fi = intern_font_path(&mut st.font_table, Some(&path));
+                                // 表满 intern 失败则不套用
+                                if let Some(fi) = fi {
+                                    crate::annotation::materialize_styles(&mut st.char_styles, n, base);
+                                    if let Some((s, e)) = crate::annotation::clamp_style_range(Some(range), n) {
+                                        if st.char_styles.len() == n {
+                                            for c in &mut st.char_styles[s..e] {
+                                                c.font = Some(fi);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                apply_font_to_range(&mut st.char_styles, &mut st.font_table, n, base, range, None);
+                            }
+                        }
+                    }
+                }
+                self.edit_font_hover_orig = None;
+                return;
+            }
             if let Some(f) = commit {
                 if let Some(st) = &mut self.editing_text {
                     st.font = f;
@@ -816,7 +993,7 @@ impl Editor {
     }
 }
 
-fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>, prefix: &[Annotation]) {
+fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>, prefix: &[Annotation]) {
     let to_pt = |p: (f32,f32)| egui::pos2(p.0/ppp, p.1/ppp);
     let stroke = |c: Color, w: f32| egui::Stroke::new(w/ppp, egui::Color32::from_rgba_unmultiplied(c.r,c.g,c.b,c.a));
     match ann {
@@ -825,13 +1002,15 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
             painter.rect_stroke(r, 0.0, stroke(*color,*stroke_width), egui::StrokeKind::Outside);
         }
         Annotation::Arrow{ from, to, color, stroke_width, .. } => {
-            let (f,t) = (to_pt(*from), to_pt(*to));
+            let t = to_pt(*to);
             let st = stroke(*color,*stroke_width);
-            // 轴线只画到三角底边中心（arrow_shaft_end，平头端埋进实心三角内），
-            // 尖端纯粹是三角锐角顶点——锐利尖头，与导出 draw_arrow 同源几何
-            // （2026-09-10：轴线画到 to 会把尖端截平成线宽宽的平头）。
-            let shaft_end = to_pt(crate::annotation::tools::arrow::arrow_shaft_end(*from, *to, *stroke_width));
-            painter.line_segment([f, shaft_end], st);
+            // 轴线伸入三角内部一个重叠量（arrow_shaft_end：平头端埋在实心区，
+            // 既不截平尖端、也不在底边留缝），尖端纯粹是三角锐角顶点，
+            // 与导出 draw_arrow 同源几何（2026-09-12 接缝根因见 arrow.rs）。
+            // 短箭头只画头（arrow_shaft_span 返回 None 时无轴线，防穿帮）。
+            if let Some((sf, se)) = crate::annotation::tools::arrow::arrow_shaft_span(*from, *to, *stroke_width) {
+                painter.line_segment([to_pt(sf), to_pt(se)], st);
+            }
             let (w1, w2) = crate::annotation::tools::arrow::arrow_head_wings(*from, *to, *stroke_width);
             painter.add(egui::Shape::convex_polygon(
                 vec![t, to_pt(w1), to_pt(w2)],
@@ -881,24 +1060,66 @@ fn draw_annotation(painter: &egui::Painter, _ctx: &egui::Context, ann: &Annotati
                 crate::annotation::MosaicStyle::Solid{ color } => { painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255)); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); }
             }
         }
-        Annotation::Text{ rect, content, color, font_size, bold, font, .. } => {
+        Annotation::Text{ rect, content, color, font_size, bold, font, char_styles, font_table, .. } => {
             let r = egui::Rect::from_min_max(to_pt((rect.x as f32, rect.y as f32)), to_pt((rect.right() as f32, rect.bottom() as f32)));
             // 文本框无底色（透明），仅边框与文字，避免遮挡截图内容
             // 按行 wrapping 绘制（与导出一致的简易 wrap）
             // 文字标注预览用"标注字体" family（独立字体优先，与导出 CPU 渲染同字体文件）
-            let fam = crate::ui::gui::ensure_annotation_family(_ctx, font.as_deref());
-            let font_id = egui::FontId::new(font_size / ppp, fam);
-            let col = egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,color.a);
             let wrap_w = (rect.width as f32 / ppp).max(20.0);
-            let galley = painter.layout(content.clone(), font_id.clone(), col, wrap_w);
-            if *bold {
-                // 粗体：四向 0.8px 偏移叠加，明显加粗（导出端为字体+描边，此处视觉对齐）
-                let shadow = egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b, (color.a as f32 * 0.9) as u8);
-                for (dx,dy) in [(0.8,0.0),(0.0,0.8),(0.8,0.8)] {
-                    painter.galley(r.min + egui::vec2(dx, dy), galley.clone(), shadow);
+            let styles_valid = !char_styles.is_empty() && char_styles.len() == content.chars().count();
+            if !styles_valid {
+                let fam = crate::ui::gui::ensure_annotation_family(ctx, font.as_deref());
+                let font_id = egui::FontId::new(font_size / ppp, fam);
+                let col = egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,color.a);
+                let galley = painter.layout(content.clone(), font_id.clone(), col, wrap_w);
+                if *bold {
+                    // 粗体：四向 0.8px 偏移叠加，明显加粗（导出端为字体+描边，此处视觉对齐）
+                    let shadow = egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b, (color.a as f32 * 0.9) as u8);
+                    for (dx,dy) in [(0.8,0.0),(0.0,0.8),(0.8,0.8)] {
+                        painter.galley(r.min + egui::vec2(dx, dy), galley.clone(), shadow);
+                    }
                 }
+                painter.galley(r.min, galley, col);
+            } else {
+                // 富文本：逐字符颜色/加粗/字体经 LayoutJob 分段（字号整框统一）。
+                // 加粗走真粗体变体 family；无变体时预览回退常规（导出仍四向模拟，
+                // 预览与导出在此极端下有差，见 PROGRESS；有变体的主流字体不受影响）。
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = wrap_w;
+                // 按 (颜色, 加粗, 字体下标) 分段，连续同样式合并一次 append
+                let mut run = String::new();
+                let mut run_key: Option<(Color, bool, Option<u16>)> = None;
+                let flush = |job: &mut egui::text::LayoutJob, run: &mut String, key: Option<(Color, bool, Option<u16>)>| {
+                    if run.is_empty() { return; }
+                    let Some((c, b, fi)) = key else { return };
+                    let path = fi.and_then(|i| font_table.get(i as usize).map(String::as_str)).or(font.as_deref());
+                    let fam = if b && crate::ui::gui::bold_variant_available(path) {
+                        crate::ui::gui::ensure_annotation_family_bold(ctx, path)
+                    } else {
+                        crate::ui::gui::ensure_annotation_family(ctx, path)
+                    };
+                    job.append(run.as_str(), 0.0, egui::text::TextFormat {
+                        font_id: egui::FontId::new(font_size / ppp, fam),
+                        color: egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a),
+                        ..Default::default()
+                    });
+                    run.clear();
+                };
+                for (ch, st) in content.chars().zip(char_styles.iter()) {
+                    let key = (st.color, st.bold, st.font);
+                    match run_key {
+                        Some(k) if k == key => run.push(ch),
+                        _ => {
+                            flush(&mut job, &mut run, run_key);
+                            run_key = Some(key);
+                            run.push(ch);
+                        }
+                    }
+                }
+                flush(&mut job, &mut run, run_key);
+                let galley = painter.layout_job(job);
+                painter.galley(r.min, galley, egui::Color32::WHITE);
             }
-            painter.galley(r.min, galley, col);
             if selected {
                 painter.rect_stroke(r, 2.0, egui::Stroke::new(1.2/ppp.max(1.0), egui::Color32::from_rgba_unmultiplied(10,132,255,180)), egui::StrokeKind::Outside);
                 // 八句柄（四角+四边中点）
