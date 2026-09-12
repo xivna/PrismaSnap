@@ -119,10 +119,8 @@ mod imp {
             // 记住当前前台窗口：覆盖层需要键盘焦点（Esc/Enter），截图期间焦点
             // 会转移；结束后在 close_overlay 里归还（失败只记日志，不影响流程）。
             self.prev_foreground = foreground_window();
-            // 隐藏设置窗口，避免遮挡与抢焦点（截图结束恢复）
-            if let Some(settings) = &self.settings {
-                settings.hide();
-            }
+            // 2026-09-12 用户要求：设置窗口不再响应截图动作——触发时不隐藏，
+            // 结束时不恢复，保持用户自己安排的可见状态。
             let config = self.config.clone();
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -180,9 +178,9 @@ mod imp {
             if let Some(hwnd) = self.prev_foreground.take() {
                 restore_foreground_window(hwnd);
             }
-            // 截图期间被隐藏的设置窗口恢复显示
-            if let Some(settings) = &self.settings {
-                settings.show();
+            // 2026-09-12 用户要求：设置窗口不再响应截图动作——结束时不恢复显示，
+            // 只按窗口是否还在决定事件循环模式（设置开着保持 Poll）。
+            if self.settings.is_some() {
                 event_loop.set_control_flow(ControlFlow::Poll);
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -199,7 +197,7 @@ mod imp {
                 settings.focus();
                 return;
             }
-            let window = match Settings::create_window(event_loop) {
+            let window = match Settings::create_window(event_loop, self.config.ui.settings_pos) {
                 Ok(w) => w,
                 Err(e) => {
                     error!("创建设置窗口失败: {e:#}");
@@ -221,7 +219,7 @@ mod imp {
             event_loop.set_control_flow(ControlFlow::Poll);
         }
 
-        /// 关闭设置窗口（丢弃编辑缓冲）。
+        /// 关闭设置窗口（丢弃编辑缓冲，记录窗口位置并写盘下次恢复）。
         fn close_settings(&mut self, event_loop: &ActiveEventLoop) {
             // 录制期间关闭窗口：恢复被挂起的全局热键
             if self.hotkey_suspended {
@@ -229,6 +227,18 @@ mod imp {
                     error!("恢复全局热键失败: {e:#}");
                 }
                 self.hotkey_suspended = false;
+            }
+            // 记录关闭位置：直接改生效配置并写盘（不走 draft，避免把未点保存的
+            // 编辑缓冲一并落盘；位置与编辑内容是两回事）
+            if let Some(s) = &self.settings {
+                if let Some(pos) = s.outer_position() {
+                    let mut cfg = (*self.config).clone();
+                    cfg.ui.settings_pos = Some(pos);
+                    match cfg.save(&self.config_path) {
+                        Ok(()) => self.config = Arc::new(cfg),
+                        Err(e) => error!("设置窗口位置写盘失败: {e:#}"),
+                    }
+                }
             }
             self.settings = None;
             if self.overlay.is_none() {
@@ -248,6 +258,15 @@ mod imp {
             if close {
                 if let Some(s) = &mut self.settings {
                     s.close_requested = false;
+                }
+                // 先落盘已确认的变更再关闭：JSON 参数失焦落盘与点 X 关闭同帧时，
+                // 不先 apply 就会丢弃用户刚确认的内容（2026-09-12 用户实机反馈）；
+                // "丢弃编辑缓冲"只丢未确认的编辑，已 pending 的变更必须保存
+                if pending {
+                    if let Some(s) = &mut self.settings {
+                        s.pending_save = false;
+                    }
+                    self.apply_settings();
                 }
                 self.close_settings(event_loop);
                 return;

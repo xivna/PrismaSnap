@@ -100,6 +100,9 @@ pub struct UiConfig {
     pub interface_font: String,
     /// 标注/翻译字体文件路径（文字标注 + 译文覆盖渲染及对应预览；空 = 系统默认）。
     pub annotation_font: String,
+    /// 设置窗口上次关闭时的位置（物理像素左上角；`None` = 首次打开走系统默认）。
+    /// 关闭设置窗口时记录并写盘，下次打开恢复（2026-09-12 用户要求）。
+    pub settings_pos: Option<(i32, i32)>,
 }
 
 /// 界面主题（TOML 里蛇形小写，如 `theme = "light"`）。
@@ -296,6 +299,29 @@ pub const DEFAULT_TARGET_LANG: &str = "简体中文";
 /// 默认 Auto 模式置信度阈值（低于此值的区域走裁剪多模态路径）。
 pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.85;
 
+/// 默认纯文本翻译温度（低随机，保证术语一致）。
+pub const DEFAULT_LLM_TEMPERATURE: f32 = 0.2;
+/// 默认返回上限（token，防长文截断；本地服务不识别该字段时一般忽略）。
+pub const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
+/// 默认上下文长度（Ollama 等部分后端识别；不识别的服务端忽略该字段）。
+pub const DEFAULT_LLM_NUM_CTX: u32 = 8192;
+/// 默认大模型调用参数 JSON（设置页"大模型参数"卡片直接编辑；未知字段服务端
+/// 一般忽略，各家关思考参数不统一故把四件套都带上）。
+pub const DEFAULT_LLM_PARAMS_JSON: &str = r#"{"temperature":0.2,"max_tokens":4096,"num_ctx":8192,"reasoning_effort":"none","enable_thinking":false,"chat_template_kwargs":{"enable_thinking":false},"think":false}"#;
+/// 关思考的键集合（总开关关闭时从合并后的请求体里剔掉这些键；
+/// 用户自加的其他键不受影响）。
+pub const THINKING_PARAM_KEYS: [&str; 4] = [
+    "reasoning_effort",
+    "enable_thinking",
+    "chat_template_kwargs",
+    "think",
+];
+
+/// 默认大模型调用参数 JSON 字符串。
+fn default_llm_params_json() -> String {
+    String::from(DEFAULT_LLM_PARAMS_JSON)
+}
+
 /// 翻译管线配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -312,6 +338,19 @@ pub struct TranslateConfig {
     pub multimodal_llm: MultimodalLlmConfig,
     /// 提示词模板（= 设置页提示词卡片；留空即用内置默认）。
     pub prompts: TranslatePrompts,
+    /// 大模型调用参数 JSON（对象字符串；= 设置页"大模型参数"卡片输入框，
+    /// 每次请求逐键合并进请求体，未知字段服务端一般忽略）。
+    #[serde(default = "default_llm_params_json")]
+    pub params_json: String,
+    /// 思考模式总开关（默认开；关闭时从合并后的请求体里剔掉
+    /// `THINKING_PARAM_KEYS` 四键，用户自加的其他键不受影响）。
+    #[serde(default = "default_disable_thinking")]
+    pub disable_thinking: bool,
+}
+
+/// 新字段默认开（关闭思考），缺字段的旧配置加载即生效。
+fn default_disable_thinking() -> bool {
+    true
 }
 
 impl Default for TranslateConfig {
@@ -323,6 +362,8 @@ impl Default for TranslateConfig {
             text_llm: LlmEndpoint::default(),
             multimodal_llm: MultimodalLlmConfig::default(),
             prompts: TranslatePrompts::default(),
+            params_json: String::from(DEFAULT_LLM_PARAMS_JSON),
+            disable_thinking: true,
         }
     }
 }
@@ -560,6 +601,48 @@ model = "gpt-4o"
         Config::default().save(&path).unwrap();
         assert!(!path.with_extension("toml.tmp").exists());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disable_thinking_defaults_on_and_old_config_inherits() {
+        // 新默认：总开关开
+        assert!(TranslateConfig::default().disable_thinking);
+        // 旧配置文件缺该字段 → 回退 true（直接生效，无需用户改配置）
+        let t: TranslateConfig = toml::from_str("mode = \"auto\"\n").unwrap();
+        assert!(t.disable_thinking);
+        assert_eq!(t.params_json, DEFAULT_LLM_PARAMS_JSON);
+    }
+
+    #[test]
+    fn settings_pos_roundtrip_and_missing_defaults_none() {
+        let mut config = Config::default();
+        assert_eq!(config.ui.settings_pos, None);
+        config.ui.settings_pos = Some((120, 240));
+        let path = temp_config_path("settings_pos");
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.ui.settings_pos, Some((120, 240)));
+        let _ = std::fs::remove_file(&path);
+        // 缺字段的旧文件 → None（首次打开走系统默认）
+        let old: Config = toml::from_str("hotkey = \"Ctrl+Alt+A\"\n").unwrap();
+        assert_eq!(old.ui.settings_pos, None);
+    }
+
+    #[test]
+    fn llm_params_defaults_and_old_config_inherits() {
+        // 默认 JSON 是合法对象，含温度/上限/上下文/思考四件套
+        let obj: serde_json::Value = serde_json::from_str(DEFAULT_LLM_PARAMS_JSON).unwrap();
+        let map = obj.as_object().expect("默认参数须是 JSON 对象");
+        assert!((map["temperature"].as_f64().unwrap_or(-1.0) - 0.2).abs() < 1e-9);
+        assert_eq!(map["max_tokens"], 4096);
+        assert_eq!(map["num_ctx"], 8192);
+        assert_eq!(map["reasoning_effort"], "none");
+        // 上一轮的 [translate.params] 表残留未知字段 → 忽略，新字段取默认
+        let old: Config = toml::from_str(
+            "hotkey = \"Ctrl+Alt+A\"\n[translate.params]\ntemperature = 0.7\n",
+        )
+        .unwrap();
+        assert_eq!(old.translate.params_json, DEFAULT_LLM_PARAMS_JSON);
     }
 
     #[test]

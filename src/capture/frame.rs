@@ -10,6 +10,7 @@
 
 use half::f16;
 use image::RgbaImage;
+use std::borrow::Cow;
 
 /// 捕获帧像素格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,17 +48,26 @@ impl RawFrame {
     /// wgpu 的 `write_texture` 要求 `bytes_per_row` 为 256 的倍数。
     /// 因此每行取前 `width * 8` 字节有效数据紧凑排列，行尾补零到 256 对齐
     /// （padding 在像素区之外，采样不会触达）。
-    pub fn compact_rgba16f_data(&self) -> Vec<u8> {
+    ///
+    /// 快道（2026-09-12 性能优化）：常见分辨率下 `row_pitch` 本来就等于
+    /// `width * 8`（无填充，如 3840×8 = 30720 = 256×120），此时直接借用原
+    /// 数据零拷贝返回，省掉一次全帧（4K 约 66MB）分配 + 拷贝 + 置零。
+    pub fn compact_rgba16f_data(&self) -> Cow<'_, [u8]> {
         let bytes_per_row = self.width as usize * 8;
+        let h = self.height as usize;
+        if self.row_pitch == bytes_per_row && bytes_per_row.is_multiple_of(256) {
+            let len = bytes_per_row.saturating_mul(h).min(self.data.len());
+            return Cow::Borrowed(&self.data[..len]);
+        }
         let aligned = bytes_per_row.next_multiple_of(256);
-        let mut out = vec![0u8; aligned * self.height as usize];
-        for y in 0..self.height as usize {
+        let mut out = vec![0u8; aligned * h];
+        for y in 0..h {
             let src = y * self.row_pitch;
             let dst = y * aligned;
             out[dst..dst + bytes_per_row]
                 .copy_from_slice(&self.data[src..src + bytes_per_row]);
         }
-        out
+        Cow::Owned(out)
     }
 }
 
@@ -114,13 +124,69 @@ pub fn frame_rgba8_to_image(frame: &RawFrame) -> RgbaImage {
 }
 
 /// 按逐像素转换函数把 Rgba16F 帧转成 RGBA8 图像（两公开函数共用）。
-fn convert_frame(frame: &RawFrame, convert: impl Fn(f32, f32, f32) -> [u8; 3]) -> RgbaImage {
+///
+/// 性能（2026-09-12 优化）：4K 全帧逐像素 `powf` 约 300ms+，是"热键→覆盖层
+/// 出现"链路上可压缩的一段。两处优化，均与旧逻辑逐字节一致：
+/// - 直接写 `Vec<u8>` 缓冲（旧 `put_pixel` 逐像素边界检查）；
+/// - 按行分带 `std::thread::scope` 并行（无新依赖，线程数按可用核心钳制，
+///   小图退化为单线程，转换闭包只要求多加 `Sync` 界）。
+fn convert_frame(
+    frame: &RawFrame,
+    convert: impl Fn(f32, f32, f32) -> [u8; 3] + Sync + Send,
+) -> RgbaImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let mut img = RgbaImage::new(frame.width, frame.height);
+    if w == 0 || h == 0 {
+        return RgbaImage::new(frame.width, frame.height);
+    }
+    let mut buf = vec![0u8; w * h * 4];
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 32)
+        .min(h);
+    if threads <= 1 {
+        convert_rows(frame, &convert, &mut buf, 0, h);
+    } else {
+        let rows_per_band = h.div_ceil(threads);
+        let mut bands = Vec::with_capacity(threads);
+        let mut rest = buf.as_mut_slice();
+        let mut y0 = 0;
+        while y0 < h {
+            let y1 = (y0 + rows_per_band).min(h);
+            let (band, tail) = rest.split_at_mut((y1 - y0) * w * 4);
+            bands.push((band, y0, y1));
+            rest = tail;
+            y0 = y1;
+        }
+        std::thread::scope(|s| {
+            let convert_ref = &convert;
+            for (band, y0, y1) in bands {
+                s.spawn(move || convert_rows(frame, convert_ref, band, y0, y1));
+            }
+        });
+    }
+    match RgbaImage::from_raw(frame.width, frame.height, buf) {
+        Some(img) => img,
+        None => {
+            tracing::error!("转换缓冲尺寸不匹配，回退空图");
+            RgbaImage::new(frame.width, frame.height)
+        }
+    }
+}
 
-    for y in 0..h {
+/// 转换行带 `[y0, y1)`（`out` 恰为该行带像素区，不含填充）。
+fn convert_rows(
+    frame: &RawFrame,
+    convert: &(impl Fn(f32, f32, f32) -> [u8; 3] + Sync + Send),
+    out: &mut [u8],
+    y0: usize,
+    y1: usize,
+) {
+    let w = frame.width as usize;
+    for y in y0..y1 {
         let row_start = y * frame.row_pitch;
+        let out_row = &mut out[(y - y0) * w * 4..][..w * 4];
         for x in 0..w {
             let px = row_start + x * 8;
             let r = read_f16(&frame.data[px..px + 2]);
@@ -130,10 +196,13 @@ fn convert_frame(frame: &RawFrame, convert: impl Fn(f32, f32, f32) -> [u8; 3]) -
 
             let [sr, sg, sb] = convert(r, g, b);
             let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-            img.put_pixel(x as u32, y as u32, image::Rgba([sr, sg, sb, alpha]));
+            let o = x * 4;
+            out_row[o] = sr;
+            out_row[o + 1] = sg;
+            out_row[o + 2] = sb;
+            out_row[o + 3] = alpha;
         }
     }
-    img
 }
 
 #[cfg(test)]

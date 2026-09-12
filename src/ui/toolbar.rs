@@ -15,6 +15,22 @@
 use crate::annotation::Color;
 use crate::utils::math::Rect;
 
+/// 文字工具字体按钮的显示文本（跨平台纯函数，可单测）。
+///
+/// 自有字体优先显示；未设独立字体时显示全局字体名（标"全局"以示跟随，
+/// 2026-09-12 用户实机 bug：之前直接显示"默认"，与实际渲染用的全局字体不符）；
+/// 两者都空才显示"默认"。
+/// 入参为已解析的**显示名**（路径→显示名的解析在调用方做，见 `display` 组装处）。
+pub fn text_font_button_label(own: Option<&str>, global: Option<&str>) -> String {
+    if let Some(o) = own.filter(|s| !s.is_empty()) {
+        return format!("字体：{o}");
+    }
+    if let Some(g) = global.filter(|s| !s.is_empty()) {
+        return format!("字体：{g}（全局）");
+    }
+    String::from("字体：默认")
+}
+
 /// 工具条估算尺寸（egui 点）。
 ///
 /// 两/三行布局：第一行工具按钮；第二行颜色/线宽或遮挡样式；马赛克像素化/模糊时
@@ -39,9 +55,9 @@ const PRESET_COLORS: [Color; 6] = [
     Color::BLACK,
 ];
 
-/// 线宽档位 `(线宽物理像素, 按钮圆点字号 pt)`。
+/// 线宽档位（物理像素；圆点半径按 `w * 0.8` 自绘，见 `width_dot`）。
 #[cfg(target_os = "windows")]
-const WIDTH_STEPS: [(f32, f32); 3] = [(3.0, 10.0), (6.0, 13.0), (10.0, 16.0)];
+const WIDTH_STEPS: [f32; 3] = [3.0, 6.0, 10.0];
 
 /// 计算工具条左上角位置（egui 逻辑点）。
 ///
@@ -81,6 +97,24 @@ pub fn toolbar_pos_pts(sel: &Rect, screen: &Rect, bar_size: (f32, f32), ppp: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_button_label_prefers_own_then_global() {
+        // 自有字体优先
+        assert_eq!(
+            text_font_button_label(Some("Noto Serif"), Some("华文宋体")),
+            "字体：Noto Serif"
+        );
+        // 未设独立字体 → 显示全局名（标"全局"）
+        assert_eq!(
+            text_font_button_label(None, Some("华文宋体")),
+            "字体：华文宋体（全局）"
+        );
+        // 两空 → 默认
+        assert_eq!(text_font_button_label(None, None), "字体：默认");
+        assert_eq!(text_font_button_label(Some(""), Some("")), "字体：默认");
+    }
+
 
     const SCREEN: Rect = Rect { x: 0, y: 0, width: 1920, height: 1080 };
     const PPP: f32 = 1.0;
@@ -252,6 +286,30 @@ fn color_dot(ui: &mut egui::Ui, c: Color, selected: bool) -> egui::Response {
     };
     ui.painter()
         .circle_stroke(center, D * 0.5 - w * 0.5, egui::Stroke::new(w, col));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// 线宽圆点（自绘，无按钮外框）。
+///
+/// 2026-09-12 用户实机：`Button` 版"●"字形大小不一，圆心视觉不在同一直线，
+/// 且按钮自带外框。改固定格自绘——圆心恒为格子中心，天然对齐；选中态用
+/// 主题选中色圆角底衬区分（仿图标按钮），无描边框。
+#[cfg(target_os = "windows")]
+fn width_dot(ui: &mut egui::Ui, w: f32, selected: bool) -> egui::Response {
+    const D: f32 = 22.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(D, D), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
+    }
+    ui.painter().circle_filled(
+        rect.center(),
+        (w * 0.8).clamp(2.0, 8.0),
+        ui.visuals().strong_text_color(),
+    );
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -531,10 +589,19 @@ pub fn toolbar_ui(
                                         let _ = r;
                                     }
                                     Some(cur) => {
-                                        let disp = match cur {
-                                            None => "字体：默认".to_string(),
-                                            Some(p) => format!("字体：{}", super::font_list::display_name_for(&p)),
-                                        };
+                                        // 显示有效字体名：自有优先，否则全局（标"全局"），
+                                        // 两空才"默认"（见 text_font_button_label）
+                                        let own_name = cur.as_deref().filter(|s| !s.is_empty()).map(
+                                            |p| super::font_list::display_name_for(p),
+                                        );
+                                        let global_name =
+                                            crate::utils::fontsel::annotation_font_path()
+                                                .filter(|p| !p.is_empty())
+                                                .map(|p| super::font_list::display_name_for(&p));
+                                        let disp = text_font_button_label(
+                                            own_name.as_deref(),
+                                            global_name.as_deref(),
+                                        );
                                         let st = super::font_list::PickerStyle {
                                             fill: if dark_mode { egui::Color32::from_white_alpha(22) } else { egui::Color32::from_black_alpha(8) },
                                             stroke: egui::Stroke::new(1.0, egui::Color32::from_black_alpha(40)),
@@ -573,14 +640,9 @@ pub fn toolbar_ui(
                                     }
                                 }
                                 ui.separator();
-                                for &(w, dot) in &WIDTH_STEPS {
+                                for &w in &WIDTH_STEPS {
                                     let selected = (stroke_width - w).abs() < f32::EPSILON;
-                                    let mut btn =
-                                        egui::Button::new(egui::RichText::new("●").size(dot));
-                                    if selected {
-                                        btn = btn.fill(ui.visuals().selection.bg_fill);
-                                    }
-                                    if ui.add(btn).clicked() {
+                                    if width_dot(ui, w, selected).clicked() {
                                         action = Some(ToolbarAction::SetStrokeWidth(w));
                                     }
                                 }

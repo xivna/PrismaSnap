@@ -70,7 +70,8 @@ pub fn font_picker_widget(
         .fill(style.fill)
         .stroke(style.stroke)
         .corner_radius(6.0)
-        .min_size(egui::vec2(width, 24.0));
+        // 右控件区可视高统一 25（见七十七记录）
+        .min_size(egui::vec2(width, 25.0));
     let btn_resp = ui.add(button);
     if btn_resp.clicked() {
         state.open = !state.open;

@@ -23,38 +23,52 @@ const REQUEST_RETRIES: usize = 1;
 const MAX_IMAGE_SIDE: u32 = 1024;
 /// 裁剪图 JPEG 质量（OCR/识别够用即可，不追求无损）。
 const JPEG_QUALITY: u8 = 80;
-/// 纯文本翻译温度（低随机，保证术语一致）。
-const TEXT_TEMPERATURE: f32 = 0.2;
-/// 返回上限（token，防长文截断；本地服务不识别该字段时一般忽略）。
-const MAX_TOKENS: u32 = 4096;
-
+/// 大模型调用参数走配置（`TranslateConfig::params_json`，设置页"大模型参数"
+/// 卡片直接编辑 JSON；未知字段服务端一般忽略，非法回退内置默认）。
 /// OpenAI 兼容 chat 客户端（`{url}/v1/chat/completions`，Key 为空则不带认证头）。
 pub struct LlmClient {
     http: reqwest::Client,
     endpoint: LlmEndpoint,
+    /// 调用参数 JSON（对象字符串，全后端共用）。
+    params_json: String,
+    /// 思考模式总开关（`false` = 从请求体剔掉思考四键）。
+    disable_thinking: bool,
 }
 
 impl LlmClient {
     /// 由配置构造（`api_url` 为空时后续请求直接报错，不在这里拦）。
-    pub fn new(endpoint: LlmEndpoint) -> anyhow::Result<Self> {
+    pub fn new(
+        endpoint: LlmEndpoint,
+        params_json: String,
+        disable_thinking: bool,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()?;
-        Ok(Self { http, endpoint })
+        Ok(Self { http, endpoint, params_json, disable_thinking })
     }
 
     /// 纯文本 chat（system + user），返回 assistant 文本。
     pub async fn chat_text(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        let body = serde_json::json!({
+        let body = self.build_text_body(system, user);
+        self.post(body).await
+    }
+
+    /// 纯文本请求体组包（纯函数，单测断言参数合并用）。
+    fn build_text_body(&self, system: &str, user: &str) -> serde_json::Value {
+        let mut body = serde_json::json!({
             "model": self.endpoint.model,
-            "temperature": TEXT_TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         });
-        self.post(body).await
+        merge_params_body(
+            &mut body,
+            self.disable_thinking,
+            &self.params_json,
+        );
+        body
     }
 
     /// 多模态 chat（prompt + JPEG 裁剪图），返回 assistant 文本。
@@ -71,14 +85,17 @@ impl LlmClient {
                 "image_url": {"url": data_url(&jpeg)},
             }));
         }
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.endpoint.model,
-            "temperature": TEXT_TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "user", "content": content},
             ],
         });
+        merge_params_body(
+            &mut body,
+            self.disable_thinking,
+            &self.params_json,
+        );
         self.post(body).await
     }
 
@@ -124,10 +141,83 @@ impl LlmClient {
     }
 }
 
+/// 把用户配置的参数 JSON 合并进请求体（2026-09-12 设置页"大模型参数"卡片）。
+///
+/// 合法 JSON 对象逐键合并（温度/上限/上下文/思考四件套/其他全由用户自配）；
+/// 非法（非 JSON / 非对象 / 空对象）回退内置默认并记日志；总开关关闭时合并后
+/// 再剔掉思考四键（`THINKING_PARAM_KEYS`），用户自加的其他键不受影响。
+/// 各家关思考参数不统一，默认 JSON 把四件套都带上，服务端一般忽略不认识的
+/// 字段。llama.cpp 老版本顶层参数无效，请用服务端启动参数关思考。
+/// 若某云端严格校验未知字段而 400，把总开关关掉并精简 JSON 即可。
+fn merge_params_body(
+    body: &mut serde_json::Value,
+    disable_thinking: bool,
+    params_json: &str,
+) {
+    // 自定义非法一律回退内置默认
+    let fallback: serde_json::Value =
+        serde_json::from_str(crate::config::DEFAULT_LLM_PARAMS_JSON)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+    let parsed: serde_json::Value = serde_json::from_str(params_json).unwrap_or_else(|e| {
+        tracing::warn!("大模型参数 JSON 非法（{e}），回退内置默认");
+        fallback.clone()
+    });
+    let mut custom = parsed
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Default::default);
+    if custom.is_empty() {
+        if let Some(def) = fallback.as_object() {
+            custom = def.clone();
+        }
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (k, v) in &custom {
+        obj.insert(k.clone(), v.clone());
+    }
+    // 总开关关闭：只剔思考四键，其余用户参数原样保留
+    if !disable_thinking {
+        for k in crate::config::THINKING_PARAM_KEYS {
+            obj.remove(k);
+        }
+    }
+}
+
+/// 剥掉思考过程块（`<think>…</think>`，含未闭合的半截）。
+///
+/// 兜底：关思考参数是"尽力"语义，某些后端仍会吐思考块；思考文本混入译文会
+/// 污染下游 JSON 解析，故在出口统一清理。无标签时原样返回，零成本。
+/// 大小写不敏感（`<THINK>` 同理），嵌套不考虑（模型只吐一层）。
+fn strip_think_blocks(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = 0;
+    // 字节下标与字符边界：只在 `<` 处切分，`<` 恒为单字节 ASCII，安全
+    while let Some(rel) = lower[rest..].find("<think>") {
+        let start = rest + rel;
+        out.push_str(&text[rest..start]);
+        let after_open = start + "<think>".len();
+        if let Some(end_rel) = lower[after_open..].find("</think>") {
+            rest = after_open + end_rel + "</think>".len();
+        } else {
+            // 未闭合：后面全是思考，直接丢弃并结束
+            rest = text.len();
+            break;
+        }
+    }
+    out.push_str(&text[rest..]);
+    // 残留的孤立闭标签（如只有 </think>）一并清理
+    let cleaned = out.replace("</think>", "").replace("</THINK>", "");
+    cleaned.trim().to_string()
+}
+
 /// 从 chat completions 返回中提取 assistant 文本。
 ///
 /// 兼容 `{"choices": [{"message": {"content": "..."}}]}` 标准形状；
 /// `content` 为数组（部分多模态服务端）时拼接其中 `text` 段。
+/// 出口统一过 `strip_think_blocks`（关不掉思考的后端兜底）。
 pub fn extract_content(body: &serde_json::Value) -> anyhow::Result<String> {
     let content = body
         .get("choices")
@@ -140,7 +230,7 @@ pub fn extract_content(body: &serde_json::Value) -> anyhow::Result<String> {
             anyhow::anyhow!("LLM 返回缺少 choices/message/content: {snippet}")
         })?;
     if let Some(text) = content.as_str() {
-        return Ok(text.to_owned());
+        return Ok(strip_think_blocks(text));
     }
     // 数组形状：拼接各 text 段
     let mut out = String::new();
@@ -154,7 +244,7 @@ pub fn extract_content(body: &serde_json::Value) -> anyhow::Result<String> {
     if out.is_empty() {
         anyhow::bail!("LLM 返回 content 为空或形状未知")
     } else {
-        Ok(out)
+        Ok(strip_think_blocks(&out))
     }
 }
 
@@ -201,12 +291,14 @@ pub struct TextBackend {
 }
 
 impl TextBackend {
-    /// 由文本 LLM 配置 + 提示词模板构造。
+    /// 由文本 LLM 配置 + 提示词模板 + 调用参数构造。
     pub fn new(
         endpoint: LlmEndpoint,
         prompts: crate::config::TranslatePrompts,
+        params_json: String,
+        disable_thinking: bool,
     ) -> anyhow::Result<Self> {
-        Ok(Self { client: LlmClient::new(endpoint)?, prompts })
+        Ok(Self { client: LlmClient::new(endpoint, params_json, disable_thinking)?, prompts })
     }
 }
 
@@ -268,12 +360,14 @@ pub struct MultimodalBackend {
 }
 
 impl MultimodalBackend {
-    /// 由多模态 LLM 配置 + 提示词模板构造。
+    /// 由多模态 LLM 配置 + 提示词模板 + 调用参数构造。
     pub fn new(
         endpoint: LlmEndpoint,
         prompts: crate::config::TranslatePrompts,
+        params_json: String,
+        disable_thinking: bool,
     ) -> anyhow::Result<Self> {
-        Ok(Self { client: LlmClient::new(endpoint)?, prompts })
+        Ok(Self { client: LlmClient::new(endpoint, params_json, disable_thinking)?, prompts })
     }
 }
 
@@ -377,13 +471,107 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_empty_config() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+    fn params_merge_all_keys_and_thinking_switch() {
+        // 总开关开：全部键合并（含温度/上限/上下文/思考四件套）
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        merge_params_body(
+            &mut body,
+            true,
+            crate::config::DEFAULT_LLM_PARAMS_JSON,
+        );
+        assert!((body["temperature"].as_f64().unwrap_or(-1.0) - 0.2).abs() < 1e-9);
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["num_ctx"], 8192);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["model"], "m");
+        // 总开关关：只剔思考四键，其余保留
+        let mut body = serde_json::json!({"model": "m"});
+        merge_params_body(
+            &mut body,
+            false,
+            crate::config::DEFAULT_LLM_PARAMS_JSON,
+        );
+        assert!((body["temperature"].as_f64().unwrap_or(-1.0) - 0.2).abs() < 1e-9);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("think").is_none());
+    }
+
+    #[test]
+    fn params_merge_custom_and_fallback() {
+        // 自定义 JSON 按原样合并
+        let mut body = serde_json::json!({"model": "m"});
+        merge_params_body(&mut body, true, r#"{"temperature": 0.7, "my_opt": 1}"#);
+        assert!((body["temperature"].as_f64().unwrap_or(-1.0) - 0.7).abs() < 1e-9);
+        assert_eq!(body["my_opt"], 1);
+        // 非法 JSON 回退内置默认
+        let mut body = serde_json::json!({"model": "m"});
+        merge_params_body(&mut body, true, "{broken");
+        assert_eq!(body["reasoning_effort"], "none");
+        // 非对象/空对象回退内置默认
+        let mut body = serde_json::json!({"model": "m"});
+        merge_params_body(&mut body, true, "[1,2]");
+        assert_eq!(body["think"], false);
+        let mut body = serde_json::json!({"model": "m"});
+        merge_params_body(&mut body, true, "{}");
+        assert_eq!(body["enable_thinking"], false);
+    }
+
+    #[test]
+    fn client_body_uses_configured_params() {
+        let client = LlmClient::new(
+            LlmEndpoint::default(),
+            String::from(r#"{"temperature": 0.7, "max_tokens": 512}"#),
+            false,
+        )
+        .unwrap();
+        let body = client.build_text_body("s", "u");
+        assert!((body["temperature"].as_f64().unwrap_or(-1.0) - 0.7).abs() < 1e-9);
+        assert_eq!(body["max_tokens"], 512);
+        // 总开关关 → 无思考键
+        assert!(body.get("think").is_none());
+    }
+
+    #[test]
+    fn strip_think_blocks_pair_and_unclosed() {
+        assert_eq!(
+            strip_think_blocks("<think>嗯……</think>你好"),
+            "你好"
+        );
+        assert_eq!(
+            strip_think_blocks("前<think>没想完"),
+            "前"
+        );
+        // 无标签原样（仅去首尾空白）
+        assert_eq!(strip_think_blocks("  甲乙  "), "甲乙");
+        // 大小写不敏感
+        assert_eq!(
+            strip_think_blocks("<THINK>x</THINK>好"),
+            "好"
+        );
+    }
+
+    #[test]
+    fn extract_strips_think_from_content() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "<think>翻译中</think>{\"a\":1}"}}],
+        });
+        assert_eq!(extract_content(&body).unwrap(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn client_rejects_empty_config() {        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let client = LlmClient::new(LlmEndpoint::default()).unwrap();
+            let client = LlmClient::new(
+                LlmEndpoint::default(),
+                String::from(crate::config::DEFAULT_LLM_PARAMS_JSON),
+                true,
+            )
+            .unwrap();
             // 默认地址非空但模型为空 → 模型未配置错误（不发网）
             let err = client.chat_text("s", "u").await.unwrap_err();
             assert!(err.to_string().contains("模型未配置"), "{err:#}");

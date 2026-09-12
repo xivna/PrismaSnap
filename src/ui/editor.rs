@@ -846,7 +846,6 @@ impl Editor {
                         let r = egui::Rect::from_min_max(egui::pos2(rect.x as f32/ppp, rect.y as f32/ppp), egui::pos2(rect.right() as f32/ppp, rect.bottom() as f32/ppp));
                         painter.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(70, 70, 70, 230));
                         painter.text(r.center(), egui::Align2::CENTER_CENTER, "模糊", egui::FontId::proportional(12.0 / ppp.max(1.0)), egui::Color32::WHITE);
-                        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
                         continue;
                     }
                     let r = egui::Rect::from_min_max(egui::pos2(rect.x as f32/ppp, rect.y as f32/ppp), egui::pos2(rect.right() as f32/ppp, rect.bottom() as f32/ppp));
@@ -863,7 +862,7 @@ impl Editor {
                             let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw());
                             entry.handle.set(color_image, egui::TextureOptions::LINEAR);
                             painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
-                            painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                            // 提交态马赛克无描边（导出即如此；2026-09-12 用户实机反馈去边框）
                             if selected {
                                 let b = ann.bounds();
                                 let br = egui::Rect::from_min_max(egui::pos2(b.x as f32/ppp, b.y as f32/ppp), egui::pos2(b.right() as f32/ppp, b.bottom() as f32/ppp));
@@ -901,10 +900,10 @@ impl Editor {
                             let handle = ctx.load_texture(format!("blur_cache_{}", blur_id), color_image, egui::TextureOptions::LINEAR);
                             let tid = handle.id();
                             self.blur_cache.insert(blur_id, BlurCacheEntry{ padded_rect: padded, radius, blurred: patch, rev: cur_rev, handle });
-                            painter.image(tid, r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
-                        }
-                        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
-                        if selected {
+                                painter.image(tid, r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
+                            }
+                            // 提交态马赛克无描边（导出即如此；2026-09-12 用户实机反馈去边框）
+                            if selected {
                             let b = ann.bounds();
                             let br = egui::Rect::from_min_max(egui::pos2(b.x as f32/ppp, b.y as f32/ppp), egui::pos2(b.right() as f32/ppp, b.bottom() as f32/ppp));
                             painter.rect_stroke(br, 0.0, egui::Stroke::new(1.0/ppp.max(1.0), egui::Color32::from_rgba_unmultiplied(10,132,255,180)), egui::StrokeKind::Outside);
@@ -1049,15 +1048,15 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
                                 let lr=egui::Rect::from_min_max(to_pt(((x0+bx) as f32, (y0+by) as f32)), to_pt(((x0+bx1) as f32, (y0+by1) as f32)));
                                 painter.rect_filled(lr,0.0,col);
                             }}
-                            painter.rect_stroke(r,0.0,egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                            // 提交态像素化无描边（导出即如此）
                         }
-                    } else { painter.rect_filled(r,0.0, egui::Color32::from_rgb(68,68,68)); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); }
+                    } else { painter.rect_filled(r,0.0, egui::Color32::from_rgb(68,68,68)); }
                 }
                 crate::annotation::MosaicStyle::Blur{ .. } => {
                     // 已由 Editor::draw_annotations 缓存路径处理，此处仅兜底占位（避免每帧新建纹理，C 残留已消除）
-                    painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(70,70,70,230)); painter.text(r.center(), egui::Align2::CENTER_CENTER, "模糊", egui::FontId::proportional(12.0/ppp.max(1.0)), egui::Color32::WHITE); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                    painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(70,70,70,230)); painter.text(r.center(), egui::Align2::CENTER_CENTER, "模糊", egui::FontId::proportional(12.0/ppp.max(1.0)), egui::Color32::WHITE);
                 }
-                crate::annotation::MosaicStyle::Solid{ color } => { painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255)); painter.rect_stroke(r,0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside); }
+                crate::annotation::MosaicStyle::Solid{ color } => { painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255)); }
             }
         }
         Annotation::Text{ rect, content, color, font_size, bold, font, char_styles, font_table, .. } => {

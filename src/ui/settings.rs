@@ -28,7 +28,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{
     Config, LogLevel, MultimodalMode, OcrEngineKind, SaveFormat, SaveMode, Theme,
-    TranslateMode, TranslatePrompts,
+    TranslateMode, TranslatePrompts, DEFAULT_LLM_PARAMS_JSON,
 };
 use crate::ocr::create_engine;
 use crate::ocr::download::{
@@ -115,6 +115,33 @@ pub struct Settings {
     model_dl: ModelDownloadUi,
     /// 字体选择弹层状态（key = "interface"/"annotation"；纹理缓存与 ctx 绑定）。
     font_pickers: std::collections::HashMap<String, super::font_list::FontPickerState>,
+    /// 大模型参数 JSON 输入框会话缓冲（`None` = 下帧从配置重载；不进配置，
+    /// 关闭设置窗口即丢弃。编辑中非法只提示不保存，失焦时合法美化落盘、
+    /// 非法恢复上一版）。
+    params_ed: ParamsEditUi,
+}
+
+/// 大模型参数区编辑状态（设置页"大模型参数"卡片用）。
+#[derive(Default)]
+struct ParamsEditUi {
+    /// 输入框文本缓冲（`None` = 下帧从 `draft.translate.params_json` 重载）。
+    buf: Option<String>,
+    /// 当前提示（编辑中非法错误 / 失焦恢复通知），`err_until` 过期即消失。
+    err: Option<String>,
+    /// 提示可见截止时间（3 秒自动消失用）。
+    err_until: Option<std::time::Instant>,
+    /// 上帧输入框是否有焦点（失焦边沿检测用）。
+    had_focus: bool,
+}
+
+impl ParamsEditUi {
+    /// 3 秒提示是否还可见（可见时宿主需持续重绘以保证按时消失）。
+    fn notice_visible(&self) -> bool {
+        match (self.err.as_ref(), self.err_until) {
+            (Some(_), Some(until)) => std::time::Instant::now() < until,
+            _ => false,
+        }
+    }
 }
 
 /// 单文件下载任务的 UI 侧句柄（`None` 表示该行无在途/暂停任务）。
@@ -263,8 +290,15 @@ impl ModelDownloadUi {
 
 impl Settings {
     /// 创建设置窗口（普通有边框、可调整大小）。
-    pub fn create_window(event_loop: &ActiveEventLoop) -> anyhow::Result<Arc<Window>> {
-        let attrs = Window::default_attributes()
+    ///
+    /// `saved_pos` 为上次关闭时的位置（物理像素左上角，见 `UiConfig::settings_pos`）：
+    /// 有值则恢复到该位置（钳制到当前显示器内，防换显示器后开到屏外），
+    /// 无值（首次打开）走系统默认 placement。
+    pub fn create_window(
+        event_loop: &ActiveEventLoop,
+        saved_pos: Option<(i32, i32)>,
+    ) -> anyhow::Result<Arc<Window>> {
+        let mut attrs = Window::default_attributes()
             .with_title("PrismaSnap 设置")
             .with_inner_size(winit::dpi::LogicalSize::new(
                 DEFAULT_SIZE.0 as f64,
@@ -275,10 +309,28 @@ impl Settings {
                 MIN_SIZE.1 as f64,
             ))
             .with_resizable(true);
+        if let Some((x, y)) = saved_pos {
+            // 按鼠标所在显示器钳制：至少留 120×40 的标题栏可点，避免屏外失联
+            let (mx, my, mw, mh) = Self::monitor_rect_or_fallback();
+            let cx = x.clamp(mx, mx + mw.max(121) - 121);
+            let cy = y.clamp(my, my + mh.max(41) - 41);
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(cx, cy));
+        }
         event_loop
             .create_window(attrs)
             .context("创建设置窗口失败")
             .map(Arc::new)
+    }
+
+    /// 上次关闭位置恢复用的显示器矩形（物理像素左上+宽高）。
+    ///
+    /// 取鼠标所在显示器（与截图目标一致）；查询失败回退 1920×1080，
+    /// 调用方钳制逻辑不受影响（窗口最多偏一点，不会失联）。
+    fn monitor_rect_or_fallback() -> (i32, i32, i32, i32) {
+        match crate::capture::engine::monitor_rect_at_cursor() {
+            Ok(r) => (r.x, r.y, r.width as i32, r.height as i32),
+            Err(_) => (0, 0, 1920, 1080),
+        }
     }
 
     /// 初始化设置窗口（克隆配置为编辑缓冲）。
@@ -298,6 +350,7 @@ impl Settings {
             status: None,
             model_dl: ModelDownloadUi::default(),
             font_pickers: std::collections::HashMap::new(),
+            params_ed: ParamsEditUi::default(),
         })
     }
 
@@ -306,16 +359,12 @@ impl Settings {
         self.window.id()
     }
 
-    /// 隐藏窗口（截图期间避免遮挡）。
-    pub fn hide(&self) {
-        self.window.set_visible(false);
-    }
-
-    /// 显示窗口并聚焦（截图结束后恢复）。
-    pub fn show(&self) {
-        self.window.set_visible(true);
-        self.window.focus_window();
-        self.window.request_redraw();
+    /// 当前窗口位置（物理像素左上角），关闭时记录用；查询失败返回 `None`。
+    pub fn outer_position(&self) -> Option<(i32, i32)> {
+        self.window
+            .outer_position()
+            .map(|p| (p.x, p.y))
+            .ok()
     }
 
     /// 聚焦已有窗口（托盘再次点「打开设置」时）。
@@ -409,6 +458,7 @@ impl Settings {
         let status = self.status.clone();
         let mut mdl = std::mem::take(&mut self.model_dl);
         let mut font_pickers = std::mem::take(&mut self.font_pickers);
+        let mut params_ed = std::mem::take(&mut self.params_ed);
 
         self.gui.render(self.window.as_ref(), |ui| {
             // 主题实时预览：改选项立即生效（正式写盘仍走 pending_save）
@@ -424,6 +474,7 @@ impl Settings {
                 &mut start_recording,
                 &mut mdl,
                 &mut font_pickers,
+                &mut params_ed,
             );
         });
 
@@ -433,14 +484,15 @@ impl Settings {
         self.active_section = active_section;
         self.model_dl = mdl;
         self.font_pickers = font_pickers;
+        self.params_ed = params_ed;
         if start_recording {
             self.recording_hotkey = true;
         }
         if changed {
             self.pending_save = true;
         }
-        // 下载进行中时持续重绘，进度百分比才动
-        if self.model_dl.any_live() {
+        // 下载进行中时持续重绘，进度百分比才动；参数区 3 秒提示同理
+        if self.model_dl.any_live() || self.params_ed.notice_visible() {
             self.window.request_redraw();
         }
     }
@@ -470,6 +522,7 @@ fn draw_settings_ui(
     start_recording: &mut bool,
     mdl: &mut ModelDownloadUi,
     font_pickers: &mut std::collections::HashMap<String, super::font_list::FontPickerState>,
+    params_ed: &mut ParamsEditUi,
 ) {
     let pal = palette(matches!(draft.ui.theme, Theme::Dark));
 
@@ -518,7 +571,7 @@ fn draw_settings_ui(
                 Section::Save => draw_save(ui, &pal, draft, dir_input, changed),
                 Section::Capture => draw_capture(ui, &pal, draft, changed),
                 Section::Appearance => draw_appearance(ui, &pal, draft, changed, font_pickers),
-                Section::Ai => draw_ai(ui, &pal, draft, changed, mdl),
+                Section::Ai => draw_ai(ui, &pal, draft, changed, mdl, params_ed),
             }
 
             // 状态提示（保存成功/失败等）
@@ -602,11 +655,12 @@ fn draw_general(
                         .color(pal.accent),
                 );
             } else {
-                keycap(ui, pal, &display_hotkey(&draft.hotkey));
-                ui.add_space(8.0);
+                // 控件从右往左排：最右是当前热键键帽，其左是重新录制按钮
                 if primary_button(ui, pal, "重新录制").clicked() {
                     *start_recording = true;
                 }
+                ui.add_space(8.0);
+                keycap(ui, pal, &display_hotkey(&draft.hotkey));
             }
         });
         row_separator(ui, pal);
@@ -615,13 +669,13 @@ fn draw_general(
                 ui,
                 pal,
                 &[
-                    ("错误", LogLevel::Error),
-                    ("警告", LogLevel::Warn),
-                    ("信息", LogLevel::Info),
-                    ("调试", LogLevel::Debug),
-                    ("详细", LogLevel::Trace),
+                    ("error", LogLevel::Error),
+                    ("warn", LogLevel::Warn),
+                    ("info", LogLevel::Info),
+                    ("debug", LogLevel::Debug),
+                    ("trace", LogLevel::Trace),
                 ],
-                52.0,
+                56.0,
                 &mut draft.logging.level,
             );
         });
@@ -652,13 +706,27 @@ fn draw_save(
         row_separator(ui, pal);
 
         setting_row(ui, "保存目录", |ui| {
-            *changed |= ui
-                .add_sized(
-                    [220.0, 24.0],
-                    egui::TextEdit::singleline(dir_input)
-                        .hint_text("<程序目录>/screenshots"),
+            // 自适应宽：按路径文本实测 + 边距，钳制 [120, 300]——再长截右侧，
+            // 不会和左侧标签重叠（框体本身已在右侧区）。
+            let text_w = ui
+                .painter()
+                .layout_no_wrap(
+                    dir_input.clone(),
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::TRANSPARENT,
                 )
-                .changed();
+                .size()
+                .x;
+            let w = (text_w + 28.0).clamp(120.0, 300.0);
+            *changed |= framed_singleline(
+                ui,
+                pal,
+                dir_input,
+                w,
+                Some("<程序目录>/screenshots"),
+                false,
+            )
+            .changed();
         });
         row_separator(ui, pal);
 
@@ -677,7 +745,7 @@ fn draw_save(
             setting_row(ui, "JPEG 质量", |ui| {
                 *changed |= ui
                     .add_sized(
-                        [160.0, 24.0],
+                        [182.0, 25.0],
                         egui::Slider::new(&mut draft.save.jpeg_quality, 1..=100).show_value(true),
                     )
                     .changed();
@@ -769,7 +837,8 @@ fn font_pick_row(
         state,
         style,
         &display,
-        120.0,
+        // 116 = 主题分段槽总宽（56×2+槽边距 4），同行视觉对齐
+        116.0,
         true,
     ) {
         // 提交：None=系统默认，Some(path)=选字体
@@ -787,45 +856,56 @@ fn draw_ai(
     draft: &mut Config,
     changed: &mut bool,
     mdl: &mut ModelDownloadUi,
+    params_ed: &mut ParamsEditUi,
 ) {
     // 卡片一：基础 LLM（即文本翻译后端；行布局保持不动，只改绑定到新配置）。
     card(ui, pal, |ui| {
         setting_row(ui, "API 地址", |ui| {
-            *changed |= ui
-                .add_sized(
-                    [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.translate.text_llm.api_url)
-                        .hint_text("http://127.0.0.1:8080/v1/chat/completions"),
-                )
-                .changed();
+            *changed |= framed_singleline(
+                ui,
+                pal,
+                &mut draft.translate.text_llm.api_url,
+                228.0,
+                Some("http://127.0.0.1:8080/v1/chat/completions"),
+                false,
+            )
+            .changed();
         });
         row_separator(ui, pal);
         setting_row(ui, "API Key", |ui| {
-            *changed |= ui
-                .add_sized(
-                    [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.translate.text_llm.api_key).password(true),
-                )
-                .changed();
+            *changed |= framed_singleline(
+                ui,
+                pal,
+                &mut draft.translate.text_llm.api_key,
+                228.0,
+                None,
+                true,
+            )
+            .changed();
         });
         row_separator(ui, pal);
         setting_row(ui, "模型", |ui| {
-            *changed |= ui
-                .add_sized(
-                    [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.translate.text_llm.model),
-                )
-                .changed();
+            *changed |= framed_singleline(
+                ui,
+                pal,
+                &mut draft.translate.text_llm.model,
+                228.0,
+                None,
+                false,
+            )
+            .changed();
         });
         row_separator(ui, pal);
         setting_row(ui, "翻译目标", |ui| {
-            *changed |= ui
-                .add_sized(
-                    [240.0, 24.0],
-                    egui::TextEdit::singleline(&mut draft.translate.target_lang)
-                        .hint_text("简体中文"),
-                )
-                .changed();
+            *changed |= framed_singleline(
+                ui,
+                pal,
+                &mut draft.translate.target_lang,
+                228.0,
+                Some("简体中文"),
+                false,
+            )
+            .changed();
         });
     });
     ui.add_space(12.0);
@@ -848,86 +928,104 @@ fn draw_ai(
         if draft.translate.multimodal_llm.mode == MultimodalMode::Custom {
             row_separator(ui, pal);
             setting_row(ui, "API 地址", |ui| {
-                *changed |= ui
-                    .add_sized(
-                        [240.0, 24.0],
-                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.api_url)
-                            .hint_text("多模态模型地址"),
-                    )
-                    .changed();
+                *changed |= framed_singleline(
+                    ui,
+                    pal,
+                    &mut draft.translate.multimodal_llm.api_url,
+                    228.0,
+                    Some("多模态模型地址"),
+                    false,
+                )
+                .changed();
             });
             row_separator(ui, pal);
             setting_row(ui, "API Key", |ui| {
-                *changed |= ui
-                    .add_sized(
-                        [240.0, 24.0],
-                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.api_key)
-                            .password(true),
-                    )
-                    .changed();
+                *changed |= framed_singleline(
+                    ui,
+                    pal,
+                    &mut draft.translate.multimodal_llm.api_key,
+                    228.0,
+                    None,
+                    true,
+                )
+                .changed();
             });
             row_separator(ui, pal);
             setting_row(ui, "模型", |ui| {
-                *changed |= ui
-                    .add_sized(
-                        [240.0, 24.0],
-                        egui::TextEdit::singleline(&mut draft.translate.multimodal_llm.model)
-                            .hint_text("如 qwen-vl-max"),
-                    )
-                    .changed();
+                *changed |= framed_singleline(
+                    ui,
+                    pal,
+                    &mut draft.translate.multimodal_llm.model,
+                    228.0,
+                    Some("如 qwen-vl-max"),
+                    false,
+                )
+                .changed();
             });
         }
     });
     ui.add_space(12.0);
 
     // 卡片三：翻译模式（三选一，默认自动；Auto 才显示阈值滑块；
-    // "?" 按钮点出悬浮窗介绍各选项含义）。
+    // 提示图标紧跟标签右侧，点击弹说明窗，悬停看一句话简述）。
     card(ui, pal, |ui| {
-        setting_row(ui, "翻译模式", |ui| {
-            // 右对齐行内先加 "?"（最右侧），再加分段按钮组（其左侧）。
-            let tip = ui.small_button("?");
-            *changed |= segmented(
-                ui,
-                pal,
-                &[
-                    ("自动", TranslateMode::Auto),
-                    ("OCR 文本", TranslateMode::OcrText),
-                    ("裁剪多模态", TranslateMode::CropMultimodal),
-                ],
-                80.0,
-                &mut draft.translate.mode,
-            );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("翻译模式").size(13.0));
+            let tip = hint_icon_button(ui, "翻译模式说明（点击看详情）：自动按置信度分流；OCR 文本快而便宜；裁剪多模态艺术字更准但贵。");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                *changed |= segmented(
+                    ui,
+                    pal,
+                    &[
+                        ("自动", TranslateMode::Auto),
+                        ("OCR 文本", TranslateMode::OcrText),
+                        ("裁剪多模态", TranslateMode::CropMultimodal),
+                    ],
+                    80.0,
+                    &mut draft.translate.mode,
+                );
+            });
             egui::Popup::menu(&tip).show(|ui| {
-                ui.set_width(300.0);
-                ui.label(egui::RichText::new("翻译模式说明").size(12.5).strong());
-                ui.separator();
-                for (i, (name, desc)) in [
-                    ("自动", "按置信度分流，有把握走纯文本，没把握裁剪给多模态（默认）"),
-                    ("OCR 文本", "先识别再整体翻译，快、便宜，适合界面文档等标准字体"),
-                    ("裁剪多模态", "逐框裁剪给多模态识别+翻译，艺术字更准，但贵而慢"),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    if i > 0 {
-                        ui.separator();
+                // 与设置菜单同风格：卡片底 + 描边 + 圆角
+                egui::Frame::new()
+                    .fill(pal.card_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(280.0);
+                    ui.label(egui::RichText::new("翻译模式说明").size(12.5).strong());
+                    ui.separator();
+                    for (i, (name, desc)) in [
+                        ("自动", "按置信度分流，有把握走纯文本，没把握裁剪给多模态（默认）"),
+                        ("OCR 文本", "先识别再整体翻译，快、便宜，适合界面文档等标准字体"),
+                        ("裁剪多模态", "逐框裁剪给多模态识别+翻译，艺术字更准，但贵而慢"),
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        ui.label(egui::RichText::new(*name).size(12.5).strong());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(*desc).size(12.0).color(pal.secondary),
+                            )
+                            .wrap(),
+                        );
                     }
-                    ui.label(egui::RichText::new(*name).size(12.5).strong());
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(*desc).size(12.0).color(pal.secondary),
-                        )
-                        .wrap(),
-                    );
-                }
+                    });
             });
         });
         if draft.translate.mode == TranslateMode::Auto {
             row_separator(ui, pal);
             setting_row(ui, "置信度阈值", |ui| {
+                // 滑条 190 + 数字约 46 + 间距 ≈ 244，与上面分段槽总宽对齐
                 *changed |= ui
                     .add_sized(
-                        [160.0, 24.0],
+                        [190.0, 25.0],
                         egui::Slider::new(&mut draft.translate.confidence_threshold, 0.5..=0.95)
                             .show_value(true),
                     )
@@ -987,15 +1085,26 @@ fn draw_ai(
     draw_model_card(ui, pal, mdl);
     ui.add_space(12.0);
 
-    // 卡片六：提示词模板（纯文本/多模态单图/多模态批量；留空用内置默认）。
+    // 卡片六：大模型参数（温度/上限/思考模式开关 + 自定义思考 JSON + 重置）。
+    draw_params_card(ui, pal, draft, changed, params_ed);
+    ui.add_space(12.0);
+
+    // 卡片七：提示词模板（纯文本/多模态单图/多模态批量；留空用内置默认）。
     card(ui, pal, |ui| {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("提示词模板").size(13.0));
-        ui.label(
-            egui::RichText::new("占位符：{target} 目标语言，{items} 输入条目（纯文本），{count} 图片数（批量）。留空即用内置默认。")
-                .size(12.0)
-                .color(pal.secondary),
-        );
+        // "占位符"前加提示图标，完整说明进悬停提示（行内只留标签，干净）
+        ui.horizontal(|ui| {
+            hint_icon(
+                ui,
+                "占位符：{target} 目标语言，{items} 输入条目（纯文本），{count} 图片数（批量）。留空即用内置默认。",
+            );
+            ui.label(
+                egui::RichText::new("占位符")
+                    .size(12.0)
+                    .color(pal.secondary),
+            );
+        });
         ui.add_space(4.0);
         for (label, field) in [
             ("纯文本", &mut draft.translate.prompts.text),
@@ -1003,12 +1112,7 @@ fn draw_ai(
             ("多模态批量", &mut draft.translate.prompts.multimodal_batch),
         ] {
             ui.label(egui::RichText::new(label).size(12.5).strong());
-            *changed |= ui
-                .add_sized(
-                    [ui.available_width(), 84.0],
-                    egui::TextEdit::multiline(field).font(egui::FontId::monospace(12.0)),
-                )
-                .changed();
+            *changed |= framed_multiline(ui, pal, field, 84.0).changed();
             ui.add_space(4.0);
         }
         if primary_button(ui, pal, "恢复默认提示词").clicked() {
@@ -1026,21 +1130,27 @@ fn draw_ai(
 ///（唯一例外：之前放错 DLL 并触发过识别/翻译的，需重启——运行时只初始化一次）。
 fn draw_model_card(ui: &mut egui::Ui, pal: &Palette, mdl: &mut ModelDownloadUi) {
     card(ui, pal, |ui| {
-        // 标题行：左"OCR插件下载"，右 取消（有任务才显示）+ 来源 + 帮助
-        setting_row(ui, "OCR插件下载", |ui| {
-            ui.horizontal(|ui| {
+        // 标题行：左"OCR插件下载"+提示图标（点击开手动下载帮助，悬停看简述），
+        // 右仅保留取消（有任务才显示）；"官方自动下载"说明文字已删（默认行为）。
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("OCR插件下载").size(13.0));
+            if hint_icon_button(
+                ui,
+                "插件模型从官方源自动下载；点击打开手动下载帮助（含项目地址/直链/改名对照）。",
+            )
+            .clicked()
+            {
+                mdl.show_help = true;
+                mdl.copied = None;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if mdl.any_job() && ui.small_button("取消").clicked() {
                     mdl.cancel_all();
                 }
-                ui.label(
-                    egui::RichText::new("官方自动下载").size(12.0).color(pal.secondary),
-                );
-                if ui.small_button("手动下载帮助").clicked() {
-                    mdl.show_help = true;
-                    mdl.copied = None;
-                }
             });
         });
+        ui.add_space(4.0);
         row_separator(ui, pal);
         // 四文件行：本地名 + 说明 | 右侧：已就绪 / 下载 / 暂停+取消 / 继续+取消
         let dir = ocr_plugin_dir().unwrap_or_else(|_| PathBuf::from("plugins/ocr"));
@@ -1118,7 +1228,7 @@ fn draw_model_card(ui: &mut egui::Ui, pal: &Palette, mdl: &mut ModelDownloadUi) 
     });
     // 帮助窗口（可拖动 egui::Window，标题栏拖移；主题跟随设置页）
     if mdl.show_help {
-        draw_model_help(ui.ctx(), mdl);
+        draw_model_help(ui.ctx(), pal, mdl);
     }
 }
 
@@ -1135,12 +1245,21 @@ fn progress_text(progress: Option<(u64, Option<u64>)>) -> String {
 }
 
 /// 手动下载帮助：项目地址 + 四文件直链（可复制）+ 改名对照 + 校验说明。
-fn draw_model_help(ctx: &egui::Context, mdl: &mut ModelDownloadUi) {
+fn draw_model_help(ctx: &egui::Context, pal: &Palette, mdl: &mut ModelDownloadUi) {
     let mut open = mdl.show_help;
+    // 与设置菜单同风格：卡片底 + 描边 + 圆角（主题跟随设置页）
     egui::Window::new("手动下载帮助")
         .open(&mut open)
+        .collapsible(false)
         .resizable(true)
         .default_width(520.0)
+        .frame(
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(14)),
+        )
         .show(ctx, |ui| {
             ui.label(egui::RichText::new("项目地址").size(13.0).strong());
             for (name, url) in [
@@ -1262,6 +1381,7 @@ fn segmented<T: PartialEq + Copy>(
     let mut changed = false;
     egui::Frame::new()
         .fill(pal.control_bg)
+        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
         .corner_radius(7.0)
         .inner_margin(egui::Margin::same(2))
         .show(ui, |ui| {
@@ -1281,7 +1401,8 @@ fn segmented<T: PartialEq + Copy>(
                     })
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(6.0);
-                if ui.add_sized(egui::vec2(button_width, 20.0), btn).clicked() {
+                // 右控件区可视高统一 25（槽描边 + 纵边距 2×2，见七十七记录）
+                if ui.add_sized(egui::vec2(button_width, 21.0), btn).clicked() {
                     *value = *v;
                     changed = true;
                 }
@@ -1313,9 +1434,9 @@ fn primary_button(ui: &mut egui::Ui, pal: &Palette, text: &str) -> egui::Respons
     )
 }
 
-/// iOS 风格开关，返回是否变更。
+/// iOS 风格开关，返回是否变更（轨道 40×25，与右区其他控件同高）。
 fn toggle(ui: &mut egui::Ui, pal: &Palette, on: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 24.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 25.0), egui::Sense::click());
     let mut changed = false;
     if response.clicked() {
         *on = !*on;
@@ -1324,10 +1445,237 @@ fn toggle(ui: &mut egui::Ui, pal: &Palette, on: &mut bool) -> bool {
     let anim = ui.ctx().animate_bool_with_time(response.id, *on, 0.15);
     let track = pal.control_bg.lerp_to_gamma(pal.accent, anim);
     ui.painter().rect_filled(rect, 12.0, track);
+    // 轨道细描边：与输入框/键帽/分段槽视觉高度对齐（2026-09-12 用户实机反馈）
+    ui.painter().rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(1.0, pal.card_stroke),
+        egui::StrokeKind::Inside,
+    );
     let knob_x = egui::emath::lerp(rect.left() + 12.0..=rect.right() - 12.0, anim);
     ui.painter().circle_filled(egui::pos2(knob_x, rect.center().y), 9.0, egui::Color32::WHITE);
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
     changed
+}
+
+/// 行内提示图标资源（200×200 RGBA；`include_bytes!` 编进 exe，便携无外部依赖）。
+const ICON_HINT: &[u8] = include_bytes!("../../assets/icons/提示.png");
+
+/// 提示图标边长（逻辑点，比 13pt 行高略大一点，不撑行高）。
+const HINT_ICON_SIZE: f32 = 14.0;
+
+/// 取提示图标纹理（ctx 数据区缓存，多帧复用不重复解码；失败返回 `None`，
+/// 调用方直接跳过图标，功能不受影响）。
+fn hint_icon_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("settings_hint_icon");
+    if let Some(handle) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(handle);
+    }
+    let rgba = image::load_from_memory(ICON_HINT).ok()?.to_rgba8();
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    let handle = ctx.load_texture("settings_hint_icon", color, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, handle.clone()));
+    Some(handle)
+}
+
+/// 行内小提示图标（悬停出 tooltip；解码失败时静默跳过）。
+fn hint_icon(ui: &mut egui::Ui, tooltip: &str) {
+    if let Some(handle) = hint_icon_texture(ui.ctx()) {
+        ui.add(egui::Image::new(&handle).fit_to_exact_size(egui::vec2(HINT_ICON_SIZE, HINT_ICON_SIZE)))
+            .on_hover_text(tooltip);
+    }
+}
+
+/// 可点击的提示图标（行为同"?"按钮：点击供调用方弹说明窗，悬停看简述；
+/// 解码失败时回退文字 "?"，功能不断）。
+fn hint_icon_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    if let Some(handle) = hint_icon_texture(ui.ctx()) {
+        ui.add(
+            egui::Image::new(&handle)
+                .fit_to_exact_size(egui::vec2(HINT_ICON_SIZE, HINT_ICON_SIZE))
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        ui.small_button("?")
+    }
+}
+
+/// 启用自定义参数开关的悬停提示（只保留开/关作用说明）。
+const THINK_TIP: &str = "打开：请求时合并下方自定义参数（含思考四键）；\n关闭：剔掉思考四键后发送。";
+
+/// 带边框的单行输入框（与 `framed_multiline` 同风格；全设置页单行输入统一用它）。
+///
+/// 白卡片上原生 TextEdit 描边几乎看不见（2026-09-12 用户实机反馈），且各处
+/// 宽高不一，故收敛到这一个入口：固定高 24、圆角 6。
+/// 文本从左往右显示、超长时右侧截断（`clip_text`，不跟随光标滚动——长路径
+/// 或长 URL 显示开头、截掉尾巴，不会把框撑开）。
+fn framed_singleline(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &mut String,
+    width: f32,
+    hint: Option<&str>,
+    password: bool,
+) -> egui::Response {
+    egui::Frame::new()
+        .fill(pal.control_bg)
+        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            let mut edit = egui::TextEdit::singleline(text)
+                .frame(egui::Frame::NONE)
+                .clip_text(true);
+            if let Some(h) = hint {
+                edit = edit.hint_text(h);
+            }
+            if password {
+                edit = edit.password(true);
+            }
+            ui.add_sized([width, 21.0], edit)
+        })
+        .inner
+}
+
+/// 带边框的多行输入框（苹果风：浅底 + 细描边 + 圆角）。
+///
+/// 白卡片上原生 TextEdit 描边几乎看不见，标题与输入分不开
+/// （2026-09-12 用户实机反馈），故统一用 Frame 包一层。
+fn framed_multiline(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    text: &mut String,
+    height: f32,
+) -> egui::Response {
+    egui::Frame::new()
+        .fill(pal.control_bg)
+        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(6))
+        .show(ui, |ui| {
+            ui.add_sized(
+                [ui.available_width(), height],
+                egui::TextEdit::multiline(text)
+                    .font(egui::FontId::monospace(12.0))
+                    .frame(egui::Frame::NONE),
+            )
+        })
+        .inner
+}
+
+/// JSON 文本转编辑用美化格式（合法美化，非法原样带入让用户修）。
+fn pretty_json_or_raw(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string()))
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// 卡片六：大模型参数（单 JSON 输入 + 启用自定义参数总开关 + 重置）。
+///
+/// 每次调用大模型时把 JSON 逐键合并进请求体（温度/上限/上下文/思考四件套等
+/// 全由用户自配；总开关关闭时剔掉思考四键）。
+/// 编辑规则（2026-09-12 用户要求）：敲的过程中非法只红字提示、不保存；
+/// 鼠标离开输入框（失焦）时统一结算——合法则美化格式后落盘，非则恢复上一版
+/// 并提示 3 秒后消失。
+fn draw_params_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    draft: &mut Config,
+    changed: &mut bool,
+    ed: &mut ParamsEditUi,
+) {
+    card(ui, pal, |ui| {
+        // 标题行（说明文字已删，干净）
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("大模型参数").size(13.0));
+        ui.add_space(4.0);
+        // 总开关行：图标紧跟标签右侧，开关在右控件区
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("启用自定义参数").size(13.0));
+            hint_icon(ui, THINK_TIP);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                *changed |= toggle(ui, pal, &mut draft.translate.disable_thinking);
+            });
+        });
+        ui.add_space(4.0);
+        row_separator(ui, pal);
+        // 参数 JSON 输入（会话缓冲 + 失焦结算；框内恒为美化格式，见图 8）
+        ui.add_space(4.0);
+        let buf = ed
+            .buf
+            .get_or_insert_with(|| pretty_json_or_raw(&draft.translate.params_json));
+        let resp = framed_multiline(ui, pal, buf, 84.0);
+        let focused = resp.has_focus();
+        if resp.changed() {
+            // 敲的过程中：合法清提示（暂不落盘，等失焦统一美化），非法红字提示
+            if serde_json::from_str::<serde_json::Value>(buf)
+                .map(|v| v.is_object())
+                .unwrap_or(false)
+            {
+                ed.err = None;
+                ed.err_until = None;
+            } else {
+                ed.err = Some(String::from("不是合法的 JSON 对象，请检查括号/引号/逗号"));
+                ed.err_until = None;
+            }
+        }
+        if ed.had_focus && !focused {
+            // 失焦结算：合法美化落盘，非法恢复上一版 + 3 秒提示
+            match serde_json::from_str::<serde_json::Value>(buf) {
+                Ok(v) if v.is_object() => {
+                    let pretty =
+                        serde_json::to_string_pretty(&v).unwrap_or_else(|_| buf.clone());
+                    *buf = pretty.clone();
+                    draft.translate.params_json = pretty;
+                    *changed = true;
+                    ed.err = None;
+                    ed.err_until = None;
+                }
+                _ => {
+                    *buf = pretty_json_or_raw(&draft.translate.params_json);
+                    ed.err = Some(String::from("格式有误，已恢复上一版"));
+                    ed.err_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                }
+            }
+        }
+        ed.had_focus = focused;
+        // 提示行：3 秒提示按时消失（过期清掉，需宿主持续重绘，见 redraw）
+        if let Some(until) = ed.err_until {
+            if std::time::Instant::now() >= until {
+                ed.err = None;
+                ed.err_until = None;
+            }
+        }
+        if let Some(err) = ed.err.clone() {
+            ui.label(
+                egui::RichText::new(err)
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(255, 69, 58)),
+            );
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("未知字段服务端一般忽略。")
+                .size(12.0)
+                .color(pal.secondary),
+        );
+        ui.add_space(4.0);
+        // 重置放底部（与提示词"恢复默认提示词"同逻辑）
+        if primary_button(ui, pal, "重置参数").clicked() {
+            draft.translate.params_json = String::from(DEFAULT_LLM_PARAMS_JSON);
+            ed.buf = Some(pretty_json_or_raw(&draft.translate.params_json));
+            ed.err = None;
+            ed.err_until = None;
+            *changed = true;
+        }
+        ui.add_space(4.0);
+    });
 }
 
 /// 把配置里的热键字符串转成用户友好的显示（`Super` → `Win`）。
