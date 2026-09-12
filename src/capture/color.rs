@@ -64,6 +64,38 @@ pub fn linear_to_srgb_gamma(x: f32) -> f32 {
     }
 }
 
+/// sRGB gamma → linear 解码（[`linear_to_srgb_gamma`] 的逆函数）。
+///
+/// 输入为 `[0, 1]` 的 sRGB 编码值；不 clamp，便于调用方自行处理越界。
+pub fn srgb_gamma_to_linear(x: f32) -> f32 {
+    if x <= 0.040_45 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// 预览贴图亮度预补偿（HDR 屏专用，纯函数）。
+///
+/// HDR 屏的 egui 打码贴图在合成时会统一乘 SDR 白点 boost，而贴图本身取自
+/// 已按 [`DEFAULT_GAIN`] 压暗的 SDR 映射图；两者叠加使预览里打码区域比周围
+/// 原始 HDR 画面暗约一个增益系数（2026-09-12 用户实机反馈"马赛克/模糊预览
+/// 与周围色深不一致"）。本函数把 sRGB 8-bit 值解码回线性、乘 `comp`
+/// （= `1 / DEFAULT_GAIN`）再编码，恰好抵消该差异（高光超 1.0 截白）。
+/// `comp == 1.0` 时原样返回（SDR 屏无操作）。
+pub fn compensate_preview_gain(r: u8, g: u8, b: u8, comp: f32) -> [u8; 3] {
+    if (comp - 1.0).abs() < f32::EPSILON {
+        return [r, g, b];
+    }
+    let to_byte = |v: u8| {
+        let lin = srgb_gamma_to_linear(v as f32 / 255.0) * comp;
+        (linear_to_srgb_gamma(lin.clamp(0.0, 1.0)) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [to_byte(r), to_byte(g), to_byte(b)]
+}
+
 /// 线性 SDR → sRGB 8-bit 直通转换（无增益、无归一化），输出 `[r, g, b]`。
 ///
 /// 适用于系统未开启 HDR 的显示器：此时 WGC 的 `Rgba16F` 缓冲就是
@@ -197,6 +229,35 @@ mod tests {
     fn gamma_endpoints() {
         assert!(approx(linear_to_srgb_gamma(0.0), 0.0));
         assert!(approx(linear_to_srgb_gamma(1.0), 1.0));
+    }
+
+    #[test]
+    fn srgb_gamma_roundtrip() {
+        // 编解码互逆（含线性段与幂函数段端点）
+        for x in [0.0f32, 0.001, 0.0032, 0.0404, 0.05, 0.25, 0.5, 0.75, 1.0] {
+            let encoded = linear_to_srgb_gamma(x);
+            assert!(approx(srgb_gamma_to_linear(encoded), x), "x={x}");
+        }
+    }
+
+    #[test]
+    fn compensate_preview_gain_identity_and_clamp() {
+        // comp = 1 原样返回；comp > 1 时白色仍为白（高光截断不回绕）
+        assert_eq!(compensate_preview_gain(12, 130, 250, 1.0), [12, 130, 250]);
+        assert_eq!(compensate_preview_gain(255, 255, 255, 1.0 / 0.617), [255, 255, 255]);
+    }
+
+    #[test]
+    fn compensate_preview_gain_undoes_hdr_gain() {
+        // 模拟 HDR 屏链路：原始线性 x → hdr_to_srgb 增益压暗 → 预览贴图补偿
+        // → 应还原为"不增益"的 sRGB 编码（浅色中间调误差 ≤ 1 个字节）
+        let comp = 1.0 / DEFAULT_GAIN;
+        for x in [0.05f32, 0.2, 0.4, 0.6] {
+            let [r, _g, _b] = hdr_to_srgb(x, x, x, 1.0);
+            let [cr, _cg, _cb] = compensate_preview_gain(r, r, r, comp);
+            let expected = (linear_to_srgb_gamma(x.clamp(0.0, 1.0)) * 255.0).round() as i32;
+            assert!((cr as i32 - expected).abs() <= 1, "x={x}: {cr} vs {expected}");
+        }
     }
 
     #[test]

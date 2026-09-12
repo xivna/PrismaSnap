@@ -103,6 +103,9 @@ pub struct UiConfig {
     /// 设置窗口上次关闭时的位置（物理像素左上角；`None` = 首次打开走系统默认）。
     /// 关闭设置窗口时记录并写盘，下次打开恢复（2026-09-12 用户要求）。
     pub settings_pos: Option<(i32, i32)>,
+    /// 设置窗口上次关闭时的大小（物理像素；`None` = 首次打开用默认尺寸）。
+    /// 关闭时记录并写盘，下次打开恢复并按显示器钳制（2026-09-12 用户要求）。
+    pub settings_size: Option<(u32, u32)>,
 }
 
 /// 界面主题（TOML 里蛇形小写，如 `theme = "light"`）。
@@ -618,14 +621,17 @@ model = "gpt-4o"
         let mut config = Config::default();
         assert_eq!(config.ui.settings_pos, None);
         config.ui.settings_pos = Some((120, 240));
+        config.ui.settings_size = Some((900, 640));
         let path = temp_config_path("settings_pos");
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.ui.settings_pos, Some((120, 240)));
+        assert_eq!(loaded.ui.settings_size, Some((900, 640)));
         let _ = std::fs::remove_file(&path);
         // 缺字段的旧文件 → None（首次打开走系统默认）
         let old: Config = toml::from_str("hotkey = \"Ctrl+Alt+A\"\n").unwrap();
         assert_eq!(old.ui.settings_pos, None);
+        assert_eq!(old.ui.settings_size, None);
     }
 
     #[test]

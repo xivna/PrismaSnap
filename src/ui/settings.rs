@@ -291,12 +291,14 @@ impl ModelDownloadUi {
 impl Settings {
     /// 创建设置窗口（普通有边框、可调整大小）。
     ///
-    /// `saved_pos` 为上次关闭时的位置（物理像素左上角，见 `UiConfig::settings_pos`）：
-    /// 有值则恢复到该位置（钳制到当前显示器内，防换显示器后开到屏外），
-    /// 无值（首次打开）走系统默认 placement。
+    /// `saved_pos` / `saved_size` 为上次关闭时的位置与大小（物理像素，见
+    /// `UiConfig::settings_pos` / `settings_size`）：有值则恢复（位置按鼠标所在
+    /// 显示器钳制，大小钳制到 [MIN_SIZE, 显示器]，防换屏后失联/窗口过大），
+    /// 无值（首次打开）走默认尺寸与系统 placement。
     pub fn create_window(
         event_loop: &ActiveEventLoop,
         saved_pos: Option<(i32, i32)>,
+        saved_size: Option<(u32, u32)>,
     ) -> anyhow::Result<Arc<Window>> {
         let mut attrs = Window::default_attributes()
             .with_title("PrismaSnap 设置")
@@ -309,6 +311,12 @@ impl Settings {
                 MIN_SIZE.1 as f64,
             ))
             .with_resizable(true);
+        if let Some((w, h)) = saved_size {
+            let (_, _, mw, mh) = Self::monitor_rect_or_fallback();
+            let w = w.clamp(MIN_SIZE.0, mw.max(MIN_SIZE.0 as i32) as u32);
+            let h = h.clamp(MIN_SIZE.1, mh.max(MIN_SIZE.1 as i32) as u32);
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+        }
         if let Some((x, y)) = saved_pos {
             // 按鼠标所在显示器钳制：至少留 120×40 的标题栏可点，避免屏外失联
             let (mx, my, mw, mh) = Self::monitor_rect_or_fallback();
@@ -367,6 +375,12 @@ impl Settings {
             .ok()
     }
 
+    /// 当前窗口物理尺寸，关闭时记录用（下次打开恢复）。
+    pub fn inner_size(&self) -> (u32, u32) {
+        let s = self.window.inner_size();
+        (s.width, s.height)
+    }
+
     /// 聚焦已有窗口（托盘再次点「打开设置」时）。
     pub fn focus(&self) {
         self.window.focus_window();
@@ -379,9 +393,14 @@ impl Settings {
         self.window.request_redraw();
     }
 
-    /// 把目录文本缓冲同步回编辑缓冲并返回其引用（保存前调用）。
+    /// 把目录/JSON 文本缓冲同步回编辑缓冲并返回其引用（保存前调用）。
     pub fn apply_draft(&mut self) -> &Config {
         self.draft.save.dir = PathBuf::from(self.dir_input.trim());
+        // JSON 缓冲兜底：编辑中合法内容本就实时写入，这里再防一手极端时序
+        // （如点 X 关闭那一帧无失焦帧）；非法内容忽略，保留上一版合法值。
+        if let Some(buf) = self.params_ed.buf.as_deref() {
+            settle_params_json(&mut self.draft, buf);
+        }
         &self.draft
     }
 
@@ -706,8 +725,10 @@ fn draw_save(
         row_separator(ui, pal);
 
         setting_row(ui, "保存目录", |ui| {
-            // 自适应宽：按路径文本实测 + 边距，钳制 [120, 300]——再长截右侧，
-            // 不会和左侧标签重叠（框体本身已在右侧区）。
+            // 自适应宽：按路径文本实测 + 边距；下限使**外框**与上下 2 档 segmented
+            // 可视宽严格相等（短路径时三行等长——2026-09-12 用户实机反馈；
+            // framed_singleline 外宽 = 内容宽 + 左右 margin 6×2 + 描边 2 = +14），
+            // 长路径按文本加宽、上限 300（再长截右侧，不和左侧标签重叠）。
             let text_w = ui
                 .painter()
                 .layout_no_wrap(
@@ -717,7 +738,9 @@ fn draw_save(
                 )
                 .size()
                 .x;
-            let w = (text_w + 28.0).clamp(120.0, 300.0);
+            // text_w + 20：文本两侧各留约 10px（6 margin + 1 描边 + 3 余量）——
+            // 此前 +28 余量会让普通路径比下限多 1px、外框比上下框宽（第二轮实机反馈）
+            let w = (text_w + 20.0).clamp(segmented_width(2, 56.0) - 14.0, 300.0);
             *changed |= framed_singleline(
                 ui,
                 pal,
@@ -743,12 +766,14 @@ fn draw_save(
         if draft.save.format == SaveFormat::Jpeg {
             row_separator(ui, pal);
             setting_row(ui, "JPEG 质量", |ui| {
-                *changed |= ui
-                    .add_sized(
-                        [182.0, 25.0],
-                        egui::Slider::new(&mut draft.save.jpeg_quality, 1..=100).show_value(true),
-                    )
-                    .changed();
+                let value_text = format!("{}", draft.save.jpeg_quality);
+                *changed |= slider_total_width(
+                    ui,
+                    182.0 + 48.0,
+                    &value_text,
+                    egui::Slider::new(&mut draft.save.jpeg_quality, 1..=100).show_value(true),
+                )
+                .changed();
             });
         }
     });
@@ -1022,14 +1047,17 @@ fn draw_ai(
         if draft.translate.mode == TranslateMode::Auto {
             row_separator(ui, pal);
             setting_row(ui, "置信度阈值", |ui| {
-                // 滑条 190 + 数字约 46 + 间距 ≈ 244，与上面分段槽总宽对齐
-                *changed |= ui
-                    .add_sized(
-                        [190.0, 25.0],
-                        egui::Slider::new(&mut draft.translate.confidence_threshold, 0.5..=0.95)
-                            .show_value(true),
-                    )
-                    .changed();
+                // 目标："数字框 + 轨道"总宽 = 上方 3 档分段槽（2026-09-12 用户要求；
+                // 轨道长度靠 spacing.slider_width，数字框宽见 drag_value_width）
+                let value_text = format!("{:.3}", draft.translate.confidence_threshold);
+                *changed |= slider_total_width(
+                    ui,
+                    segmented_width(3, 80.0),
+                    &value_text,
+                    egui::Slider::new(&mut draft.translate.confidence_threshold, 0.5..=0.95)
+                        .show_value(true),
+                )
+                .changed();
             });
         }
         // 多模态未配置却选了裁剪模式：行内警告（功能侧同样会降级，见 3.8 节）。
@@ -1112,7 +1140,7 @@ fn draw_ai(
             ("多模态批量", &mut draft.translate.prompts.multimodal_batch),
         ] {
             ui.label(egui::RichText::new(label).size(12.5).strong());
-            *changed |= framed_multiline(ui, pal, field, 84.0).changed();
+            *changed |= framed_multiline(ui, pal, field, 84.0, label).changed();
             ui.add_space(4.0);
         }
         if primary_button(ui, pal, "恢复默认提示词").clicked() {
@@ -1366,6 +1394,81 @@ fn row_separator(ui: &mut egui::Ui, pal: &Palette) {
     ui.painter().rect_filled(rect, 0.0, pal.separator);
 }
 
+/// 右控件区可视高度（含 1px 描边）：实际文本行高 + 上下 4 边距 + Frame 描边 2。
+///
+/// 2026-09-12 用户多轮反馈 segmented / 输入框 / toggle / 滑条与键帽不等高——
+/// 此前各控件写死魔数（21/24/25），实际行高随界面字体浮动。改为统一按当前
+/// 字体实测动态计算，数学上保证右控件区可视高严格相等。
+/// 注：egui `Frame` 的 `outer_rect` 会把 stroke 宽度计入总高（上下各 +1），
+/// 故 Frame 类控件的内高要再减 2（见各调用处 `- 6`）；
+/// headless 单测 `control_heights_are_uniform` 锁定。
+fn control_h(ui: &egui::Ui) -> f32 {
+    text_row_h(ui) + 10.0
+}
+
+/// 12.5pt 文本的**实际渲染行高**（galley 高度，与 Label/TextEdit 同源）。
+///
+/// 不用 `fonts.row_height`：实测（egui 0.36 默认字体）它为 14.38，而 Label 的
+/// galley 高 14.00——实机字体下偏差方向/大小不定，会把键帽文字撑高、与分段槽
+/// 差 1~2px（第二轮实机反馈的残留根因），改用与文字渲染完全一致的 galley 高。
+fn text_row_h(ui: &egui::Ui) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            String::from("Ag"),
+            egui::FontId::proportional(12.5),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .y
+}
+
+/// 分段选择器可视总宽（`count` 档 × 按钮宽 + 槽内边距 2×2 + 描边 1×2），
+/// 供同行滑条/输入框对齐（egui `Frame::outer_rect` 会把 stroke 计入尺寸）。
+fn segmented_width(count: usize, button_width: f32) -> f32 {
+    count as f32 * button_width + 6.0
+}
+
+/// 估算 Slider 内数字框（`DragValue`）的宽度。
+///
+/// egui `DragValue`：内容 = 值文本，左右边距 = `button_padding`，下限 =
+/// `interact_size.x`（默认 40）。用于把"数字框 + 轨道"总宽反推为分段槽宽
+/// （2026-09-12 用户要求"滑条加数字总共和上面一样长"）。
+fn drag_value_width(ui: &egui::Ui, text: &str) -> f32 {
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(12.5),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x;
+    (text_w + ui.spacing().button_padding.x * 2.0).max(ui.spacing().interact_size.x)
+}
+
+/// 把某个滑条布置成"数字框 + 轨道"总宽 = `total`（右对齐时与上方分段槽等长），
+/// 并统一行高为 `control_h`。返回滑条响应。
+fn slider_total_width(
+    ui: &mut egui::Ui,
+    total: f32,
+    value_text: &str,
+    slider: egui::Slider<'_>,
+) -> egui::Response {
+    // 数字框（DragValue 内部是 Button）圆角与全设置页统一为 6
+    // （2026-09-12 用户实机反馈：默认 2 太方，与上下控件不一致）
+    let radius = egui::CornerRadius::same(6);
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.inactive.corner_radius = radius;
+    widgets.hovered.corner_radius = radius;
+    widgets.active.corner_radius = radius;
+    widgets.noninteractive.corner_radius = radius;
+    let value_w = drag_value_width(ui, value_text);
+    ui.spacing_mut().slider_width =
+        (total - value_w - ui.spacing().item_spacing.x).max(120.0);
+    ui.set_min_height(control_h(ui));
+    ui.add(slider)
+}
+
 /// 分段选择器（macOS 胶囊组），返回是否变更。
 ///
 /// `button_width` 为整排统一固定宽度——各选项按内容自适应时，选中加粗与
@@ -1379,6 +1482,7 @@ fn segmented<T: PartialEq + Copy>(
     value: &mut T,
 ) -> bool {
     let mut changed = false;
+    let h = control_h(ui);
     egui::Frame::new()
         .fill(pal.control_bg)
         .stroke(egui::Stroke::new(1.0, pal.card_stroke))
@@ -1401,8 +1505,9 @@ fn segmented<T: PartialEq + Copy>(
                     })
                     .stroke(egui::Stroke::NONE)
                     .corner_radius(6.0);
-                // 右控件区可视高统一 25（槽描边 + 纵边距 2×2，见七十七记录）
-                if ui.add_sized(egui::vec2(button_width, 21.0), btn).clicked() {
+                // 槽内边距 2×2 + Frame 描边 2：按钮高 = control_h - 6，
+                // 字号/行高变化时自动对齐（见 control_h 注释）
+                if ui.add_sized(egui::vec2(button_width, h - 6.0), btn).clicked() {
                     *value = *v;
                     changed = true;
                 }
@@ -1412,31 +1517,52 @@ fn segmented<T: PartialEq + Copy>(
 }
 
 /// 键帽徽章（展示当前热键，弱控件底色 + 细描边）。
+///
+/// 键帽是右控件区的**高度基准**：内容高锁定为 [`control_h`] - 6（Frame 上下
+/// 边距 4 + 描边 2），文字用 painter 居中绘制、**不参与布局**——任何字体行高
+/// /DPI 下键帽总高都恒等于动态计算的 `control_h`；日志级别等分段槽复用同一
+/// 基准（2026-09-12 用户要求"日志级别复用截图热键的高度"，是动态基准而非
+/// 硬编码像素，换设备/分辨率不会跑偏）。
 fn keycap(ui: &mut egui::Ui, pal: &Palette, text: &str) {
+    let h = control_h(ui);
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(12.5),
+        ui.visuals().strong_text_color(),
+    );
+    let text_w = galley.size().x;
     egui::Frame::new()
         .fill(pal.control_bg)
         .stroke(egui::Stroke::new(1.0, pal.card_stroke))
         .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(10, 4))
+        .inner_margin(egui::Margin::symmetric(10, 2))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(12.5).strong());
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(text_w, h - 6.0), egui::Sense::hover());
+            ui.painter().galley(
+                rect.center() - galley.size() * 0.5,
+                galley,
+                egui::Color32::PLACEHOLDER,
+            );
         });
 }
 
-/// 强调色主按钮（白字 + accent 底）。
+/// 强调色主按钮（白字 + accent 底，高度与右控件区统一）。
 fn primary_button(ui: &mut egui::Ui, pal: &Palette, text: &str) -> egui::Response {
+    let h = control_h(ui);
     ui.add(
         egui::Button::new(egui::RichText::new(text).size(12.5).color(egui::Color32::WHITE))
             .fill(pal.accent)
             .stroke(egui::Stroke::NONE)
             .corner_radius(6.0)
-            .min_size(egui::vec2(56.0, 24.0)),
+            .min_size(egui::vec2(56.0, h)),
     )
 }
 
-/// iOS 风格开关，返回是否变更（轨道 40×25，与右区其他控件同高）。
+/// iOS 风格开关，返回是否变更（轨道 40×control_h，与右区其他控件同高）。
 fn toggle(ui: &mut egui::Ui, pal: &Palette, on: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 25.0), egui::Sense::click());
+    let h = control_h(ui);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, h), egui::Sense::click());
     let mut changed = false;
     if response.clicked() {
         *on = !*on;
@@ -1444,16 +1570,17 @@ fn toggle(ui: &mut egui::Ui, pal: &Palette, on: &mut bool) -> bool {
     }
     let anim = ui.ctx().animate_bool_with_time(response.id, *on, 0.15);
     let track = pal.control_bg.lerp_to_gamma(pal.accent, anim);
-    ui.painter().rect_filled(rect, 12.0, track);
+    ui.painter().rect_filled(rect, h / 2.0, track);
     // 轨道细描边：与输入框/键帽/分段槽视觉高度对齐（2026-09-12 用户实机反馈）
     ui.painter().rect_stroke(
         rect,
-        12.0,
+        h / 2.0,
         egui::Stroke::new(1.0, pal.card_stroke),
         egui::StrokeKind::Inside,
     );
-    let knob_x = egui::emath::lerp(rect.left() + 12.0..=rect.right() - 12.0, anim);
-    ui.painter().circle_filled(egui::pos2(knob_x, rect.center().y), 9.0, egui::Color32::WHITE);
+    let knob_r = h / 2.0 - 3.5;
+    let knob_x = egui::emath::lerp(rect.left() + h / 2.0..=rect.right() - h / 2.0, anim);
+    ui.painter().circle_filled(egui::pos2(knob_x, rect.center().y), knob_r, egui::Color32::WHITE);
     response.on_hover_cursor(egui::CursorIcon::PointingHand);
     changed
 }
@@ -1511,7 +1638,7 @@ const THINK_TIP: &str = "打开：请求时合并下方自定义参数（含思�
 /// 带边框的单行输入框（与 `framed_multiline` 同风格；全设置页单行输入统一用它）。
 ///
 /// 白卡片上原生 TextEdit 描边几乎看不见（2026-09-12 用户实机反馈），且各处
-/// 宽高不一，故收敛到这一个入口：固定高 24、圆角 6。
+/// 宽高不一，故收敛到这一个入口：高度与右控件区统一（`control_h`）、圆角 6。
 /// 文本从左往右显示、超长时右侧截断（`clip_text`，不跟随光标滚动——长路径
 /// 或长 URL 显示开头、截掉尾巴，不会把框撑开）。
 fn framed_singleline(
@@ -1522,6 +1649,7 @@ fn framed_singleline(
     hint: Option<&str>,
     password: bool,
 ) -> egui::Response {
+    let h = control_h(ui);
     egui::Frame::new()
         .fill(pal.control_bg)
         .stroke(egui::Stroke::new(1.0, pal.card_stroke))
@@ -1537,7 +1665,8 @@ fn framed_singleline(
             if password {
                 edit = edit.password(true);
             }
-            ui.add_sized([width, 21.0], edit)
+            // Frame 内边距 2×2 + 描边 2：内容高 = control_h - 6，总高 = control_h
+            ui.add_sized([width, h - 6.0], edit)
         })
         .inner
 }
@@ -1546,26 +1675,47 @@ fn framed_singleline(
 ///
 /// 白卡片上原生 TextEdit 描边几乎看不见，标题与输入分不开
 /// （2026-09-12 用户实机反馈），故统一用 Frame 包一层。
+///
+/// 高度固定为视口高（`height`，不含边框内边距），内容超出时在框内滚动编辑，
+/// 不再随行数把框撑高（2026-09-12 用户实机反馈："输入很长文字后文本框不应
+/// 变得很高，用户可在里面滚动文字并编辑"）。
+/// `id_salt` 必须每个框唯一：ScrollArea 默认 salt 相同会让多个框共享滚动
+/// 状态（滚一个所有框同步滚——第二轮实机反馈）。
 fn framed_multiline(
     ui: &mut egui::Ui,
     pal: &Palette,
     text: &mut String,
     height: f32,
+    id_salt: &str,
 ) -> egui::Response {
-    egui::Frame::new()
+    let fr = egui::Frame::new()
         .fill(pal.control_bg)
         .stroke(egui::Stroke::new(1.0, pal.card_stroke))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
-            ui.add_sized(
-                [ui.available_width(), height],
-                egui::TextEdit::multiline(text)
-                    .font(egui::FontId::monospace(12.0))
-                    .frame(egui::Frame::NONE),
-            )
-        })
-        .inner
+            let mut resp: Option<egui::Response> = None;
+            egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(height)
+                .min_scrolled_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    resp = Some(ui.add(
+                        egui::TextEdit::multiline(text)
+                            .font(egui::FontId::monospace(12.0))
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY),
+                    ));
+                });
+            resp.unwrap_or_else(|| ui.allocate_response(egui::vec2(0.0, height), egui::Sense::hover()))
+        });
+    // 鼠标在框内：吞掉内层 ScrollArea 未消费的滚轮（滚到尽头也不带动设置页
+    // 外层滚动）；鼠标不在框上开始滚动时照旧冒泡（2026-09-12 用户要求）。
+    if ui.rect_contains_pointer(fr.response.rect) {
+        ui.ctx().input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+    }
+    fr.inner
 }
 
 /// JSON 文本转编辑用美化格式（合法美化，非法原样带入让用户修）。
@@ -1575,13 +1725,25 @@ fn pretty_json_or_raw(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
+/// JSON 编辑缓冲结算（纯函数）：合法 JSON 对象则写入配置并返回 `true`。
+fn settle_params_json(draft: &mut Config, buf: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(buf) {
+        Ok(v) if v.is_object() => {
+            draft.translate.params_json = buf.trim().to_owned();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 卡片六：大模型参数（单 JSON 输入 + 启用自定义参数总开关 + 重置）。
 ///
 /// 每次调用大模型时把 JSON 逐键合并进请求体（温度/上限/上下文/思考四件套等
 /// 全由用户自配；总开关关闭时剔掉思考四键）。
-/// 编辑规则（2026-09-12 用户要求）：敲的过程中非法只红字提示、不保存；
-/// 鼠标离开输入框（失焦）时统一结算——合法则美化格式后落盘，非则恢复上一版
-/// 并提示 3 秒后消失。
+/// 编辑规则（2026-09-12 用户要求）：敲的过程中非法只红字提示、不保存；**合法
+/// 立即写入编辑缓冲（实时保存模型）**——切页/点别处/关窗都不会丢（此前只在
+/// 失焦帧结算，切页那一帧卡片已不渲染，编辑内容永远进不了正式配置，用户两次
+/// 反馈"格式正确却没保存成功"）。失焦时再把缓冲美化/非法回滚。
 fn draw_params_card(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -1609,16 +1771,15 @@ fn draw_params_card(
         let buf = ed
             .buf
             .get_or_insert_with(|| pretty_json_or_raw(&draft.translate.params_json));
-        let resp = framed_multiline(ui, pal, buf, 84.0);
+        let resp = framed_multiline(ui, pal, buf, 84.0, "llm_params_json");
         let focused = resp.has_focus();
         if resp.changed() {
-            // 敲的过程中：合法清提示（暂不落盘，等失焦统一美化），非法红字提示
-            if serde_json::from_str::<serde_json::Value>(buf)
-                .map(|v| v.is_object())
-                .unwrap_or(false)
-            {
+            // 敲的过程中：合法立即写入 draft（实时保存，切页/关窗都不丢），
+            // 非法只红字提示、draft 保留上一版合法值
+            if settle_params_json(draft, buf) {
                 ed.err = None;
                 ed.err_until = None;
+                *changed = true;
             } else {
                 ed.err = Some(String::from("不是合法的 JSON 对象，请检查括号/引号/逗号"));
                 ed.err_until = None;
@@ -1805,4 +1966,176 @@ fn is_standalone_ok(key: &str) -> bool {
         return rest.parse::<u8>().is_ok();
     }
     matches!(key, "PrintScreen" | "ScrollLock" | "Pause")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 跑一帧 egui（无窗口布局计算）并返回闭包结果。
+    fn run_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut result: Option<R> = None;
+        let mut f = Some(f);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx
+            .run_ui(input, |ui| {
+                if let Some(f) = f.take() {
+                    result = Some(f(ui));
+                }
+            })
+            .drop_without_applying_deltas();
+        result.expect("run_ui 闭包应执行")
+    }
+
+    /// 模拟 `setting_row` 的右侧控件位（right_to_left 水平布局，与实际调用一致；
+    /// 垂直布局下 segmented 的按钮会纵向堆叠，测不出真实高度）。
+    fn in_right_zone<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.scope(|ui| add(ui)).inner
+            })
+            .inner
+        })
+        .inner
+    }
+
+    /// 右控件区可视高必须严格一致（键帽/分段槽/单行输入/toggle/主按钮）。
+    #[test]
+    fn control_heights_are_uniform() {
+        let (key_h, seg_h, input_h, toggle_h, btn_h) = run_ui(|ui| {
+            let pal = palette(false);
+            let key_h = in_right_zone(ui, |ui| {
+                ui.scope(|ui| keycap(ui, &pal, "Ctrl+Alt+A")).response.rect.height()
+            });
+            ui.add_space(4.0);
+            let seg_h = in_right_zone(ui, |ui| {
+                let mut v = 0usize;
+                ui.scope(|ui| {
+                    segmented(ui, &pal, &[("a", 0usize), ("b", 1usize)], 56.0, &mut v);
+                })
+                .response
+                .rect
+                .height()
+            });
+            ui.add_space(4.0);
+            let input_h = in_right_zone(ui, |ui| {
+                let mut s = String::from("x");
+                ui.scope(|ui| {
+                    framed_singleline(ui, &pal, &mut s, 100.0, None, false);
+                })
+                .response
+                .rect
+                .height()
+            });
+            ui.add_space(4.0);
+            let toggle_h = in_right_zone(ui, |ui| {
+                let mut on = false;
+                ui.scope(|ui| {
+                    toggle(ui, &pal, &mut on);
+                })
+                .response
+                .rect
+                .height()
+            });
+            ui.add_space(4.0);
+            let btn_h = in_right_zone(ui, |ui| primary_button(ui, &pal, "重新录制").rect.height());
+            (key_h, seg_h, input_h, toggle_h, btn_h)
+        });
+        for (name, h) in [
+            ("segmented", seg_h),
+            ("framed_singleline", input_h),
+            ("toggle", toggle_h),
+            ("primary_button", btn_h),
+        ] {
+            assert!(
+                (h - key_h).abs() < 0.5,
+                "右控件高度不一致：键帽 {key_h} vs {name} {h}"
+            );
+        }
+    }
+
+    /// 多行输入框固定高度：短内容/长内容都不改变框高（长内容框内滚动）。
+    #[test]
+    fn framed_multiline_keeps_fixed_height_for_long_text() {
+        let (short_h, long_h) = run_ui(|ui| {
+            let pal = palette(false);
+            let mut short = String::from("a");
+            let mut long = "line\n".repeat(80);
+            let a = ui
+                .scope(|ui| {
+                    framed_multiline(ui, &pal, &mut short, 84.0, "test_short");
+                })
+                .response
+                .rect
+                .height();
+            let b = ui
+                .scope(|ui| {
+                    framed_multiline(ui, &pal, &mut long, 84.0, "test_long");
+                })
+                .response
+                .rect
+                .height();
+            (a, b)
+        });
+        // 视口 84 + Frame 内边距 6×2 + 描边 2 = 98
+        assert!((short_h - 98.0).abs() < 1.0, "短内容应固定 98，实际 {short_h}");
+        assert!((long_h - 98.0).abs() < 1.0, "长内容不应撑高，实际 {long_h}");
+    }
+
+    /// 保存目录框（短路径）与上下 2 档 segmented 可视外宽一致。
+    #[test]
+    fn save_dir_input_matches_segmented_width() {
+        let (seg_w, input_w) = run_ui(|ui| {
+            let pal = palette(false);
+            let seg_w = in_right_zone(ui, |ui| {
+                let mut v = 0usize;
+                ui.scope(|ui| {
+                    segmented(ui, &pal, &[("a", 0usize), ("b", 1usize)], 56.0, &mut v);
+                })
+                .response
+                .rect
+                .width()
+            });
+            ui.add_space(4.0);
+            let mut s = String::from("D:\\D1");
+            let input_w = ui
+                .scope(|ui| {
+                    framed_singleline(
+                        ui,
+                        &pal,
+                        &mut s,
+                        segmented_width(2, 56.0) - 14.0,
+                        None,
+                        false,
+                    );
+                })
+                .response
+                .rect
+                .width();
+            (seg_w, input_w)
+        });
+        assert!(
+            (seg_w - input_w).abs() < 0.5,
+            "保存目录框外宽 {input_w} 与分段槽 {seg_w} 不等"
+        );
+    }
+
+    /// JSON 编辑缓冲结算：只接受合法 JSON 对象，非法/数组不写入。
+    #[test]
+    fn settle_params_json_only_accepts_object() {
+        let mut cfg = Config::default();
+        cfg.translate.params_json = String::from("{\"a\":1}");
+        assert!(settle_params_json(&mut cfg, " {\"b\": 2} "));
+        assert_eq!(cfg.translate.params_json, "{\"b\": 2}");
+        assert!(!settle_params_json(&mut cfg, "[1,2]"));
+        assert!(!settle_params_json(&mut cfg, "{bad"));
+        assert_eq!(cfg.translate.params_json, "{\"b\": 2}");
+    }
 }

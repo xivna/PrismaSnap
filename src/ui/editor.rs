@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::annotation::{Annotation, AnnotationManager, CharStyle, Color, Tool};
 use crate::annotation::{apply_bold_to_range, apply_color_to_range, apply_font_to_range};
 use crate::annotation::{intern_font_path, materialize_styles, sync_styles_to_len};
+use crate::annotation::tools::mosaic::padded_rect_for_blur;
 use crate::utils::math::Rect;
 use libblur::{stack_blur, FastBlurChannels, ThreadingPolicy};
 
@@ -78,6 +79,12 @@ pub struct Editor {
     edit_font_hover_orig: Option<Option<String>>,
     /// 选区边界（物理像素），标注创建/拖动/缩放均钳制于此（防止拖出选区外并遮挡工具条）。
     selection: Option<Rect>,
+    /// HDR 屏预览打码贴图的亮度补偿（= `1/DEFAULT_GAIN`；SDR 屏 1.0 无操作）。
+    ///
+    /// 打码像素取自已按增益压暗的 SDR 映射图，而 egui 合成时会乘 SDR 白点
+    /// boost，不补偿则预览里打码区域比周围原始 HDR 画面暗一截（2026-09-12
+    /// 用户实机反馈）。见 [`crate::capture::color::compensate_preview_gain`]。
+    hdr_preview_comp: f32,
 }
 
 impl Default for Editor {
@@ -88,7 +95,12 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new() -> Self {
-        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None, font_hover: None, edit_font_hover_orig: None }
+        Self { mgr: AnnotationManager::default(), active_tool: None, editing_text: None, resizing_text: None, blur_cache: HashMap::new(), preview_blur: None, selection: None, font_hover: None, edit_font_hover_orig: None, hdr_preview_comp: 1.0 }
+    }
+
+    /// 设置 HDR 预览打码补偿因子（覆盖层按 `hdr_mode` 调用；SDR 保持 1.0）。
+    pub fn set_hdr_preview_comp(&mut self, comp: f32) {
+        self.hdr_preview_comp = comp.max(1.0);
     }
 
     /// 设置选区边界（`Overlay` 每帧同步），`None` 表示无限制。
@@ -836,6 +848,8 @@ impl Editor {
         };
         let painter = &painter;
         let editing_idx = self.editing_text.as_ref().and_then(|s| s.index);
+        // 打码贴图 HDR 预览补偿（SDR 屏 = 1.0 无操作）
+        let comp = self.hdr_preview_comp;
         for (idx, ann) in self.mgr.annotations().iter().enumerate() {
             if Some(idx) == editing_idx { continue; }
             let selected = self.mgr.selected() == Some(idx);
@@ -859,7 +873,7 @@ impl Editor {
                             let dy = (rect.y - entry.padded_rect.y) as u32;
                             let w = rect.width; let h = rect.height;
                             let cropped = image::imageops::crop_imm(&entry.blurred, dx, dy, w, h).to_image();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw());
+                            let color_image = compensated_color_image(&cropped, comp);
                             entry.handle.set(color_image, egui::TextureOptions::LINEAR);
                             painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                             // 提交态马赛克无描边（导出即如此；2026-09-12 用户实机反馈去边框）
@@ -886,7 +900,7 @@ impl Editor {
                         let entry_exists = self.blur_cache.contains_key(&blur_id);
                         let dx = (rect.x - padded.x) as u32; let dy = (rect.y - padded.y) as u32;
                         let cropped = image::imageops::crop_imm(&patch, dx, dy, rect.width, rect.height).to_image();
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied([rect.width as usize, rect.height as usize], cropped.as_raw());
+                        let color_image = compensated_color_image(&cropped, comp);
                         if entry_exists {
                             if let Some(entry) = self.blur_cache.get_mut(&blur_id) {
                                 entry.padded_rect = padded;
@@ -912,7 +926,7 @@ impl Editor {
                     }
                 }
             }
-            draw_annotation(painter, ctx, ann, ppp, selected, image, &self.mgr.annotations()[..idx]);
+            draw_annotation(painter, ctx, ann, ppp, selected, image, &self.mgr.annotations()[..idx], comp, false);
         }
         if let Some(state) = &self.editing_text {
             let to_pt = |p: (f32,f32)| egui::pos2(p.0/ppp, p.1/ppp);
@@ -945,7 +959,7 @@ impl Editor {
                             let dy = (rect.y - entry.padded_rect.y) as u32;
                             let w = rect.width; let h = rect.height;
                             let cropped = image::imageops::crop_imm(&entry.blurred, dx, dy, w, h).to_image();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw());
+                            let color_image = compensated_color_image(&cropped, comp);
                             entry.handle.set(color_image, egui::TextureOptions::LINEAR);
                             painter.image(entry.handle.id(), r, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                             painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
@@ -962,7 +976,7 @@ impl Editor {
                             stack_blur_rgba(&mut patch, radius_v as u32);
                             let dx = (rect.x - padded.x) as u32; let dy = (rect.y - padded.y) as u32;
                             let cropped = image::imageops::crop_imm(&patch, dx, dy, rect.width, rect.height).to_image();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied([rect.width as usize, rect.height as usize], cropped.as_raw());
+                            let color_image = compensated_color_image(&cropped, comp);
                             if let Some(entry) = self.preview_blur.as_mut() {
                                 entry.padded_rect = padded;
                                 entry.radius = radius_v;
@@ -987,12 +1001,13 @@ impl Editor {
             }
             let is_text = matches!(a, Annotation::Text{..});
             let prefix = self.mgr.annotations().to_vec();
-            draw_annotation(painter, ctx, &a, ppp, is_text, image, &prefix);
+            draw_annotation(painter, ctx, &a, ppp, is_text, image, &prefix, comp, true);
         }
     }
 }
 
-fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>, prefix: &[Annotation]) {
+#[allow(clippy::too_many_arguments)]
+fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotation, ppp: f32, selected: bool, image: Option<&image::RgbaImage>, prefix: &[Annotation], preview_comp: f32, draft: bool) {
     let to_pt = |p: (f32,f32)| egui::pos2(p.0/ppp, p.1/ppp);
     let stroke = |c: Color, w: f32| egui::Stroke::new(w/ppp, egui::Color32::from_rgba_unmultiplied(c.r,c.g,c.b,c.a));
     match ann {
@@ -1044,11 +1059,22 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
                                 let mut rs=0; let mut gs=0; let mut bs_=0; let mut cnt=0;
                                 for py in by..by1 { for px in bx..bx1 { let p=patch.get_pixel(px as u32, py as u32).0; rs+=p[0] as u32; gs+=p[1] as u32; bs_+=p[2] as u32; cnt+=1; }}
                                 if cnt==0 {continue;}
-                                let col=egui::Color32::from_rgb((rs/cnt) as u8,(gs/cnt) as u8,(bs_/cnt) as u8);
+                                let col = apply_preview_comp(
+                                    egui::Color32::from_rgb(
+                                        (rs / cnt) as u8,
+                                        (gs / cnt) as u8,
+                                        (bs_ / cnt) as u8,
+                                    ),
+                                    preview_comp,
+                                );
                                 let lr=egui::Rect::from_min_max(to_pt(((x0+bx) as f32, (y0+by) as f32)), to_pt(((x0+bx1) as f32, (y0+by1) as f32)));
                                 painter.rect_filled(lr,0.0,col);
                             }}
-                            // 提交态像素化无描边（导出即如此）
+                            // 绘制中白描边 + 提交后无描边（导出干净）——此前像素化绘制中
+                            // 没有线框，用户无法判断框大小（2026-09-12 实机反馈）
+                            if draft {
+                                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                            }
                         }
                     } else { painter.rect_filled(r,0.0, egui::Color32::from_rgb(68,68,68)); }
                 }
@@ -1056,7 +1082,13 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
                     // 已由 Editor::draw_annotations 缓存路径处理，此处仅兜底占位（避免每帧新建纹理，C 残留已消除）
                     painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(70,70,70,230)); painter.text(r.center(), egui::Align2::CENTER_CENTER, "模糊", egui::FontId::proportional(12.0/ppp.max(1.0)), egui::Color32::WHITE);
                 }
-                crate::annotation::MosaicStyle::Solid{ color } => { painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255)); }
+                crate::annotation::MosaicStyle::Solid{ color } => {
+                    painter.rect_filled(r,0.0, egui::Color32::from_rgba_unmultiplied(color.r,color.g,color.b,255));
+                    // 绘制中白描边（同像素化/模糊；提交后无描边）
+                    if draft {
+                        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)), egui::StrokeKind::Outside);
+                    }
+                }
             }
         }
         Annotation::Text{ rect, content, color, font_size, bold, font, char_styles, font_table, .. } => {
@@ -1141,14 +1173,29 @@ fn draw_annotation(painter: &egui::Painter, ctx: &egui::Context, ann: &Annotatio
     }
 }
 
-fn padded_rect_for_blur(rect: Rect, image: &image::RgbaImage) -> Rect {
-    let pad_w = (rect.width as f32 * 0.3).max(24.0) as i32;
-    let pad_h = (rect.height as f32 * 0.3).max(24.0) as i32;
-    let x0 = (rect.x - pad_w).max(0);
-    let y0 = (rect.y - pad_h).max(0);
-    let x1 = (rect.right() + pad_w).min(image.width() as i32);
-    let y1 = (rect.bottom() + pad_h).min(image.height() as i32);
-    Rect::from_points(x0, y0, x1, y1)
+/// 打码贴图转 egui `ColorImage`：HDR 屏先做预览亮度补偿（SDR 屏 `comp=1.0` 直通）。
+fn compensated_color_image(cropped: &image::RgbaImage, comp: f32) -> egui::ColorImage {
+    let [w, h] = [cropped.width() as usize, cropped.height() as usize];
+    if (comp - 1.0).abs() < f32::EPSILON {
+        return egui::ColorImage::from_rgba_unmultiplied([w, h], cropped.as_raw());
+    }
+    let mut scaled = cropped.clone();
+    for p in scaled.pixels_mut() {
+        let [r, g, b] =
+            crate::capture::color::compensate_preview_gain(p.0[0], p.0[1], p.0[2], comp);
+        *p = image::Rgba([r, g, b, p.0[3]]);
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], scaled.as_raw())
+}
+
+/// 单个打码颜色的 HDR 预览补偿（`preview_comp == 1.0` 时原样返回）。
+fn apply_preview_comp(c: egui::Color32, preview_comp: f32) -> egui::Color32 {
+    if (preview_comp - 1.0).abs() < f32::EPSILON {
+        return c;
+    }
+    let [r, g, b] =
+        crate::capture::color::compensate_preview_gain(c.r(), c.g(), c.b(), preview_comp);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 fn stack_blur_rgba(patch: &mut image::RgbaImage, radius: u32) {

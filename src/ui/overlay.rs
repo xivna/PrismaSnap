@@ -198,6 +198,12 @@ impl Overlay {
             (Some(id), Some(t), Some(v))
         };
         let hdr_mode = gui.is_hdr();
+        // HDR 屏：打码贴图预乘 1/增益，抵消「SDR 映射已压暗 × egui 合成 boost」
+        // 的叠加，否则预览里马赛克/模糊区域比周围 HDR 画面暗一截（2026-09-12）。
+        let mut editor = Editor::new();
+        if hdr_mode {
+            editor.set_hdr_preview_comp(1.0 / crate::capture::color::DEFAULT_GAIN);
+        }
         Ok(Self {
             window,
             gui,
@@ -207,7 +213,7 @@ impl Overlay {
             texture_id,
             hdr_mode,
             mode: Mode::Selecting,
-            editor: Editor::new(),
+            editor,
             font_picker: super::font_list::FontPickerState::default(),
             current_cursor: None,
             drag_start: None,

@@ -197,7 +197,11 @@ mod imp {
                 settings.focus();
                 return;
             }
-            let window = match Settings::create_window(event_loop, self.config.ui.settings_pos) {
+            let window = match Settings::create_window(
+                event_loop,
+                self.config.ui.settings_pos,
+                self.config.ui.settings_size,
+            ) {
                 Ok(w) => w,
                 Err(e) => {
                     error!("创建设置窗口失败: {e:#}");
@@ -228,16 +232,17 @@ mod imp {
                 }
                 self.hotkey_suspended = false;
             }
-            // 记录关闭位置：直接改生效配置并写盘（不走 draft，避免把未点保存的
-            // 编辑缓冲一并落盘；位置与编辑内容是两回事）
+            // 记录关闭位置与大小：直接改生效配置并写盘（不走 draft，避免把未点
+            // 保存的编辑缓冲一并落盘；窗口几何与编辑内容是两回事）
             if let Some(s) = &self.settings {
+                let mut cfg = (*self.config).clone();
                 if let Some(pos) = s.outer_position() {
-                    let mut cfg = (*self.config).clone();
                     cfg.ui.settings_pos = Some(pos);
-                    match cfg.save(&self.config_path) {
-                        Ok(()) => self.config = Arc::new(cfg),
-                        Err(e) => error!("设置窗口位置写盘失败: {e:#}"),
-                    }
+                }
+                cfg.ui.settings_size = Some(s.inner_size());
+                match cfg.save(&self.config_path) {
+                    Ok(()) => self.config = Arc::new(cfg),
+                    Err(e) => error!("设置窗口位置/大小写盘失败: {e:#}"),
                 }
             }
             self.settings = None;
