@@ -58,16 +58,19 @@ enum Section {
     Appearance,
     /// AI 接口。
     Ai,
+    /// 关于（版本号与赞助作者）。
+    About,
 }
 
 impl Section {
     /// 侧栏导航顺序。
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::General,
         Section::Save,
         Section::Capture,
         Section::Appearance,
         Section::Ai,
+        Section::About,
     ];
 
     /// 侧栏显示名。
@@ -78,6 +81,7 @@ impl Section {
             Section::Capture => "捕获",
             Section::Appearance => "外观",
             Section::Ai => "AI 接口",
+            Section::About => "关于",
         }
     }
 
@@ -85,6 +89,7 @@ impl Section {
     fn title(self) -> &'static str {
         match self {
             Section::Ai => "AI 接口（OpenAI 兼容）",
+            Section::About => "关于 PrismaSnap",
             other => other.label(),
         }
     }
@@ -119,6 +124,8 @@ pub struct Settings {
     /// 关闭设置窗口即丢弃。编辑中非法只提示不保存，失焦时合法美化落盘、
     /// 非法恢复上一版）。
     params_ed: ParamsEditUi,
+    /// 赞助作者弹窗是否打开（关于页入口；不进配置，关闭设置窗口即关闭）。
+    show_sponsor: bool,
 }
 
 /// 大模型参数区编辑状态（设置页"大模型参数"卡片用）。
@@ -359,6 +366,7 @@ impl Settings {
             model_dl: ModelDownloadUi::default(),
             font_pickers: std::collections::HashMap::new(),
             params_ed: ParamsEditUi::default(),
+            show_sponsor: false,
         })
     }
 
@@ -478,6 +486,7 @@ impl Settings {
         let mut mdl = std::mem::take(&mut self.model_dl);
         let mut font_pickers = std::mem::take(&mut self.font_pickers);
         let mut params_ed = std::mem::take(&mut self.params_ed);
+        let mut show_sponsor = self.show_sponsor;
 
         self.gui.render(self.window.as_ref(), |ui| {
             // 主题实时预览：改选项立即生效（正式写盘仍走 pending_save）
@@ -494,6 +503,7 @@ impl Settings {
                 &mut mdl,
                 &mut font_pickers,
                 &mut params_ed,
+                &mut show_sponsor,
             );
         });
 
@@ -504,6 +514,7 @@ impl Settings {
         self.model_dl = mdl;
         self.font_pickers = font_pickers;
         self.params_ed = params_ed;
+        self.show_sponsor = show_sponsor;
         if start_recording {
             self.recording_hotkey = true;
         }
@@ -542,6 +553,7 @@ fn draw_settings_ui(
     mdl: &mut ModelDownloadUi,
     font_pickers: &mut std::collections::HashMap<String, super::font_list::FontPickerState>,
     params_ed: &mut ParamsEditUi,
+    show_sponsor: &mut bool,
 ) {
     let pal = palette(matches!(draft.ui.theme, Theme::Dark));
 
@@ -591,6 +603,7 @@ fn draw_settings_ui(
                 Section::Capture => draw_capture(ui, &pal, draft, changed),
                 Section::Appearance => draw_appearance(ui, &pal, draft, changed, font_pickers),
                 Section::Ai => draw_ai(ui, &pal, draft, changed, mdl, params_ed),
+                Section::About => draw_about(ui, &pal, show_sponsor),
             }
 
             // 状态提示（保存成功/失败等）
@@ -608,6 +621,127 @@ fn draw_settings_ui(
             }
             ui.add_space(24.0);
         });
+
+    // 赞助作者弹窗：不受当前分区限制（打开后切分区仍显示，`open` 由右上角 X 关闭）
+    if *show_sponsor {
+        draw_sponsor_window(ui.ctx(), &pal, show_sponsor);
+    }
+}
+
+/// 「关于」分区：版本号 + 赞助作者入口，拆成两张互不相关的卡片
+///（2026-09-13 用户返工：功能不相关不放在一起）。
+fn draw_about(ui: &mut egui::Ui, pal: &Palette, show_sponsor: &mut bool) {
+    card(ui, pal, |ui| {
+        setting_row(ui, "版本", |ui| {
+            ui.label(
+                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                    .size(13.0)
+                    .color(pal.secondary),
+            );
+        });
+    });
+    ui.add_space(12.0);
+    card(ui, pal, |ui| {
+        setting_row(ui, "请作者喝杯咖啡？", |ui| {
+            if secondary_button(ui, pal, "赞助").clicked() {
+                *show_sponsor = true;
+            }
+        });
+    });
+}
+
+/// 赞助作者弹窗（notepad-- 捐赠窗式：顶部居中引言 + 两张收款码并排）。
+fn draw_sponsor_window(ctx: &egui::Context, pal: &Palette, show: &mut bool) {
+    let mut open = *show;
+    egui::Window::new("赞助作者")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(340.0)
+        // 标题栏背景与卡片同色、去掉独立灰条（2026-09-13 用户反馈：默认标题栏风格不符）
+        .title_frame(egui::Frame::NONE.fill(pal.card_bg))
+        .frame(
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(14)),
+        )
+        .show(ctx, |ui| {
+            ui.set_max_width(312.0);
+            ui.add_space(2.0);
+            // 引言：逐行居中（Layout::top_down(Center) 让 Label 内部多行也居中）
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(SPONSOR_INTRO).size(12.5));
+            });
+            ui.add_space(14.0);
+            sponsor_qr_row(ui);
+            ui.add_space(4.0);
+        });
+    *show = open;
+}
+
+/// 赞助弹窗引言（原文见用户 2026-09-13 指定文案，仅去掉段间空行）。
+const SPONSOR_INTRO: &str = "这个截图工具免费使用，功能也不打算收费。\n\
+如果它刚好帮到了你，你可以自愿扫码赞助我一下。\n\
+不赞助完全没关系，软件照用，功能照旧。\n\
+谢谢啦。";
+
+/// 赞助码资源（JPEG；`include_bytes!` 编进 exe，便携无外部依赖）。
+const PAY_WECHAT: &[u8] = include_bytes!("../../assets/pay/wx.jpg");
+const PAY_ALIPAY: &[u8] = include_bytes!("../../assets/pay/ali.jpg");
+
+/// 收款码统一展示高度（逻辑点，宽度按原图比例自适应；两张并排总宽约 284）。
+const PAY_QR_HEIGHT: f32 = 190.0;
+
+/// 两张收款码并排：统一高度、整行居中、等高对齐；图片自带「微信支付/支付宝」字样，不再加重叠标签。
+fn sponsor_qr_row(ui: &mut egui::Ui) {
+    const GAP: f32 = 18.0;
+    let images: Vec<(egui::TextureHandle, egui::Vec2)> =
+        [("微信", PAY_WECHAT), ("支付宝", PAY_ALIPAY)]
+            .iter()
+            .filter_map(|(label, bytes)| pay_qr_texture(ui.ctx(), label, bytes))
+            .collect();
+    let total: f32 = images
+        .iter()
+        .map(|(_, s)| PAY_QR_HEIGHT * s.x / s.y)
+        .sum::<f32>()
+        + GAP * images.len().saturating_sub(1) as f32;
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+        for (i, (handle, size)) in images.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(GAP);
+            }
+            let w = PAY_QR_HEIGHT * size.x / size.y;
+            ui.add(egui::Image::new(handle).fit_to_exact_size(egui::vec2(w, PAY_QR_HEIGHT)));
+        }
+    });
+}
+
+/// 取收款码纹理（ctx 数据区缓存，多帧复用不重复解码；失败返回 `None` 跳过图片）。
+fn pay_qr_texture(
+    ctx: &egui::Context,
+    label: &str,
+    bytes: &'static [u8],
+) -> Option<(egui::TextureHandle, egui::Vec2)> {
+    let id = egui::Id::new(("settings_pay_qr", label));
+    if let Some(v) = ctx.data(|d| d.get_temp::<(egui::TextureHandle, egui::Vec2)>(id)) {
+        return Some(v);
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = egui::vec2(rgba.width() as f32, rgba.height() as f32);
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    let handle = ctx.load_texture(
+        format!("settings_pay_qr_{label}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(id, (handle.clone(), size)));
+    Some((handle, size))
 }
 
 /// 左侧导航栏：应用名 + 分区列表（圆角胶囊高亮选中项）。
@@ -701,6 +835,34 @@ fn draw_general(
     });
 }
 
+/// 「保存」分区路径输入框的占位提示（空目录时显示，宽度也按它实测）。
+const SAVE_DIR_PLACEHOLDER: &str = "<程序目录>/screenshots";
+
+/// 保存目录输入框宽度：按当前文本实测；输入为空时按占位符实测（保证默认目录
+/// 完整显示不被截断）。下限使**外框**与上下 2 档 segmented 可视宽严格相等
+///（短路径时三行等长——2026-09-12 用户实机反馈；`framed_singleline` 外宽 =
+/// 内容宽 + 左右 margin 6×2 + 描边 2 = +14），长路径按文本加宽、上限 300
+///（再长截右侧，不和左侧标签重叠）。`text_w + 20`：文本两侧各留约 10px
+///（6 margin + 1 描边 + 3 余量）——此前 +28 余量会让普通路径比下限多 1px、
+/// 外框比上下框宽（第二轮实机反馈）。
+fn save_dir_input_width(ui: &egui::Ui, dir_input: &str) -> f32 {
+    let measure = if dir_input.is_empty() {
+        SAVE_DIR_PLACEHOLDER
+    } else {
+        dir_input
+    };
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(
+            measure.to_string(),
+            egui::FontId::proportional(12.5),
+            egui::Color32::TRANSPARENT,
+        )
+        .size()
+        .x;
+    (text_w + 20.0).clamp(segmented_width(2, 56.0) - 14.0, 300.0)
+}
+
 /// 「保存」分区：保存模式 / 目录 / 格式 / 质量。
 fn draw_save(
     ui: &mut egui::Ui,
@@ -725,28 +887,15 @@ fn draw_save(
         row_separator(ui, pal);
 
         setting_row(ui, "保存目录", |ui| {
-            // 自适应宽：按路径文本实测 + 边距；下限使**外框**与上下 2 档 segmented
-            // 可视宽严格相等（短路径时三行等长——2026-09-12 用户实机反馈；
-            // framed_singleline 外宽 = 内容宽 + 左右 margin 6×2 + 描边 2 = +14），
-            // 长路径按文本加宽、上限 300（再长截右侧，不和左侧标签重叠）。
-            let text_w = ui
-                .painter()
-                .layout_no_wrap(
-                    dir_input.clone(),
-                    egui::FontId::proportional(12.5),
-                    egui::Color32::TRANSPARENT,
-                )
-                .size()
-                .x;
-            // text_w + 20：文本两侧各留约 10px（6 margin + 1 描边 + 3 余量）——
-            // 此前 +28 余量会让普通路径比下限多 1px、外框比上下框宽（第二轮实机反馈）
-            let w = (text_w + 20.0).clamp(segmented_width(2, 56.0) - 14.0, 300.0);
+            // 输入为空时宽度按占位符实测，保证 `<程序目录>/screenshots` 完整显示
+            //（2026-09-13 用户实机反馈：旧逻辑按空串测宽，占位符被截成 `<程序目录>/scr…`）。
+            let w = save_dir_input_width(ui, dir_input);
             *changed |= framed_singleline(
                 ui,
                 pal,
                 dir_input,
                 w,
-                Some("<程序目录>/screenshots"),
+                Some(SAVE_DIR_PLACEHOLDER),
                 false,
             )
             .changed();
@@ -1281,6 +1430,8 @@ fn draw_model_help(ctx: &egui::Context, pal: &Palette, mdl: &mut ModelDownloadUi
         .collapsible(false)
         .resizable(true)
         .default_width(520.0)
+        // 标题栏背景与卡片同色，避免默认灰条与设置页风格不符（同赞助窗，2026-09-13）
+        .title_frame(egui::Frame::NONE.fill(pal.card_bg))
         .frame(
             egui::Frame::new()
                 .fill(pal.card_bg)
@@ -1554,6 +1705,21 @@ fn primary_button(ui: &mut egui::Ui, pal: &Palette, text: &str) -> egui::Respons
         egui::Button::new(egui::RichText::new(text).size(12.5).color(egui::Color32::WHITE))
             .fill(pal.accent)
             .stroke(egui::Stroke::NONE)
+            .corner_radius(6.0)
+            .min_size(egui::vec2(56.0, h)),
+    )
+}
+
+/// 次要按钮（control_bg 底 + 描边，无强调色；高度与右控件区统一）。
+///
+/// 与 `primary_button` 同尺寸，仅配色弱化——用于非主操作（如「赞助」入口，
+/// 2026-09-13 用户要求不用强调色）。
+fn secondary_button(ui: &mut egui::Ui, pal: &Palette, text: &str) -> egui::Response {
+    let h = control_h(ui);
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).size(12.5))
+            .fill(pal.control_bg)
+            .stroke(egui::Stroke::new(1.0, pal.card_stroke))
             .corner_radius(6.0)
             .min_size(egui::vec2(56.0, h)),
     )
@@ -2087,6 +2253,34 @@ mod tests {
         // 视口 84 + Frame 内边距 6×2 + 描边 2 = 98
         assert!((short_h - 98.0).abs() < 1.0, "短内容应固定 98，实际 {short_h}");
         assert!((long_h - 98.0).abs() < 1.0, "长内容不应撑高，实际 {long_h}");
+    }
+
+    /// 保存目录占位符完整显示：空输入时框宽必须容纳 `<程序目录>/screenshots`
+    /// 全文（2026-09-13 用户实机反馈：旧逻辑按空串测宽，占位符被截断）。
+    #[test]
+    fn save_dir_placeholder_displays_fully_when_empty() {
+        let (placeholder_w, empty_w, short_w) = run_ui(|ui| {
+            let placeholder_w = ui
+                .painter()
+                .layout_no_wrap(
+                    SAVE_DIR_PLACEHOLDER.to_string(),
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::TRANSPARENT,
+                )
+                .size()
+                .x;
+            let empty_w = save_dir_input_width(ui, "");
+            let short_w = save_dir_input_width(ui, "D:\\D1");
+            (placeholder_w, empty_w, short_w)
+        });
+        assert!(
+            empty_w >= placeholder_w + 20.0 - 0.5,
+            "空输入框宽 {empty_w} 放不下占位符文本 {placeholder_w}"
+        );
+        assert!(
+            short_w < empty_w,
+            "短路径应比占位符窄（{short_w} vs {empty_w}）"
+        );
     }
 
     /// 保存目录框（短路径）与上下 2 档 segmented 可视外宽一致。
