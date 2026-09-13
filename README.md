@@ -19,7 +19,7 @@ Windows 11 便携式截图工具：HDR 正确、标注顺手、AI 提取与翻�
 ## 构建与测试
 
 ```bash
-# 目标平台 Windows 11 x86_64 (MSVC)，WSL2 交叉编译（环境配置见 AGENTS.md 5.1）
+# 目标平台 Windows 11 x86_64 (MSVC)，WSL2 交叉编译（xwin + lld-link 工具链）
 cargo build --target x86_64-pc-windows-msvc --release
 
 # 纯逻辑单元测试（WSL2 可直接运行）
@@ -40,9 +40,6 @@ scripts/package.sh [输出目录]   # 默认输出到 D:\Download
 | 文件 | 内容 |
 | :--- | :--- |
 | [`docs/使用说明.md`](docs/使用说明.md) | 用户手册（安装 / 快捷键 / 标注 / AI 配置 / FAQ） |
-| [`AGENTS.md`](AGENTS.md) | 需求与设计规格、架构决策与协作规范 |
-| [`PROGRESS.md`](PROGRESS.md) | 开发进度与决策记录 |
-| [`TASKS.md`](TASKS.md) | 任务清单 |
 
 ## 开源协议
 
