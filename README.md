@@ -2,7 +2,9 @@
 
 Windows 11 截图工具，便携版。按 `Ctrl+Alt+A` 截屏，拖动框选，标注后复制或保存；还能提取图中文字、把翻译结果直接盖在原文上。
 
-![截图选区与工具条](assets/screenshots/editor.png)
+<img width="1196" height="566" alt="editor" src="https://github.com/user-attachments/assets/cea21fb2-71a0-4f4a-9d18-e1109b9268d3" />
+
+<img width="1044" height="456" alt="settings" src="https://github.com/user-attachments/assets/117cc5a1-f763-4e0f-a567-a4aef0018eca" />
 
 ## 功能
 
@@ -27,8 +29,6 @@ Windows 11 截图工具，便携版。按 `Ctrl+Alt+A` 截屏，拖动框选，�
 3. 按 `Ctrl+Alt+A` 开始第一次截图。
 
 装 OCR 插件（可选）：解压插件包，把里面的 `plugins` 文件夹合并到程序目录（与 `PrismaSnap.exe` 同级）后重启；也可以在 设置 → AI 接口 → 「OCR插件下载」中在线下载。
-
-![设置界面](assets/screenshots/settings.png)
 
 ## 快捷键
 
