@@ -160,7 +160,7 @@ pub fn draw_rich_text_in_rect(
     let mut line_idx: usize = 0;
     let mut pending: Vec<(char, usize, Color)> = Vec::new();
     let mut pend_w = 0.0f32;
-    let mut draw_line = |line: &[((char, usize, Color))], line_idx: usize| {
+    let mut draw_line = |line: &[(char, usize, Color)], line_idx: usize| {
         if line.is_empty() {
             return;
         }
