@@ -19,7 +19,7 @@ BEGIN
       VALUE "OriginalFilename", "PrismaSnap.exe"
       VALUE "ProductName", "PrismaSnap"
       VALUE "ProductVersion", "1.0.0"
-      VALUE "LegalCopyright", "MIT License"
+      VALUE "LegalCopyright", "GPL-3.0 License"
     END
   END
   BLOCK "VarFileInfo"

@@ -2,7 +2,7 @@
 # PrismaSnap 便携版打包脚本（WSL2 交叉编译，环境见 AGENTS.md 5.1）
 #
 # 产出（默认输出到 /mnt/d/Download，可用参数 1 覆盖）：
-#   1. PrismaSnap_<版本>_portable.zip   主包：PrismaSnap.exe + 使用说明.txt
+#   1. PrismaSnap_<版本>_portable.zip   主包：PrismaSnap.exe + 使用说明.md + LICENSE
 #   2. PrismaSnap_<版本>_OCR插件包.zip  可选插件：plugins/ocr/ 四件套 + 安装说明.txt
 #
 # 用法：
@@ -75,10 +75,11 @@ trap 'rm -rf "$STAGE"' EXIT
 echo "==> [3/5] 主包"
 mkdir -p "$STAGE/main"
 cp "$EXE" "$STAGE/main/PrismaSnap.exe"
-cp "docs/使用说明.md" "$STAGE/main/使用说明.txt"
+cp "docs/使用说明.md" "$STAGE/main/使用说明.md"
+cp "LICENSE" "$STAGE/main/LICENSE"
 MAIN_ZIP="$OUT_DIR/PrismaSnap_${VERSION}_portable.zip"
 rm -f "$MAIN_ZIP"
-make_zip "$MAIN_ZIP" "$STAGE/main" PrismaSnap.exe 使用说明.txt
+make_zip "$MAIN_ZIP" "$STAGE/main" PrismaSnap.exe 使用说明.md LICENSE
 echo "    $MAIN_ZIP ($(du -h "$MAIN_ZIP" | cut -f1))"
 
 echo "==> [4/5] OCR 插件包"

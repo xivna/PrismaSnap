@@ -3,7 +3,7 @@ name = "prismsnap"
 version = "1.0.0"
 edition = "2021"
 description = "PrismaSnap - Windows 11 现代化截图工具（HDR 支持）"
-license = "MIT"
+license = "GPL-3.0-only"
 
 # 目标平台：Windows 11 x86_64（MSVC），便携版分发。
 # 交叉编译命令：cargo build --target x86_64-pc-windows-msvc --release
